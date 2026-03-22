@@ -1,0 +1,100 @@
+/**:
+  ros__parameters:
+
+    use_sim_time: true
+
+    # Localization Parameters
+    # Path to pre-built PCD map file
+    localization/map_path: "/media/terramaster/lc_map_lidar_imu_odom.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+
+    # Frame IDs
+    localization/map_frame: "map"
+    localization/base_frame: "base_link"
+    localization/imu_frame: "gps_bot"  # IMU is mounted at GPS bottom location
+    localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
+
+    # Map downsampling for GICP (smaller = more accurate but slower)
+    localization/voxel_leaf_size: 0.25
+
+    # Optional map rotation (degrees) to correct sideways/up-axis issues from source map files.
+    # If your map looks sideways, try roll +/-90 first.
+    localization/map_rotation/roll_deg: 0.0
+    localization/map_rotation/pitch_deg: 0.0
+    localization/map_rotation/yaw_deg: 0.0
+
+    # Map visualization
+    localization/visualize_map: true
+    localization/map_voxel_size_vis: 1.5  # Downsample map for visualization (increase for faster RViz)
+
+    # TF publishing
+    localization/publish_tf: true
+    # If true, disable GICP scan matching and propagate pose using IMU/geometric observer only.
+    localization/imu_only: false
+
+    # Use odometry for pose initialization
+    # If true, waits for first odometry message to initialize
+    # If false, waits for initial pose from RViz or topic
+    localization/use_odom_init: true
+
+    # Publishing rate for high-rate pose topic (Hz)
+    localization/publish_rate: 100.0
+
+    # Optional initial pose (Set use=true and update pose to skip RViz initialization)
+    localization/initial_pose/use: false
+    localization/initial_pose/x: 0.0    # meters
+    localization/initial_pose/y: 0.0    # meters
+    localization/initial_pose/z: 0.0    # meters
+    localization/initial_pose/roll: 0.0 # radians
+    localization/initial_pose/pitch: 0.0 # radians
+    localization/initial_pose/yaw: 0.0  # radians
+
+    # Preprocessing Parameters (override defaults for localization)
+    dlio/preprocessing/cropBoxFilter/size: 0.0  # Disabled (set to 0) - no cropping
+    dlio/preprocessing/voxelFilter/use: false  # DISABLED - voxel filter was removing all points
+    dlio/preprocessing/voxelFilter/res: 0.5  # Slightly coarser for faster processing
+
+    # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z)
+    localization/flip_y: true
+
+    # LiDAR sensor type for per-point timestamp handling during deskewing
+    # Options: ouster, velodyne, hesai, livox, luminar
+    localization/sensor_type: "luminar"
+
+    # IMU and Deskewing Parameters
+    dlio/deskew: false  # Enable pointcloud deskewing using IMU
+    dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
+    dlio/imu/bufferSize: 2000  # IMU buffer size
+
+    # Geometric Observer Parameters (for state estimation and IMU bias correction)
+    odom/geo/Kp: 1.0      # Position correction gain
+    odom/geo/Kv: 1.0      # Velocity correction gain
+    odom/geo/Kq: 1.0      # Orientation correction gain
+    odom/geo/Kab: 0.1     # Accelerometer bias correction gain
+    odom/geo/Kgb: 0.1     # Gyroscope bias correction gain
+    odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
+    odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
+
+    # Debug / Visualization helpers
+    localization/debug/enable_pub: true
+    localization/debug/enable_jump_log: true
+    localization/debug/jump_trans_m: 1.0      # Log if pose jumps > this (meters)
+    localization/debug/jump_rot_deg: 10.0     # Log if pose jumps > this (degrees)
+
+    # GICP Registration Parameters
+    # Maximum number of iterations (increased for better convergence)
+    gicp/maxIterations: 128
+
+    # Number of neighbors used to compute per-point covariances (typical: 20)
+    gicp/correspondenceRandomness: 20
+
+    # Maximum correspondence distance (meters)
+    # Points further apart than this won't be considered correspondences
+    # Increased to handle larger initial errors
+    gicp/maxCorrespondenceDistance: 2.0
+
+    # Convergence criteria (relaxed slightly for faster convergence)
+    gicp/transformationEpsilon: 0.01
+    gicp/rotationEpsilon: 0.01  
+  
+
+  
