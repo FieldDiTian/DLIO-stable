@@ -2,10 +2,14 @@
 #include <termios.h>
 #include <unistd.h>
 #include <chrono>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <boost/format.hpp>
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <rosbag2_cpp/reader.hpp>
@@ -19,6 +23,117 @@
 #include <glim/util/extension_module_ros2.hpp>
 #include <glim_ros/glim_ros.hpp>
 #include <glim_ros/ros_compatibility.hpp>
+
+// ============================================================================
+// Multi-LiDAR concatenation support
+// ============================================================================
+
+struct AuxLidarSensor {
+  std::string topic;
+  Eigen::Isometry3d T_primary_sensor;
+  std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> buffer;
+  size_t buffer_size;
+};
+
+static double stamp_to_sec(const builtin_interfaces::msg::Time& stamp) {
+  return stamp.sec + stamp.nanosec * 1e-9;
+}
+
+static bool find_xyz_offsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
+  x_off = y_off = z_off = -1;
+  for (const auto& f : msg.fields) {
+    if (f.name == "x") x_off = f.offset;
+    else if (f.name == "y") y_off = f.offset;
+    else if (f.name == "z") z_off = f.offset;
+  }
+  return x_off >= 0 && y_off >= 0 && z_off >= 0;
+}
+
+static void transform_cloud_data(
+  std::vector<uint8_t>& data,
+  uint32_t point_step,
+  int x_off,
+  int y_off,
+  int z_off,
+  const Eigen::Isometry3d& T) {
+  const Eigen::Matrix3f R = T.linear().cast<float>();
+  const Eigen::Vector3f t = T.translation().cast<float>();
+  const size_t num_points = data.size() / point_step;
+
+  for (size_t i = 0; i < num_points; i++) {
+    const size_t base = i * point_step;
+    float x, y, z;
+    std::memcpy(&x, &data[base + x_off], sizeof(float));
+    std::memcpy(&y, &data[base + y_off], sizeof(float));
+    std::memcpy(&z, &data[base + z_off], sizeof(float));
+
+    Eigen::Vector3f p = R * Eigen::Vector3f(x, y, z) + t;
+    std::memcpy(&data[base + x_off], &p.x(), sizeof(float));
+    std::memcpy(&data[base + y_off], &p.y(), sizeof(float));
+    std::memcpy(&data[base + z_off], &p.z(), sizeof(float));
+  }
+}
+
+static sensor_msgs::msg::PointCloud2::SharedPtr find_nearest(
+  const std::deque<sensor_msgs::msg::PointCloud2::SharedPtr>& buffer,
+  double target_sec,
+  double threshold) {
+  sensor_msgs::msg::PointCloud2::SharedPtr best;
+  double best_dt = std::numeric_limits<double>::max();
+  for (const auto& msg : buffer) {
+    double dt = std::abs(stamp_to_sec(msg->header.stamp) - target_sec);
+    if (dt < best_dt) {
+      best_dt = dt;
+      best = msg;
+    }
+  }
+  return (best && best_dt <= threshold) ? best : nullptr;
+}
+
+static sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
+  const sensor_msgs::msg::PointCloud2::SharedPtr& primary,
+  std::vector<AuxLidarSensor>& aux_sensors,
+  double time_threshold) {
+  const double t_primary = stamp_to_sec(primary->header.stamp);
+  const uint32_t point_step = primary->point_step;
+
+  int x_off, y_off, z_off;
+  if (!find_xyz_offsets(*primary, x_off, y_off, z_off)) {
+    spdlog::warn("lidar_concat: cannot find xyz fields in primary cloud");
+    return primary;
+  }
+
+  auto merged = std::make_shared<sensor_msgs::msg::PointCloud2>(*primary);
+  size_t total_points = primary->width * primary->height;
+
+  for (auto& aux : aux_sensors) {
+    auto match = find_nearest(aux.buffer, t_primary, time_threshold);
+    if (!match) {
+      spdlog::debug("lidar_concat: no match for {} (t={:.3f})", aux.topic, t_primary);
+      continue;
+    }
+    if (match->point_step != point_step) {
+      spdlog::warn("lidar_concat: point_step mismatch for {} ({} vs {})", aux.topic, match->point_step, point_step);
+      continue;
+    }
+
+    std::vector<uint8_t> data(match->data.begin(), match->data.end());
+    int ax, ay, az;
+    if (find_xyz_offsets(*match, ax, ay, az)) {
+      transform_cloud_data(data, point_step, ax, ay, az, aux.T_primary_sensor);
+    }
+    merged->data.insert(merged->data.end(), data.begin(), data.end());
+    total_points += match->width * match->height;
+
+    double dt = std::abs(stamp_to_sec(match->header.stamp) - t_primary);
+    spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, dt, match->width * match->height);
+  }
+
+  merged->width = total_points;
+  merged->height = 1;
+  merged->row_step = point_step * total_points;
+  return merged;
+}
 
 class SpeedCounter {
 public:
@@ -106,6 +221,45 @@ int main(int argc, char** argv) {
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
   std::vector<std::string> topics = {imu_topic, points_topic, image_topic};
+
+  // Load multi-LiDAR concatenation config
+  const bool concat_enabled = config_ros.param<bool>("lidar_concat", "enabled", false);
+  double concat_time_threshold = config_ros.param<double>("lidar_concat", "time_threshold", 0.05);
+  const int concat_buffer_size = config_ros.param<int>("lidar_concat", "buffer_size", 200);
+  std::vector<AuxLidarSensor> aux_sensors;
+
+  if (concat_enabled) {
+    const auto aux_topics = config_ros.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
+    for (const auto& topic : aux_topics) {
+      // Build the transform param key: replace '/' with '_', remove leading '_'
+      std::string key = topic;
+      for (auto& c : key) {
+        if (c == '/') c = '_';
+      }
+      if (!key.empty() && key[0] == '_') key = key.substr(1);
+      key = "T_primary_" + key;
+
+      auto flat = config_ros.param<std::vector<double>>("lidar_concat", key);
+      if (!flat || flat->size() != 16) {
+        spdlog::error("lidar_concat: missing or invalid transform '{}' for topic '{}'", key, topic);
+        continue;
+      }
+
+      AuxLidarSensor sensor;
+      sensor.topic = topic;
+      sensor.buffer_size = concat_buffer_size;
+      Eigen::Matrix4d mat;
+      for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+          mat(r, c) = (*flat)[r * 4 + c];
+      sensor.T_primary_sensor = Eigen::Isometry3d(mat);
+
+      topics.push_back(sensor.topic);
+      spdlog::info("lidar_concat: auxiliary sensor {} enabled (transform key={})", sensor.topic, key);
+      aux_sensors.push_back(std::move(sensor));
+    }
+    spdlog::info("lidar_concat: {} auxiliary sensors, threshold={:.3f}s", aux_sensors.size(), concat_time_threshold);
+  }
 
   rosbag2_storage::StorageFilter filter;
   spdlog::info("topics:");
@@ -300,7 +454,30 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
 
-      if (msg->topic_name == imu_topic) {
+      // Check if this message is for an auxiliary LiDAR sensor
+      bool is_aux_sensor = false;
+      if (concat_enabled) {
+        for (auto& aux : aux_sensors) {
+          if (msg->topic_name == aux.topic) {
+            if (topic_type != "sensor_msgs/msg/PointCloud2") {
+              spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
+              return false;
+            }
+            auto aux_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+            points_serialization.deserialize_message(&serialized_msg, aux_msg.get());
+            aux.buffer.push_back(aux_msg);
+            while (aux.buffer.size() > aux.buffer_size) {
+              aux.buffer.pop_front();
+            }
+            is_aux_sensor = true;
+            break;
+          }
+        }
+      }
+
+      if (is_aux_sensor) {
+        // Already handled above; skip to next message
+      } else if (msg->topic_name == imu_topic) {
         if (topic_type != "sensor_msgs/msg/Imu") {
           spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/Imu (topic={})", topic_type, msg->topic_name);
           return false;
@@ -315,7 +492,13 @@ int main(int argc, char** argv) {
         }
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
-        const size_t workload = glim->points_callback(points_msg);
+
+        // Merge auxiliary LiDAR clouds if concatenation is enabled
+        sensor_msgs::msg::PointCloud2::ConstSharedPtr final_points = points_msg;
+        if (concat_enabled && !aux_sensors.empty()) {
+          final_points = merge_clouds(points_msg, aux_sensors, concat_time_threshold);
+        }
+        const size_t workload = glim->points_callback(final_points);
 
         if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
           spdlog::info("end_time reached");
