@@ -85,33 +85,5 @@
     "image_qos": {
       "profile": "sensor_data"
     }
-  },
-
-  /*** Multi-LiDAR concatenation config ***/
-  // Concatenate auxiliary LiDAR sensors into the primary points_topic frame.
-  //
-  // enabled              : Enable/disable multi-LiDAR concatenation
-  // time_threshold       : Maximum timestamp difference (seconds) to match auxiliary to primary
-  // buffer_size          : Number of auxiliary messages to buffer for matching
-  // aux_topics           : List of auxiliary LiDAR topics
-  // T_primary_sensor_*   : 4x4 row-major transformation matrix from each sensor frame to primary frame
-  //                        (suffix matches the topic name with '/' replaced by '_' and leading '_' removed)
-  "lidar_concat": {
-    "enabled": true,
-    "time_threshold": 0.05,
-    "buffer_size": 200,
-    "aux_topics": ["/luminar_left/points", "/luminar_right/points"],
-    "T_primary_luminar_left_points": [
-      -0.38268343, -0.92387953,  0.0, -0.65822000,
-       0.92387953, -0.38268343,  0.0,  0.14337000,
-       0.0,         0.0,         1.0,  0.06867000,
-       0.0,         0.0,         0.0,  1.0
-    ],
-    "T_primary_luminar_right_points": [
-      -0.38268343,  0.92387953,  0.0, -0.55258000,
-      -0.92387953, -0.38268343,  0.0, -0.15833000,
-       0.0,         0.0,         1.0,  0.06867000,
-       0.0,         0.0,         0.0,  1.0
-    ]
   }
 }

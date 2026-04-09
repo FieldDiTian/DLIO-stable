@@ -36,6 +36,7 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
+#include <glim_ros/urdf_transforms.hpp>
 
 namespace glim {
 
@@ -88,6 +89,27 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
   flip_points_y = config_sensors.param<bool>("sensors", "flip_points_y", false);
+
+  // Override T_lidar_imu from URDF if configured
+  const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
+  const std::string urdf_lidar_frame = config_sensors.param<std::string>("sensors", "urdf_lidar_frame", "");
+  const std::string urdf_imu_frame = config_sensors.param<std::string>("sensors", "urdf_imu_frame", "");
+  if (!urdf_path.empty() && !urdf_lidar_frame.empty() && !urdf_imu_frame.empty()) {
+    try {
+      auto urdf_transforms = glim::parse_urdf_transforms(urdf_path);
+      Eigen::Isometry3d T_lidar_imu = glim::compute_transform(urdf_transforms, urdf_lidar_frame, urdf_imu_frame);
+      std::stringstream ss;
+      ss << T_lidar_imu.matrix();
+      logger->info("URDF override T_lidar_imu ({} -> {}):\n{}", urdf_lidar_frame, urdf_imu_frame, ss.str());
+
+      // Write override into config_sensors.json so all modules pick it up
+      const std::string config_sensors_path = glim::GlobalConfig::get_config_path("config_sensors");
+      config_sensors.override_param<Eigen::Isometry3d>("sensors", "T_lidar_imu", T_lidar_imu);
+      config_sensors.save(config_sensors_path);
+    } catch (const std::exception& e) {
+      logger->error("Failed to compute T_lidar_imu from URDF: {}", e.what());
+    }
+  }
 
   // Setup GPU-based linearization
 #ifdef BUILD_GTSAM_POINTS_GPU

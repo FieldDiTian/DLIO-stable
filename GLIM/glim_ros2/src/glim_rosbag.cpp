@@ -23,6 +23,7 @@
 #include <glim/util/extension_module_ros2.hpp>
 #include <glim_ros/glim_ros.hpp>
 #include <glim_ros/ros_compatibility.hpp>
+#include <glim_ros/urdf_transforms.hpp>
 
 // ============================================================================
 // Multi-LiDAR concatenation support
@@ -223,39 +224,78 @@ int main(int argc, char** argv) {
   std::vector<std::string> topics = {imu_topic, points_topic, image_topic};
 
   // Load multi-LiDAR concatenation config
-  const bool concat_enabled = config_ros.param<bool>("lidar_concat", "enabled", false);
-  double concat_time_threshold = config_ros.param<double>("lidar_concat", "time_threshold", 0.05);
-  const int concat_buffer_size = config_ros.param<int>("lidar_concat", "buffer_size", 200);
+  glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
+  const bool concat_enabled = config_sensors.param<bool>("lidar_concat", "enabled", false);
+  double concat_time_threshold = config_sensors.param<double>("lidar_concat", "time_threshold", 0.05);
+  const int concat_buffer_size = config_sensors.param<int>("lidar_concat", "buffer_size", 200);
   std::vector<AuxLidarSensor> aux_sensors;
 
   if (concat_enabled) {
-    const auto aux_topics = config_ros.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
-    for (const auto& topic : aux_topics) {
-      // Build the transform param key: replace '/' with '_', remove leading '_'
-      std::string key = topic;
-      for (auto& c : key) {
-        if (c == '/') c = '_';
-      }
-      if (!key.empty() && key[0] == '_') key = key.substr(1);
-      key = "T_primary_" + key;
+    const auto aux_topics = config_sensors.param<std::vector<std::string>>("lidar_concat", "aux_topics", {});
 
-      auto flat = config_ros.param<std::vector<double>>("lidar_concat", key);
-      if (!flat || flat->size() != 16) {
-        spdlog::error("lidar_concat: missing or invalid transform '{}' for topic '{}'", key, topic);
-        continue;
-      }
+    // Try to load transforms from URDF if configured
+    const std::string urdf_path = config_sensors.param<std::string>("lidar_concat", "urdf_path", "");
+    const std::string primary_frame = config_sensors.param<std::string>("lidar_concat", "primary_frame", "");
+    std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>> urdf_transforms;
+    bool use_urdf = !urdf_path.empty() && !primary_frame.empty();
 
+    if (use_urdf) {
+      try {
+        urdf_transforms = glim::parse_urdf_transforms(urdf_path);
+        spdlog::info("lidar_concat: loaded URDF from {} (primary_frame={})", urdf_path, primary_frame);
+      } catch (const std::exception& e) {
+        spdlog::error("lidar_concat: failed to parse URDF: {}", e.what());
+        use_urdf = false;
+      }
+    }
+
+    const auto aux_frames = config_sensors.param<std::vector<std::string>>("lidar_concat", "aux_frames", {});
+    if (use_urdf && aux_frames.size() != aux_topics.size()) {
+      spdlog::error("lidar_concat: aux_frames size ({}) must match aux_topics size ({})", aux_frames.size(), aux_topics.size());
+      use_urdf = false;
+    }
+
+    for (size_t i = 0; i < aux_topics.size(); i++) {
+      const auto& topic = aux_topics[i];
       AuxLidarSensor sensor;
       sensor.topic = topic;
       sensor.buffer_size = concat_buffer_size;
-      Eigen::Matrix4d mat;
-      for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++)
-          mat(r, c) = (*flat)[r * 4 + c];
-      sensor.T_primary_sensor = Eigen::Isometry3d(mat);
+
+      if (use_urdf) {
+        const std::string& aux_frame = aux_frames[i];
+        try {
+          sensor.T_primary_sensor = glim::compute_transform(urdf_transforms, primary_frame, aux_frame);
+          std::stringstream ss;
+          ss << sensor.T_primary_sensor.matrix();
+          spdlog::info("lidar_concat: T_{}_{}:\n{}", primary_frame, aux_frame, ss.str());
+        } catch (const std::exception& e) {
+          spdlog::error("lidar_concat: failed to compute transform {} -> {}: {}", primary_frame, aux_frame, e.what());
+          continue;
+        }
+      } else {
+        // Fall back to reading the 4x4 matrix from config
+        std::string key = topic;
+        for (auto& c : key) {
+          if (c == '/') c = '_';
+        }
+        if (!key.empty() && key[0] == '_') key = key.substr(1);
+        key = "T_primary_" + key;
+
+        auto flat = config_sensors.param<std::vector<double>>("lidar_concat", key);
+        if (!flat || flat->size() != 16) {
+          spdlog::error("lidar_concat: missing or invalid transform '{}' for topic '{}'", key, topic);
+          continue;
+        }
+
+        Eigen::Matrix4d mat;
+        for (int r = 0; r < 4; r++)
+          for (int c = 0; c < 4; c++)
+            mat(r, c) = (*flat)[r * 4 + c];
+        sensor.T_primary_sensor = Eigen::Isometry3d(mat);
+      }
 
       topics.push_back(sensor.topic);
-      spdlog::info("lidar_concat: auxiliary sensor {} enabled (transform key={})", sensor.topic, key);
+      spdlog::info("lidar_concat: auxiliary sensor {} enabled", sensor.topic);
       aux_sensors.push_back(std::move(sensor));
     }
     spdlog::info("lidar_concat: {} auxiliary sensors, threshold={:.3f}s", aux_sensors.size(), concat_time_threshold);

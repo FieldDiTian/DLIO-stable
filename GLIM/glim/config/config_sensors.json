@@ -52,6 +52,11 @@
     // LiDAR config
     "global_shutter_lidar": false,
     "flip_points_y": true,
+    // URDF-based T_lidar_imu: if all three fields are set, T_lidar_imu is computed from the URDF at runtime
+    "urdf_path": "av24.urdf",
+    "urdf_lidar_frame": "luminar_front",
+    "urdf_imu_frame": "imu_bottom",
+    // Fallback T_lidar_imu (used when urdf_path is not set, overwritten at runtime when URDF is used)
     "T_lidar_imu": [
       -0.58603,
       -0.08041,
@@ -98,5 +103,31 @@
       -0.03279627881588615
     ]
 
+  },
+
+  /*** Multi-LiDAR concatenation config ***/
+  // Concatenate auxiliary LiDAR sensors into the primary points_topic frame.
+  //
+  // enabled              : Enable/disable multi-LiDAR concatenation
+  // time_threshold       : Maximum timestamp difference (seconds) to match auxiliary to primary
+  // buffer_size          : Number of auxiliary messages to buffer for matching
+  // aux_topics           : List of auxiliary LiDAR topics
+  //
+  // Option A: URDF-based transforms (preferred)
+  // urdf_path            : Path to URDF file for automatic transform extraction
+  // primary_frame        : Frame name of the primary LiDAR sensor in the URDF
+  // aux_frames           : URDF frame names for each auxiliary sensor (must match aux_topics order)
+  //
+  // Option B: Manual transforms (fallback when urdf_path is not set)
+  // T_primary_sensor_*   : 4x4 row-major transformation matrix from each sensor frame to primary frame
+  //                        (suffix matches the topic name with '/' replaced by '_' and leading '_' removed)
+  "lidar_concat": {
+    "enabled": true,
+    "time_threshold": 0.05,
+    "buffer_size": 200,
+    "aux_topics": ["/luminar_left/points", "/luminar_right/points"],
+    "aux_frames": ["luminar_left", "luminar_right"],
+    "urdf_path": "av24.urdf",
+    "primary_frame": "luminar_front"
   }
 }
