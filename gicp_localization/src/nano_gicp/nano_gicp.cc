@@ -80,7 +80,7 @@ void NanoGICP<PointSource, PointTarget>::setNumThreads(int n) {
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setCorrespondenceRandomness(int k) {
-  k_correspondences_ = k;
+  k_correspondences_ = std::max(k, 2);  // Minimum 2 to avoid division by zero in covariance calc
 }
 
 template <typename PointSource, typename PointTarget>
@@ -238,7 +238,7 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
     RCR(3, 3) = 1.0;
 
     mahalanobis_[i] = RCR.inverse();
-    mahalanobis_[i](3, 3) = 0.0f;
+    mahalanobis_[i](3, 3) = 0.0;
   }
 
   num_correspondences = std::count_if(correspondences_.begin(), correspondences_.end(), [](int c){return c > 0;});

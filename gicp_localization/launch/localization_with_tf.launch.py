@@ -101,7 +101,7 @@ def generate_launch_description():
         description='Child frame for static TF (sensor frame)'
     )
     declare_map_path_arg = DeclareLaunchArgument(
-        'map_path', default_value='/media/terramaster/lc_map_lidar_imu_odom.pcd',
+        'map_path', default_value='/media/terramaster/lc_three_lidar_map.pcd',
         description='Path to PCD map file for localization'
     )
 

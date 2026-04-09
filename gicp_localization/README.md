@@ -78,6 +78,13 @@ Edit `cfg/localization.yaml` to adjust parameters:
 - `gicp/localization/aligned_cloud` (sensor_msgs/PointCloud2): Aligned scan
 - `gicp/localization/map` (sensor_msgs/PointCloud2): Downsampled map for visualization
 
+### Debug Topics
+- `gicp/localization/debug/initial_guess_pose` (geometry_msgs/PoseStamped): Initial guess pose for each scan
+- `gicp/localization/debug/final_pose` (geometry_msgs/PoseStamped): Final GICP pose for each scan
+- `gicp/localization/debug/input_cloud_base` (sensor_msgs/PointCloud2): Input scan in `base_link`
+- `gicp/localization/debug/initial_guess_cloud` (sensor_msgs/PointCloud2): Input scan transformed by the initial guess
+- `gicp/localization/debug/pose_markers` (visualization_msgs/MarkerArray): Markers for guess and final pose
+
 ### TF Frames
 - Publishes transform: `map` → `base_link`
 
@@ -131,3 +138,91 @@ This is a "naive" approach in that it:
 ### Map Not Loading
 - Ensure map is in PCD format (convert from PLY if needed)
 - Check file path and permissions
+
+## Debug Pose Inspector
+
+Use `scripts/debug_pose_inspector.py` to print the current pose and initial guess for each scan, export them to CSV, and plot how the initial guess differs from the final pose.
+
+Requirements:
+- `localization/debug/enable_pub: true` in `cfg/localization.yaml` (enabled by default)
+- `python3-matplotlib` if you want live plots; otherwise use `--no-plot`
+
+Example workflow:
+
+Terminal 1:
+```bash
+ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true
+```
+
+Terminal 2:
+```bash
+ros2 bag play '/media/terramaster/merged_ls_run_2' \
+  --topics /gps_bot/imu /luminar_front/points \
+  --read-ahead-queue-size 10000
+```
+
+Terminal 3:
+```bash
+python3 scripts/debug_pose_inspector.py \
+  --csv-path /tmp/gicp_pose_debug.csv
+```
+
+Console-only mode:
+```bash
+python3 scripts/debug_pose_inspector.py \
+  --csv-path /tmp/gicp_pose_debug.csv \
+  --no-plot
+```
+
+Short run:
+```bash
+python3 scripts/debug_pose_inspector.py \
+  --csv-path /tmp/gicp_pose_debug.csv \
+  --max-samples 300
+```
+
+CSV columns:
+- `current_*`: final pose position and orientation for the scan
+- `guess_*`: initial guess position and orientation for the scan
+- `delta_*`: `guess - current`
+- `delta_trans_norm`: Euclidean norm of the position error
+- `delta_rot_deg`: full relative rotation angle between guess and final pose
+
+## LiDAR Topic Visualizer
+
+Use `scripts/visualize_lidar_topic.py` to verify that localization is consuming the LiDAR topic you expect.
+
+The script:
+- subscribes to the raw LiDAR topic, default `/luminar_front/points`
+- reconstructs the same cloud localization should use by applying the TF into `base_link` and the configured `flip_y`
+- compares that reconstructed cloud against `/gicp/localization/debug/input_cloud_base`
+- plots raw, expected, actual, and overlay views live
+
+Requirements:
+- `localization/debug/enable_pub: true` in `cfg/localization.yaml`
+- the localization node running so `/gicp/localization/debug/input_cloud_base` is being published
+- `python3-matplotlib`
+
+Example workflow:
+
+Terminal 1:
+```bash
+ros2 launch gicp_localization localization_with_tf.launch.py rviz:=false
+```
+
+Terminal 2:
+```bash
+python3 scripts/visualize_lidar_topic.py
+```
+
+If your raw topic differs:
+```bash
+python3 scripts/visualize_lidar_topic.py \
+  --topic /your/lidar/topic \
+  --expected-frame your_lidar_frame
+```
+
+Interpretation:
+- if the raw panel looks correct but the expected/actual overlay does not match, the issue is usually TF or `flip_y`
+- if the raw panel itself looks wrong, localization is likely subscribed to the wrong topic or receiving bad data on that topic
+- if `mean_err`, `p95_err`, and `max_err` stay near zero, the debug input cloud matches the reconstructed input and the topic path is consistent

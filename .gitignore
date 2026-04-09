@@ -1,0 +1,7 @@
+build/
+install/
+log/
+tmp/
+.DS_Store
+CLAUDE.md
+.codex

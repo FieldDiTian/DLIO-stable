@@ -14,12 +14,149 @@
 #include "dlio/utils.h"
 
 #include <Eigen/Geometry>
+#include <Eigen/Eigenvalues>
 #include <pcl/filters/crop_box.h>
 #include <pcl/common/transforms.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <chrono>
 #include <algorithm>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+namespace {
+
+constexpr double kRadToDeg = 57.29577951308232;
+
+bool matrixFinite(const Eigen::Matrix4f& pose) {
+  return pose.array().isFinite().all();
+}
+
+geometry_msgs::msg::Pose poseMsgFromMatrix(const Eigen::Matrix4f& pose) {
+  geometry_msgs::msg::Pose msg;
+  const Eigen::Vector3f t = pose.block<3, 1>(0, 3);
+  Eigen::Quaternionf q(pose.block<3, 3>(0, 0));
+  q.normalize();
+
+  msg.position.x = t.x();
+  msg.position.y = t.y();
+  msg.position.z = t.z();
+  msg.orientation.w = q.w();
+  msg.orientation.x = q.x();
+  msg.orientation.y = q.y();
+  msg.orientation.z = q.z();
+  return msg;
+}
+
+geometry_msgs::msg::PoseStamped poseStampedFromMatrix(const Eigen::Matrix4f& pose,
+                                                      const rclcpp::Time& stamp,
+                                                      const std::string& frame_id) {
+  geometry_msgs::msg::PoseStamped msg;
+  msg.header.stamp = stamp;
+  msg.header.frame_id = frame_id;
+  msg.pose = poseMsgFromMatrix(pose);
+  return msg;
+}
+
+double rotationDistanceDeg(const Eigen::Matrix4f& a, const Eigen::Matrix4f& b) {
+  Eigen::Quaternionf qa(a.block<3, 3>(0, 0));
+  Eigen::Quaternionf qb(b.block<3, 3>(0, 0));
+  qa.normalize();
+  qb.normalize();
+
+  Eigen::Quaternionf dq = qa.conjugate() * qb;
+  dq.normalize();
+  const double w = std::clamp(std::abs(static_cast<double>(dq.w())), 0.0, 1.0);
+  return 2.0 * std::acos(w) * kRadToDeg;
+}
+
+double deltaTranslationNorm(const Eigen::Matrix4f& from, const Eigen::Matrix4f& to) {
+  return (to.block<3, 1>(0, 3) - from.block<3, 1>(0, 3)).norm();
+}
+
+std::string poseSummary(const Eigen::Matrix4f& pose) {
+  if (!matrixFinite(pose)) {
+    return "invalid";
+  }
+
+  const Eigen::Vector3f t = pose.block<3, 1>(0, 3);
+  const Eigen::Vector3f rpy_deg = pose.block<3, 3>(0, 0).eulerAngles(0, 1, 2) * static_cast<float>(kRadToDeg);
+
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2)
+      << "xyz=[" << t.x() << "," << t.y() << "," << t.z() << "]"
+      << " rpy_deg=[" << rpy_deg.x() << "," << rpy_deg.y() << "," << rpy_deg.z() << "]";
+  return oss.str();
+}
+
+std::string scalarSummary(double value, int precision = 3) {
+  if (!std::isfinite(value)) {
+    return "nan";
+  }
+
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(precision) << value;
+  return oss.str();
+}
+
+double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
+  if (!hessian.allFinite()) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  const Eigen::Matrix<double, 6, 6> sym_hessian = 0.5 * (hessian + hessian.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(sym_hessian);
+  if (solver.info() != Eigen::Success) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  const auto abs_eigenvalues = solver.eigenvalues().cwiseAbs();
+  const double max_eigenvalue = abs_eigenvalues.maxCoeff();
+
+  double min_nonzero_eigenvalue = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < abs_eigenvalues.size(); ++i) {
+    const double value = abs_eigenvalues[i];
+    if (value > 1e-12 && value < min_nonzero_eigenvalue) {
+      min_nonzero_eigenvalue = value;
+    }
+  }
+
+  if (!std::isfinite(max_eigenvalue) || !std::isfinite(min_nonzero_eigenvalue)) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  return max_eigenvalue / min_nonzero_eigenvalue;
+}
+
+visualization_msgs::msg::Marker makeArrowMarker(const Eigen::Matrix4f& pose,
+                                                const std::string& frame_id,
+                                                const rclcpp::Time& stamp,
+                                                int id,
+                                                const std::string& ns,
+                                                float r,
+                                                float g,
+                                                float b) {
+  visualization_msgs::msg::Marker marker;
+  marker.header.stamp = stamp;
+  marker.header.frame_id = frame_id;
+  marker.ns = ns;
+  marker.id = id;
+  marker.type = visualization_msgs::msg::Marker::ARROW;
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  marker.pose = poseMsgFromMatrix(pose);
+  marker.scale.x = 2.0;
+  marker.scale.y = 0.25;
+  marker.scale.z = 0.25;
+  marker.color.a = 1.0f;
+  marker.color.r = r;
+  marker.color.g = g;
+  marker.color.b = b;
+  return marker;
+}
+
+}  // namespace
 
 gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localization_node") {
 
@@ -41,6 +178,9 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
+  this->last_scan_input_frame_.clear();
+  this->last_raw_point_count_ = 0;
+  this->last_preprocessed_point_count_ = 0;
 
   // Initialize lidar pose
   this->lidarPose.p = Eigen::Vector3f::Zero();
@@ -60,6 +200,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->state.b.accel = Eigen::Vector3f::Zero();
 
   this->geo.first_opt_done = false;
+  this->geo.update_seq = 0;
   this->geo.dp = 0.0;
   this->geo.dq_deg = 0.0;
   this->geo.prev_p = Eigen::Vector3f::Zero();
@@ -76,6 +217,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->extrinsics.baselink2lidar.R = Eigen::Matrix3f::Identity();
   this->extrinsics.baselink2imu_T = Eigen::Matrix4f::Identity();
   this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
+  this->extrinsics_cached_ = false;
 
   // Initialize point clouds
   this->map_cloud = std::make_shared<pcl::PointCloud<PointType>>();
@@ -96,10 +238,14 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->gicp.setMaximumIterations(this->gicp_max_iter_);
   this->gicp.setTransformationEpsilon(this->gicp_transformation_epsilon_);
   this->gicp.setRotationEpsilon(this->gicp_rotation_epsilon_);
+  this->gicp.setDebugPrint(this->debug_lm_print_);
 
   // Set target (map)
   this->gicp.setInputTarget(this->map_cloud);
-  this->gicp.calculateTargetCovariances();
+  if (!this->gicp.calculateTargetCovariances()) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to calculate map covariances! GICP will not work correctly.");
+    throw std::runtime_error("Failed to calculate target covariances");
+  }
 
   // Setup subscribers
   this->pointcloud_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -148,12 +294,46 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
   this->aligned_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_cloud", 10);
+  this->dbg_initial_guess_pose_pub =
+      this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
+  this->dbg_final_pose_pub =
+      this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/final_pose", 10);
+  this->dbg_input_cloud_base_pub =
+      this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/input_cloud_base", 10);
+  this->dbg_initial_guess_cloud_pub =
+      this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/initial_guess_cloud", 10);
+  this->dbg_pose_markers_pub =
+      this->create_publisher<visualization_msgs::msg::MarkerArray>("gicp/localization/debug/pose_markers", 10);
 
   // Debug publishers (small scalar topics for plotting)
   this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
   this->dbg_corr_norm_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/corr_norm", 10);
   this->dbg_scan_dt_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_dt", 10);
   this->dbg_imu_age_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_age", 10);
+  this->dbg_num_correspondences_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/num_correspondences", 10);
+  this->dbg_correspondence_ratio_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/correspondence_ratio", 10);
+  this->dbg_final_error_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/final_error", 10);
+  this->dbg_guess_to_solution_trans_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_trans_m", 10);
+  this->dbg_guess_to_solution_rot_deg_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_rot_deg", 10);
+  this->dbg_guess_from_last_trans_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_m", 10);
+  this->dbg_guess_from_last_rot_deg_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_deg", 10);
+  this->dbg_raw_points_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/raw_points", 10);
+  this->dbg_preprocessed_points_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/preprocessed_points", 10);
+  this->dbg_imu_buffer_span_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_buffer_span_s", 10);
+  this->dbg_scan_to_latest_imu_lag_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_to_latest_imu_lag_s", 10);
+  this->dbg_hessian_condition_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/hessian_condition_proxy", 10);
   this->dbg_jump_trans_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_trans", 10);
   this->dbg_jump_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_rot_deg", 10);
   this->dbg_converged_pub = this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/converged", 10);
@@ -217,7 +397,6 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/publish_tf", true);
   this->declare_parameter<bool>("localization/imu_only", false);
   this->declare_parameter<bool>("localization/use_odom_init", true);
-  this->declare_parameter<double>("localization/publish_rate", 10.0);
   this->declare_parameter<bool>("localization/initial_pose/use", false);
   this->declare_parameter<double>("localization/initial_pose/x", 0.0);
   this->declare_parameter<double>("localization/initial_pose/y", 0.0);
@@ -229,7 +408,6 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/publish_tf", this->publish_tf_);
   this->get_parameter("localization/imu_only", this->imu_only_mode_);
   this->get_parameter("localization/use_odom_init", this->use_odom_init_);
-  this->get_parameter("localization/publish_rate", this->publish_rate_);
   this->get_parameter("localization/initial_pose/use", this->use_param_initial_pose_);
   this->get_parameter("localization/initial_pose/x", this->initial_pose_x_);
   this->get_parameter("localization/initial_pose/y", this->initial_pose_y_);
@@ -244,17 +422,21 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("gicp/maxCorrespondenceDistance", 1.0);
   this->declare_parameter<double>("gicp/transformationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/rotationEpsilon", 0.0001);
+  this->declare_parameter<double>("gicp/fitnessRejectThreshold", 1.0);
+  this->declare_parameter<bool>("gicp/rejectLargeJumps", true);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
   this->get_parameter("gicp/maxCorrespondenceDistance", this->gicp_max_corr_dist_);
   this->get_parameter("gicp/transformationEpsilon", this->gicp_transformation_epsilon_);
   this->get_parameter("gicp/rotationEpsilon", this->gicp_rotation_epsilon_);
+  this->get_parameter("gicp/fitnessRejectThreshold", this->gicp_fitness_reject_threshold_);
+  this->get_parameter("gicp/rejectLargeJumps", this->gicp_reject_large_jumps_);
 
   // Preprocessing parameters
-  this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 0.0);  // Disabled by default
-  this->declare_parameter<bool>("dlio/preprocessing/voxelFilter/use", false);  // DISABLED by default - was removing all points
-  this->declare_parameter<double>("dlio/preprocessing/voxelFilter/res", 0.25);
+  this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
+  this->declare_parameter<bool>("dlio/preprocessing/voxelFilter/use", true);
+  this->declare_parameter<double>("dlio/preprocessing/voxelFilter/res", 0.3);
 
   this->get_parameter("dlio/preprocessing/cropBoxFilter/size", this->crop_size_);
   this->get_parameter("dlio/preprocessing/voxelFilter/use", this->vf_use_);
@@ -289,18 +471,12 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
-  // Geometric Observer parameters
-  this->declare_parameter<double>("odom/geo/Kp", 1.0);
-  this->declare_parameter<double>("odom/geo/Kv", 1.0);
-  this->declare_parameter<double>("odom/geo/Kq", 1.0);
+  // Geometric Observer parameters (bias correction only; Kp/Kv/Kq removed — state is snapped to GICP)
   this->declare_parameter<double>("odom/geo/Kab", 1.0);
   this->declare_parameter<double>("odom/geo/Kgb", 1.0);
   this->declare_parameter<double>("odom/geo/abias_max", 1.0);
   this->declare_parameter<double>("odom/geo/gbias_max", 1.0);
 
-  this->get_parameter("odom/geo/Kp", this->geo_Kp_);
-  this->get_parameter("odom/geo/Kv", this->geo_Kv_);
-  this->get_parameter("odom/geo/Kq", this->geo_Kq_);
   this->get_parameter("odom/geo/Kab", this->geo_Kab_);
   this->get_parameter("odom/geo/Kgb", this->geo_Kgb_);
   this->get_parameter("odom/geo/abias_max", this->geo_abias_max_);
@@ -309,11 +485,15 @@ void gicp_localization::LocalizationNode::getParams() {
   // Debug parameters
   this->declare_parameter<bool>("localization/debug/enable_pub", true);
   this->declare_parameter<bool>("localization/debug/enable_jump_log", true);
+  this->declare_parameter<bool>("localization/debug/verbose_scan_log", false);
+  this->declare_parameter<bool>("localization/debug/nano_gicp_lm_debug", false);
   this->declare_parameter<double>("localization/debug/jump_trans_m", 1.0);
   this->declare_parameter<double>("localization/debug/jump_rot_deg", 10.0);
 
   this->get_parameter("localization/debug/enable_pub", this->debug_pub_enabled_);
   this->get_parameter("localization/debug/enable_jump_log", this->debug_jump_log_enabled_);
+  this->get_parameter("localization/debug/verbose_scan_log", this->debug_verbose_scan_log_);
+  this->get_parameter("localization/debug/nano_gicp_lm_debug", this->debug_lm_print_);
   this->get_parameter("localization/debug/jump_trans_m", this->debug_jump_trans_m_);
   this->get_parameter("localization/debug/jump_rot_deg", this->debug_jump_rot_deg_);
 
@@ -321,14 +501,17 @@ void gicp_localization::LocalizationNode::getParams() {
               this->crop_size_, this->vf_use_ ? "ENABLED" : "DISABLED", this->vf_res_);
   RCLCPP_INFO(this->get_logger(), "IMU config: deskew=%s, gravity=%.2f, buffer_size=%d",
               this->deskew_ ? "ENABLED" : "DISABLED", this->gravity_, this->imu_buffer_size_);
-  RCLCPP_INFO(this->get_logger(), "Geometric Observer: Kp=%.2f, Kv=%.2f, Kq=%.2f",
-              this->geo_Kp_, this->geo_Kv_, this->geo_Kq_);
+  RCLCPP_INFO(this->get_logger(), "Geometric Observer: Kab=%.2f, Kgb=%.2f",
+              this->geo_Kab_, this->geo_Kgb_);
   RCLCPP_INFO(this->get_logger(), "Localization mode: %s",
               this->imu_only_mode_ ? "IMU-only (GICP disabled)" : "GICP + IMU");
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_trans_m_, this->debug_jump_rot_deg_);
+  RCLCPP_INFO(this->get_logger(), "Debug detail: verbose_scan_log=%s nano_gicp_lm_debug=%s",
+              this->debug_verbose_scan_log_ ? "ENABLED" : "DISABLED",
+              this->debug_lm_print_ ? "ENABLED" : "DISABLED");
 }
 
 bool gicp_localization::LocalizationNode::loadMap() {
@@ -459,6 +642,10 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
                                                           const std::string& source) {
 
   Eigen::Quaternionf q = q_in;
+  if (q.squaredNorm() < 1e-10f) {
+    RCLCPP_WARN(this->get_logger(), "Received near-zero quaternion in initial pose, ignoring");
+    return;
+  }
   q.normalize();
 
   {
@@ -561,12 +748,39 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   }
 
   this->scan_stamp = pc_transformed->header.stamp;
+  this->last_scan_input_frame_ = pc->header.frame_id;
+
+  // Cache base_link -> lidar extrinsic from TF (used by deskewing)
+  if (!this->extrinsics_cached_) {
+    try {
+      auto tf_bl = this->tf_buffer->lookupTransform(
+          this->base_frame, this->lidar_frame, tf2::TimePointZero);
+      Eigen::Quaternionf q_bl(
+          tf_bl.transform.rotation.w, tf_bl.transform.rotation.x,
+          tf_bl.transform.rotation.y, tf_bl.transform.rotation.z);
+      Eigen::Vector3f t_bl(
+          tf_bl.transform.translation.x, tf_bl.transform.translation.y,
+          tf_bl.transform.translation.z);
+      this->extrinsics.baselink2lidar.R = q_bl.toRotationMatrix();
+      this->extrinsics.baselink2lidar.t = t_bl;
+      this->extrinsics.baselink2lidar_T.setIdentity();
+      this->extrinsics.baselink2lidar_T.block<3, 3>(0, 0) = q_bl.toRotationMatrix();
+      this->extrinsics.baselink2lidar_T.block<3, 1>(0, 3) = t_bl;
+      this->extrinsics_cached_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "Cached baselink->lidar extrinsic: t=[%.3f,%.3f,%.3f]",
+                  t_bl.x(), t_bl.y(), t_bl.z());
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Cannot cache baselink->lidar TF: %s (using identity)", ex.what());
+    }
+  }
 
   // Convert to PCL format using manual field extraction for robustness
   pcl::PointCloud<PointType>::Ptr raw_scan = std::make_shared<pcl::PointCloud<PointType>>();
 
   // Calculate number of points
-  size_t num_points = pc_transformed->width * pc_transformed->height;
+  size_t num_points = static_cast<size_t>(pc_transformed->width) * pc_transformed->height;
 
   RCLCPP_DEBUG(this->get_logger(), "Received PointCloud2: width=%d, height=%d, num_points=%lu, data_size=%lu",
                pc_transformed->width, pc_transformed->height, num_points, pc_transformed->data.size());
@@ -671,6 +885,7 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   }
 
   RCLCPP_DEBUG(this->get_logger(), "Successfully converted, raw_scan has %lu points", raw_scan->points.size());
+  this->last_raw_point_count_ = raw_scan->points.size();
 
   // For Luminar: read per-point timestamps (uint64 nanoseconds) from the raw PointCloud2 bytes.
   // The manual conversion loop above only reads x/y/z and leaves pt.timestamp as zero.
@@ -707,6 +922,14 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   // Store as original scan for deskewing
   this->original_scan = raw_scan;
 
+  if (this->debug_pub_enabled_ && this->dbg_input_cloud_base_pub->get_subscription_count() > 0) {
+    sensor_msgs::msg::PointCloud2 input_cloud_msg;
+    pcl::toROSMsg(*this->original_scan, input_cloud_msg);
+    input_cloud_msg.header.stamp = this->scan_stamp;
+    input_cloud_msg.header.frame_id = this->base_frame;
+    this->dbg_input_cloud_base_pub->publish(input_cloud_msg);
+  }
+
   // Deskew using IMU
   this->deskewPointcloud();
 
@@ -714,17 +937,25 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
                this->current_scan->points.size());
 
   // Preprocess the deskewed scan
-  this->preprocessPointCloud(this->current_scan);
-
   RCLCPP_DEBUG(this->get_logger(), "Before preprocessing: current_scan has %lu points",
                this->current_scan->points.size());
 
+  this->preprocessPointCloud(this->current_scan);
+
   RCLCPP_DEBUG(this->get_logger(), "After preprocessing: current_scan has %lu points",
                this->current_scan->points.size());
+  this->last_preprocessed_point_count_ = this->current_scan->points.size();
 
   if (this->current_scan->points.empty()) {
     RCLCPP_WARN(this->get_logger(), "Point cloud empty after preprocessing (original had %lu points)",
                 raw_scan->points.size());
+
+    if (this->debug_verbose_scan_log_) {
+      RCLCPP_WARN(this->get_logger(),
+                  "SCAN DEBUG | stamp=%.3f frame=%s raw=%zu pre=0 status=empty_after_preprocess guess=%s",
+                  this->scan_stamp.seconds(), this->last_scan_input_frame_.c_str(),
+                  this->last_raw_point_count_, poseSummary(this->current_pose).c_str());
+    }
     return;
   }
 
@@ -841,7 +1072,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     if (this->imu_buffer.empty()) {
       RCLCPP_WARN(this->get_logger(), "IMU buffer is empty, skipping deskewing");
-      this->current_scan = deskewed_scan_;
+      this->current_scan = this->original_scan;
       this->prev_scan_stamp = this->scan_stamp.seconds();  // Update timestamp
       return;
     }
@@ -930,11 +1161,29 @@ void gicp_localization::LocalizationNode::preprocessPointCloud(pcl::PointCloud<P
   // Voxel filter
   if (this->vf_use_) {
     size_t before_voxel = cloud->points.size();
+    pcl::PointCloud<PointType> filtered;
     pcl::VoxelGrid<PointType> voxel;
     voxel.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
     voxel.setInputCloud(cloud);
-    voxel.filter(*cloud);
-    RCLCPP_DEBUG(this->get_logger(), "Voxel filter: %lu -> %lu points", before_voxel, cloud->points.size());
+    voxel.filter(filtered);
+    if (filtered.points.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Voxel filter removed ALL %lu input points (res=%.3f m) — "
+                  "check point coordinates and frame; keeping unfiltered cloud for this scan",
+                  before_voxel, this->vf_res_);
+      // Leave cloud unchanged — no copy needed.
+    } else {
+      *cloud = std::move(filtered);
+      const double reduction = 1.0 - static_cast<double>(cloud->points.size()) /
+                                         static_cast<double>(before_voxel);
+      if (reduction > 0.99) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Voxel filter removed %.1f%% of points (%lu -> %lu, res=%.3f m) — "
+                    "check point frame/coordinates",
+                    reduction * 100.0, before_voxel, cloud->points.size(), this->vf_res_);
+      }
+      RCLCPP_DEBUG(this->get_logger(), "Voxel filter: %lu -> %lu points", before_voxel, cloud->points.size());
+    }
   }
 
   RCLCPP_DEBUG(this->get_logger(), "Preprocessing: %lu -> %lu points total", original_size, cloud->points.size());
@@ -960,6 +1209,14 @@ void gicp_localization::LocalizationNode::performLocalization() {
   // So we align with identity, and the result is the correction T_corr
   // Final pose = T_corr * T_prior (similar to DLIO)
   Eigen::Matrix4f initial_guess = this->deskew_ ? Eigen::Matrix4f::Identity() : this->current_pose;
+  Eigen::Matrix4f guess_pose_map = this->deskew_ ? this->T_prior : this->current_pose;
+
+  double guess_from_last_trans = 0.0;
+  double guess_from_last_rot_deg = 0.0;
+  if (this->last_gicp_valid_) {
+    guess_from_last_trans = deltaTranslationNorm(this->last_gicp_pose_, guess_pose_map);
+    guess_from_last_rot_deg = rotationDistanceDeg(this->last_gicp_pose_, guess_pose_map);
+  }
 
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Starting GICP alignment...");
   auto start = std::chrono::high_resolution_clock::now();
@@ -970,18 +1227,222 @@ void gicp_localization::LocalizationNode::performLocalization() {
   double elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
   double fitness_score = this->gicp.getFitnessScore();
+  double final_error = this->gicp.getFinalError();
   bool converged = this->gicp.hasConverged();
+  const int num_correspondences = this->gicp.num_correspondences;
+  const double correspondence_ratio =
+      this->current_scan->points.empty()
+          ? 0.0
+          : static_cast<double>(num_correspondences) / static_cast<double>(this->current_scan->points.size());
+  const Eigen::Matrix<double, 6, 6>& final_hessian = this->gicp.getFinalHessian();
+  const double hessian_condition = hessianConditionProxy(final_hessian);
 
-  if (converged) {
-    Eigen::Matrix4f T_corr = this->gicp.getFinalTransformation();
+  const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
+  const Eigen::Matrix4f candidate_pose = this->deskew_ ? optimizer_solution * this->T_prior : optimizer_solution;
+  const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
-    // If deskewing is enabled, combine correction with IMU prior
-    // Otherwise, T_corr is the full pose
-    if (this->deskew_) {
-      this->current_pose = T_corr * this->T_prior;
-    } else {
-      this->current_pose = T_corr;
+  double guess_to_solution_trans = -1.0;
+  double guess_to_solution_rot_deg = -1.0;
+  if (candidate_pose_valid) {
+    guess_to_solution_trans = deltaTranslationNorm(guess_pose_map, candidate_pose);
+    guess_to_solution_rot_deg = rotationDistanceDeg(guess_pose_map, candidate_pose);
+  }
+
+  double scan_dt = 0.0;
+  if (this->last_gicp_valid_) {
+    scan_dt = (this->scan_stamp - this->last_gicp_stamp_).seconds();
+  }
+
+  double imu_buffer_span = -1.0;
+  double scan_to_latest_imu_lag = -1.0;
+  {
+    std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
+    if (!this->imu_buffer.empty()) {
+      const double latest_imu_stamp = this->imu_buffer.front().stamp;
+      const double oldest_imu_stamp = this->imu_buffer.back().stamp;
+      imu_buffer_span = latest_imu_stamp - oldest_imu_stamp;
+      scan_to_latest_imu_lag = this->scan_stamp.seconds() - latest_imu_stamp;
     }
+  }
+
+  double jump_trans = -1.0;
+  double jump_rot_deg = -1.0;
+  if (candidate_pose_valid && this->last_gicp_valid_) {
+    jump_trans = deltaTranslationNorm(this->last_gicp_pose_, candidate_pose);
+    jump_rot_deg = rotationDistanceDeg(this->last_gicp_pose_, candidate_pose);
+  }
+  const bool large_jump = candidate_pose_valid && this->last_gicp_valid_ &&
+                          (jump_trans > this->debug_jump_trans_m_ || jump_rot_deg > this->debug_jump_rot_deg_);
+
+  if (this->debug_pub_enabled_) {
+    auto publish_float = [](const rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr& pub, double value) {
+      std_msgs::msg::Float64 msg;
+      msg.data = value;
+      pub->publish(msg);
+    };
+
+    publish_float(this->dbg_fitness_pub, fitness_score);
+    publish_float(this->dbg_corr_norm_pub, guess_to_solution_trans);
+    publish_float(this->dbg_scan_dt_pub, scan_dt);
+    publish_float(this->dbg_imu_age_pub, imu_buffer_span);
+    publish_float(this->dbg_num_correspondences_pub, static_cast<double>(num_correspondences));
+    publish_float(this->dbg_correspondence_ratio_pub, correspondence_ratio);
+    publish_float(this->dbg_final_error_pub, final_error);
+    publish_float(this->dbg_guess_to_solution_trans_pub, guess_to_solution_trans);
+    publish_float(this->dbg_guess_to_solution_rot_deg_pub, guess_to_solution_rot_deg);
+    publish_float(this->dbg_guess_from_last_trans_pub, guess_from_last_trans);
+    publish_float(this->dbg_guess_from_last_rot_deg_pub, guess_from_last_rot_deg);
+    publish_float(this->dbg_raw_points_pub, static_cast<double>(this->last_raw_point_count_));
+    publish_float(this->dbg_preprocessed_points_pub, static_cast<double>(this->last_preprocessed_point_count_));
+    publish_float(this->dbg_imu_buffer_span_pub, imu_buffer_span);
+    publish_float(this->dbg_scan_to_latest_imu_lag_pub, scan_to_latest_imu_lag);
+    publish_float(this->dbg_hessian_condition_pub, hessian_condition);
+    publish_float(this->dbg_jump_trans_pub, jump_trans);
+    publish_float(this->dbg_jump_rot_deg_pub, jump_rot_deg);
+
+    std_msgs::msg::Bool converged_msg;
+    converged_msg.data = converged && candidate_pose_valid;
+    this->dbg_converged_pub->publish(converged_msg);
+
+    this->dbg_initial_guess_pose_pub->publish(
+        poseStampedFromMatrix(guess_pose_map, this->scan_stamp, this->map_frame));
+    if (candidate_pose_valid) {
+      this->dbg_final_pose_pub->publish(
+          poseStampedFromMatrix(candidate_pose, this->scan_stamp, this->map_frame));
+    }
+
+    if (this->dbg_initial_guess_cloud_pub->get_subscription_count() > 0 && matrixFinite(guess_pose_map)) {
+      pcl::PointCloud<PointType> guessed_cloud;
+      if (this->deskew_) {
+        guessed_cloud = *this->current_scan;
+      } else {
+        pcl::transformPointCloud(*this->current_scan, guessed_cloud, guess_pose_map);
+      }
+
+      sensor_msgs::msg::PointCloud2 guessed_cloud_msg;
+      pcl::toROSMsg(guessed_cloud, guessed_cloud_msg);
+      guessed_cloud_msg.header.stamp = this->scan_stamp;
+      guessed_cloud_msg.header.frame_id = this->map_frame;
+      this->dbg_initial_guess_cloud_pub->publish(guessed_cloud_msg);
+    }
+
+    if (this->dbg_pose_markers_pub->get_subscription_count() > 0) {
+      visualization_msgs::msg::MarkerArray markers;
+
+      visualization_msgs::msg::Marker clear_marker;
+      clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+      markers.markers.push_back(clear_marker);
+
+      markers.markers.push_back(
+          makeArrowMarker(guess_pose_map, this->map_frame, this->scan_stamp, 0, "gicp_debug_guess", 1.0f, 0.55f, 0.0f));
+
+      if (candidate_pose_valid) {
+        markers.markers.push_back(
+            makeArrowMarker(candidate_pose, this->map_frame, this->scan_stamp, 1, "gicp_debug_solution", 0.0f, 0.9f, 0.2f));
+
+        visualization_msgs::msg::Marker line_marker;
+        line_marker.header.stamp = this->scan_stamp;
+        line_marker.header.frame_id = this->map_frame;
+        line_marker.ns = "gicp_debug_delta";
+        line_marker.id = 2;
+        line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        line_marker.action = visualization_msgs::msg::Marker::ADD;
+        line_marker.scale.x = 0.12;
+        line_marker.color.a = 1.0f;
+        line_marker.color.r = 1.0f;
+        line_marker.color.g = 1.0f;
+        line_marker.color.b = 0.0f;
+
+        geometry_msgs::msg::Point guess_point;
+        guess_point.x = guess_pose_map(0, 3);
+        guess_point.y = guess_pose_map(1, 3);
+        guess_point.z = guess_pose_map(2, 3);
+        line_marker.points.push_back(guess_point);
+
+        geometry_msgs::msg::Point final_point;
+        final_point.x = candidate_pose(0, 3);
+        final_point.y = candidate_pose(1, 3);
+        final_point.z = candidate_pose(2, 3);
+        line_marker.points.push_back(final_point);
+        markers.markers.push_back(line_marker);
+      }
+
+      this->dbg_pose_markers_pub->publish(markers);
+    }
+  }
+
+  if (this->aligned_cloud_pub->get_subscription_count() > 0) {
+    sensor_msgs::msg::PointCloud2 aligned_msg;
+    pcl::toROSMsg(*aligned, aligned_msg);
+    aligned_msg.header.stamp = this->scan_stamp;
+    aligned_msg.header.frame_id = this->map_frame;
+    this->aligned_cloud_pub->publish(aligned_msg);
+  }
+
+  auto build_scan_debug_log = [&](const char* status) {
+    std::ostringstream oss;
+    oss << std::fixed
+        << "SCAN DEBUG | status=" << status
+        << " stamp=" << std::setprecision(3) << this->scan_stamp.seconds()
+        << " input_frame=" << this->last_scan_input_frame_
+        << " raw=" << this->last_raw_point_count_
+        << " pre=" << this->last_preprocessed_point_count_
+        << " guess={" << poseSummary(guess_pose_map) << "}"
+        << " guess_from_last=[" << scalarSummary(guess_from_last_trans) << "m,"
+        << scalarSummary(guess_from_last_rot_deg) << "deg]"
+        << " gicp_ms=" << scalarSummary(elapsed_ms, 2)
+        << " converged=" << (converged ? "true" : "false")
+        << " fitness=" << scalarSummary(fitness_score, 6)
+        << " final_error=" << scalarSummary(final_error, 6)
+        << " correspondences=" << num_correspondences << "/" << this->current_scan->points.size()
+        << " ratio=" << scalarSummary(correspondence_ratio, 3)
+        << " guess_to_solution=[" << scalarSummary(guess_to_solution_trans) << "m,"
+        << scalarSummary(guess_to_solution_rot_deg) << "deg]"
+        << " jump=[" << scalarSummary(jump_trans) << "m," << scalarSummary(jump_rot_deg) << "deg]"
+        << " imu_buffer_span=" << scalarSummary(imu_buffer_span) << "s"
+        << " scan_to_latest_imu_lag=" << scalarSummary(scan_to_latest_imu_lag) << "s"
+        << " hessian_cond=" << scalarSummary(hessian_condition, 3)
+        << " candidate={" << poseSummary(candidate_pose) << "}";
+
+    if (this->last_gicp_valid_) {
+      oss << " last_good={" << poseSummary(this->last_gicp_pose_) << "}";
+    }
+    return oss.str();
+  };
+
+  // Fitness gating and jump rejection — evaluated after convergence check.
+  bool gicp_rejected_fitness = false;
+  bool gicp_rejected_jump = false;
+  if (converged && candidate_pose_valid) {
+    if (fitness_score > this->gicp_fitness_reject_threshold_) {
+      gicp_rejected_fitness = true;
+    } else if (this->gicp_reject_large_jumps_ && large_jump) {
+      gicp_rejected_jump = true;
+    }
+  }
+  const bool gicp_accepted = converged && candidate_pose_valid && !gicp_rejected_fitness && !gicp_rejected_jump;
+
+  if (!candidate_pose_valid) {
+    RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
+  } else if (!converged) {
+    RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("failed_to_converge").c_str());
+  } else if (gicp_rejected_fitness) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
+                fitness_score, this->gicp_fitness_reject_threshold_,
+                build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_jump) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg): %s",
+                jump_trans, jump_rot_deg, build_scan_debug_log("rejected_jump").c_str());
+  } else if (large_jump) {
+    RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("large_jump").c_str());
+  } else if (this->debug_verbose_scan_log_) {
+    RCLCPP_INFO(this->get_logger(), "%s", build_scan_debug_log("ok").c_str());
+  }
+
+  if (gicp_accepted) {
+    this->current_pose = candidate_pose;
 
     // Update lidar pose for next iteration
     Eigen::Vector3f new_p = this->current_pose.block<3, 1>(0, 3);
@@ -1028,62 +1489,15 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
 
     // Use geometric observer velocity for next IMU integration
-    this->prev_vel = this->geo.prev_vel;
-
-    // Debug metrics
-    double scan_dt = 0.0;
-    if (this->last_gicp_valid_) {
-      scan_dt = (this->scan_stamp - this->last_gicp_stamp_).seconds();
-    }
-
-    double imu_age = -1.0;
     {
-      std::lock_guard<std::mutex> lock(this->mtx_imu);
-      if (!this->imu_buffer.empty()) {
-        imu_age = this->imu_buffer.front().stamp - this->imu_buffer.back().stamp;
-      }
-    }
-
-    double jump_trans = -1.0;
-    double jump_rot_deg = -1.0;
-    if (gicp_valid && this->last_gicp_valid_) {
-      const Eigen::Vector3f last_p = this->last_gicp_pose_.block<3, 1>(0, 3);
-      const Eigen::Matrix3f last_R = this->last_gicp_pose_.block<3, 3>(0, 0);
-      Eigen::Quaternionf last_q(last_R);
-      last_q.normalize();
-
-      Eigen::Quaternionf dq = last_q.conjugate() * q;
-      dq.normalize();
-      double dq_w = std::max(-1.0, std::min(1.0, static_cast<double>(dq.w())));
-      double angle_rad = 2.0 * std::acos(dq_w);
-
-      jump_trans = (new_p - last_p).norm();
-      jump_rot_deg = angle_rad * 57.29577951308232;
-    }
-
-    if (this->debug_pub_enabled_) {
-      std_msgs::msg::Float64 f;
-      f.data = fitness_score;
-      this->dbg_fitness_pub->publish(f);
-      f.data = T_corr.block<3, 1>(0, 3).norm();
-      this->dbg_corr_norm_pub->publish(f);
-      f.data = scan_dt;
-      this->dbg_scan_dt_pub->publish(f);
-      f.data = imu_age;
-      this->dbg_imu_age_pub->publish(f);
-      f.data = jump_trans;
-      this->dbg_jump_trans_pub->publish(f);
-      f.data = jump_rot_deg;
-      this->dbg_jump_rot_deg_pub->publish(f);
-      std_msgs::msg::Bool b;
-      b.data = true;
-      this->dbg_converged_pub->publish(b);
+      std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+      this->prev_vel = this->geo.prev_vel;
     }
 
     if (this->debug_jump_log_enabled_ && gicp_valid && this->last_gicp_valid_) {
-      if (jump_trans > this->debug_jump_trans_m_ || jump_rot_deg > this->debug_jump_rot_deg_) {
+      if (large_jump) {
         const Eigen::Vector3f t_prior = this->T_prior.block<3, 1>(0, 3);
-        const Eigen::Vector3f t_corr = T_corr.block<3, 1>(0, 3);
+        const Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
         RCLCPP_WARN(this->get_logger(),
                     "JUMP DETECTED: dT=%.3fm dR=%.2fdeg | dt=%.3fs fitness=%.6f | prior=[%.2f,%.2f,%.2f] corr=[%.2f,%.2f,%.2f]",
                     jump_trans, jump_rot_deg, scan_dt, fitness_score,
@@ -1100,35 +1514,35 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
 
     // Log pose and correction
-    Eigen::Vector3f t_corr = T_corr.block<3, 1>(0, 3);
+    Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
     RCLCPP_INFO(this->get_logger(),
                 "Localization: ✓ CONVERGED | fitness=%.6f | time=%.2fms | "
                 "correction=[%.3f, %.3f, %.3f] | pose=[%.2f, %.2f, %.2f]",
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
                 this->lidarPose.p.x(), this->lidarPose.p.y(), this->lidarPose.p.z());
-
-    // Publish aligned cloud for visualization
-    if (this->aligned_cloud_pub->get_subscription_count() > 0) {
-      sensor_msgs::msg::PointCloud2 aligned_msg;
-      pcl::toROSMsg(*aligned, aligned_msg);
-      aligned_msg.header.stamp = this->scan_stamp;
-      aligned_msg.header.frame_id = this->map_frame;
-      this->aligned_cloud_pub->publish(aligned_msg);
+  } else if (gicp_rejected_fitness || gicp_rejected_jump) {
+    // GICP succeeded numerically but was gated out. Fall back to the IMU-integrated prior so
+    // the vehicle continues with dead-reckoning instead of stale pose.
+    if (this->deskew_ && matrixFinite(this->T_prior)) {
+      this->current_pose = this->T_prior;
+      const Eigen::Vector3f new_p = this->T_prior.block<3, 1>(0, 3);
+      Eigen::Quaternionf q(this->T_prior.block<3, 3>(0, 0));
+      q.normalize();
+      this->lidarPose.p = new_p;
+      this->lidarPose.q = q;
+      RCLCPP_WARN(this->get_logger(),
+                  "Localization: ⚠ GICP REJECTED — holding IMU dead-reckoning pose [%.2f, %.2f, %.2f]",
+                  new_p.x(), new_p.y(), new_p.z());
+    } else {
+      // Deskew disabled: T_prior is not maintained; hold last accepted pose.
+      RCLCPP_WARN(this->get_logger(),
+                  "Localization: ⚠ GICP REJECTED — holding last accepted pose (deskew disabled)");
     }
   } else {
     RCLCPP_WARN(this->get_logger(),
                 "Localization: ✗ FAILED TO CONVERGE | fitness=%.6f | time=%.2fms | Pose NOT updated!",
                 fitness_score, elapsed_ms);
-
-    if (this->debug_pub_enabled_) {
-      std_msgs::msg::Float64 f;
-      f.data = fitness_score;
-      this->dbg_fitness_pub->publish(f);
-      std_msgs::msg::Bool b;
-      b.data = false;
-      this->dbg_converged_pub->publish(b);
-    }
   }
 }
 
@@ -1208,9 +1622,11 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   }
 
   // Propagate state with geometric observer (only after initialization)
-  static int propagate_calls = 0;
-  static int imu_total = 0;
-  static bool logged_first_propagate = false;
+  // Note: counters are member-like but use thread_local to avoid data races
+  // when the Reentrant callback group processes IMU concurrently.
+  thread_local int propagate_calls = 0;
+  thread_local int imu_total = 0;
+  thread_local bool logged_first_propagate = false;
   imu_total++;
 
   if (this->initialized && (this->geo.first_opt_done || this->imu_only_mode_)) {
@@ -1225,11 +1641,11 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   }
 
   // Debug: Log IMU and propagation rates periodically
-  static int imu_count = 0;
+  thread_local int imu_count = 0;
   if (++imu_count % 100 == 0) {  // Log every 100 IMU messages (~1 second)
     std::lock_guard<std::mutex> lock(this->mtx_imu);
     RCLCPP_INFO(this->get_logger(), "IMU rate check: %d callbacks, %d propagations, initialized=%d, geo_init=%d",
-                imu_total, propagate_calls, this->initialized, this->geo.first_opt_done.load());
+                imu_total, propagate_calls, this->initialized.load(), this->geo.first_opt_done.load());
     imu_total = 0;
     propagate_calls = 0;
   }
@@ -1304,7 +1720,7 @@ gicp_localization::LocalizationNode::integrateImu(
   // Time between first two IMU samples
   double dt = f2.dt;
 
-  if (dt <= 0.0) {
+  if (dt < 1e-6) {
     return empty;
   }
 
@@ -1389,7 +1805,7 @@ gicp_localization::LocalizationNode::integrateImuInternal(
     // Time between IMU samples
     double dt = f.dt;
 
-    if (dt <= 0.0) {
+    if (dt < 1e-6) {
       prev_imu_it = imu_it;
       continue;
     }
@@ -1487,6 +1903,7 @@ void gicp_localization::LocalizationNode::propagateState() {
   Eigen::Vector3f current_v_lin_w;
   Eigen::Vector3f bias_gyro;
   Eigen::Vector3f bias_accel;
+  uint64_t seq_at_read;
 
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
@@ -1495,6 +1912,7 @@ void gicp_localization::LocalizationNode::propagateState() {
     current_v_lin_w = this->state.v.lin.w;
     bias_gyro = this->state.b.gyro;
     bias_accel = this->state.b.accel;
+    seq_at_read = this->geo.update_seq;
   }
 
   // Do computation without holding lock
@@ -1522,18 +1940,15 @@ void gicp_localization::LocalizationNode::propagateState() {
   }
 
   // Position propagation (with gravity compensation)
-  // For ground vehicles: only propagate x,y from IMU; z comes from GICP only
   Eigen::Vector3f new_p = current_p;
-  new_p[0] += current_v_lin_w[0]*dt + 0.5*dt*dt*world_accel[0];
-  new_p[1] += current_v_lin_w[1]*dt + 0.5*dt*dt*world_accel[1];
-  // new_p[2] stays unchanged - no z propagation to avoid IMU drift
+  new_p += current_v_lin_w*dt + 0.5f*dt*dt*world_accel;
 
   // Velocity propagation
-  // Also zero out z-velocity since we assume ground vehicle (no sustained vertical motion)
-  Eigen::Vector3f new_v_lin_w = current_v_lin_w;
-  new_v_lin_w[0] += world_accel[0]*dt;
-  new_v_lin_w[1] += world_accel[1]*dt;
-  new_v_lin_w[2] = 0.0;  // Zero z-velocity for ground vehicle
+  // Dampen Z-velocity to prevent IMU drift while allowing transient vertical motion
+  // (banked turns, bumps). Full propagation in XY; exponential decay in Z.
+  Eigen::Vector3f new_v_lin_w = current_v_lin_w + world_accel*dt;
+  constexpr float kZVelDamping = 0.95f;  // ~50 ms time constant at 100 Hz
+  new_v_lin_w[2] *= kZVelDamping;
 
   // Orientation propagation
   omega.w() = 0;
@@ -1661,15 +2076,19 @@ void gicp_localization::LocalizationNode::propagateState() {
     last_report_time = now;
   }
 
-  // Update state AFTER publishing to avoid race condition
+  // Update state AFTER publishing. If updateState() ran between our read and
+  // this write (GICP corrected the state), skip the write to avoid overwriting
+  // the fresh GICP correction with stale IMU-propagated values.
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
-    this->state.p = new_p;
-    this->state.q = new_q;
-    this->state.v.lin.w = new_v_lin_w;
-    this->state.v.lin.b = new_q.toRotationMatrix().inverse() * new_v_lin_w;
-    this->state.v.ang.b = new_v_ang_b;
-    this->state.v.ang.w = new_v_ang_w;
+    if (this->geo.update_seq == seq_at_read) {
+      this->state.p = new_p;
+      this->state.q = new_q;
+      this->state.v.lin.w = new_v_lin_w;
+      this->state.v.lin.b = new_q.toRotationMatrix().inverse() * new_v_lin_w;
+      this->state.v.ang.b = new_v_ang_b;
+      this->state.v.ang.w = new_v_ang_w;
+    }
   }
 
   if (this->imu_only_mode_) {
@@ -1786,6 +2205,7 @@ void gicp_localization::LocalizationNode::updateState() {
   this->geo.prev_p = this->state.p;
   this->geo.prev_q = this->state.q;
   this->geo.prev_vel = this->state.v.lin.w;
+  ++this->geo.update_seq;  // Signal propagateState to discard stale computations
 
   // Log update status periodically
   static int update_count = 0;

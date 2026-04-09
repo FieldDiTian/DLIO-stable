@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/terramaster/lc_map_lidar_imu_odom.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/media/terramaster/lc_three_lidar_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
@@ -36,9 +36,6 @@
     # If false, waits for initial pose from RViz or topic
     localization/use_odom_init: true
 
-    # Publishing rate for high-rate pose topic (Hz)
-    localization/publish_rate: 100.0
-
     # Optional initial pose (Set use=true and update pose to skip RViz initialization)
     localization/initial_pose/use: false
     localization/initial_pose/x: 0.0    # meters
@@ -49,9 +46,12 @@
     localization/initial_pose/yaw: 0.0  # radians
 
     # Preprocessing Parameters (override defaults for localization)
-    dlio/preprocessing/cropBoxFilter/size: 0.0  # Disabled (set to 0) - no cropping
-    dlio/preprocessing/voxelFilter/use: false  # DISABLED - voxel filter was removing all points
-    dlio/preprocessing/voxelFilter/res: 0.5  # Slightly coarser for faster processing
+    # Crop box filter: keeps points within ±size meters of sensor origin (sensor frame).
+    # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in world frame,
+    # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
+    dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
+    dlio/preprocessing/voxelFilter/use: true   # Re-enabled: leaf size below is appropriate for Luminar
+    dlio/preprocessing/voxelFilter/res: 0.3   # 0.3 m voxel — good balance of density vs. speed
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z)
     localization/flip_y: true
@@ -61,14 +61,11 @@
     localization/sensor_type: "luminar"
 
     # IMU and Deskewing Parameters
-    dlio/deskew: false  # Enable pointcloud deskewing using IMU
+    dlio/deskew: true  # Enable pointcloud deskewing using IMU (essential for high-speed racing)
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
 
-    # Geometric Observer Parameters (for state estimation and IMU bias correction)
-    odom/geo/Kp: 1.0      # Position correction gain
-    odom/geo/Kv: 1.0      # Velocity correction gain
-    odom/geo/Kq: 1.0      # Orientation correction gain
+    # Geometric Observer Parameters (bias correction only; pose is snapped to GICP)
     odom/geo/Kab: 0.1     # Accelerometer bias correction gain
     odom/geo/Kgb: 0.1     # Gyroscope bias correction gain
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
@@ -77,6 +74,8 @@
     # Debug / Visualization helpers
     localization/debug/enable_pub: true
     localization/debug/enable_jump_log: true
+    localization/debug/verbose_scan_log: true
+    localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
     localization/debug/jump_trans_m: 1.0      # Log if pose jumps > this (meters)
     localization/debug/jump_rot_deg: 10.0     # Log if pose jumps > this (degrees)
 
@@ -92,9 +91,14 @@
     # Increased to handle larger initial errors
     gicp/maxCorrespondenceDistance: 2.0
 
-    # Convergence criteria (relaxed slightly for faster convergence)
-    gicp/transformationEpsilon: 0.01
-    gicp/rotationEpsilon: 0.01  
+    # Convergence criteria — tightened now that downsampling is re-enabled
+    gicp/transformationEpsilon: 0.001
+    gicp/rotationEpsilon: 0.001
+
+    # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
+    # fitness score = mean squared distance of correspondences; < 0.5 is good, > 1.0 is suspect.
+    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
   
 
   

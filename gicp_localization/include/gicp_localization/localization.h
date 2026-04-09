@@ -14,6 +14,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
@@ -98,10 +99,27 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_cloud_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_initial_guess_pose_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_final_pose_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_input_cloud_base_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_initial_guess_cloud_pub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dbg_pose_markers_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_fitness_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_corr_norm_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_dt_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_imu_age_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_num_correspondences_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_correspondence_ratio_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_final_error_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_guess_to_solution_trans_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_guess_to_solution_rot_deg_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_guess_from_last_trans_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_guess_from_last_rot_deg_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_raw_points_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_preprocessed_points_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_imu_buffer_span_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_to_latest_imu_lag_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_hessian_condition_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_trans_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_rot_deg_pub;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
@@ -122,6 +140,9 @@ private:
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
   double prev_scan_stamp;
+  std::string last_scan_input_frame_;
+  size_t last_raw_point_count_;
+  size_t last_preprocessed_point_count_;
 
   // GICP matcher
   nano_gicp::NanoGICP<PointType, PointType> gicp;
@@ -129,7 +150,7 @@ private:
   // Current pose estimate
   Eigen::Matrix4f current_pose;
   Eigen::Matrix4f T_prior;  // IMU-based prior transformation
-  bool initialized;
+  std::atomic<bool> initialized;
   std::mutex pose_mutex;
 
   // Debug tracking
@@ -179,6 +200,7 @@ private:
   struct Geo {
     std::atomic<bool> first_opt_done;
     std::mutex mtx;
+    uint64_t update_seq;  // Incremented by updateState; checked by propagateState
     double dp;
     double dq_deg;
     Eigen::Vector3f prev_p;
@@ -205,7 +227,6 @@ private:
   double map_pitch_deg_;
   double map_yaw_deg_;
   double voxel_leaf_size_;
-  double publish_rate_;
   bool publish_tf_;
   bool imu_only_mode_;
   bool use_odom_init_;
@@ -223,6 +244,8 @@ private:
   double gicp_max_corr_dist_;
   double gicp_transformation_epsilon_;
   double gicp_rotation_epsilon_;
+  double gicp_fitness_reject_threshold_;
+  bool gicp_reject_large_jumps_;
 
   // Preprocessing parameters
   double crop_size_;
@@ -236,10 +259,7 @@ private:
   bool flip_y_;
   bool is_luminar_;  // Luminar LiDAR: timestamp field is uint64 hardware ns, not Unix epoch
 
-  // Geometric observer parameters
-  double geo_Kp_;
-  double geo_Kv_;
-  double geo_Kq_;
+  // Geometric observer parameters (bias correction gains)
   double geo_Kab_;
   double geo_Kgb_;
   double geo_abias_max_;
@@ -248,6 +268,8 @@ private:
   // Debug parameters
   bool debug_pub_enabled_;
   bool debug_jump_log_enabled_;
+  bool debug_verbose_scan_log_;
+  bool debug_lm_print_;
   double debug_jump_trans_m_;
   double debug_jump_rot_deg_;
 
@@ -262,6 +284,7 @@ private:
     Eigen::Matrix4f baselink2imu_T;
     Eigen::Matrix4f baselink2lidar_T;
   }; Extrinsics extrinsics;
+  bool extrinsics_cached_;  // True once baselink2lidar_T has been populated from TF
 
   // Map visualization
   bool visualize_map_;
