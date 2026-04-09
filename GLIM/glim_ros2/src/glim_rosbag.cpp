@@ -91,6 +91,76 @@ static sensor_msgs::msg::PointCloud2::SharedPtr find_nearest(
   return (best && best_dt <= threshold) ? best : nullptr;
 }
 
+/// Find per-point time field offset and datatype in a PointCloud2 message.
+/// Returns true if a time field was found.
+static bool find_time_field(const sensor_msgs::msg::PointCloud2& msg, int& time_off, uint8_t& time_datatype, int& time_count) {
+  time_off = -1;
+  time_datatype = 0;
+  time_count = 0;
+  for (const auto& f : msg.fields) {
+    if (f.name == "t" || f.name == "time" || f.name == "time_stamp" || f.name == "timestamp") {
+      time_off = f.offset;
+      time_datatype = f.datatype;
+      time_count = f.count;
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Shift per-point timestamps in raw cloud data by dt seconds.
+/// dt = t_aux_header - t_primary_header, so aux points get rebased to primary's timebase.
+static void shift_cloud_timestamps(
+  std::vector<uint8_t>& data,
+  uint32_t point_step,
+  int time_off,
+  uint8_t time_datatype,
+  int time_count,
+  double dt) {
+  if (time_off < 0) return;
+
+  const size_t num_points = data.size() / point_step;
+  for (size_t i = 0; i < num_points; i++) {
+    uint8_t* time_ptr = &data[i * point_step + time_off];
+    switch (time_datatype) {
+      case sensor_msgs::msg::PointField::UINT32: {
+        uint32_t val;
+        std::memcpy(&val, time_ptr, sizeof(uint32_t));
+        int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
+        val = static_cast<uint32_t>(std::max<int64_t>(0, shifted));
+        std::memcpy(time_ptr, &val, sizeof(uint32_t));
+        break;
+      }
+      case sensor_msgs::msg::PointField::FLOAT32: {
+        float val;
+        std::memcpy(&val, time_ptr, sizeof(float));
+        val += static_cast<float>(dt);
+        std::memcpy(time_ptr, &val, sizeof(float));
+        break;
+      }
+      case sensor_msgs::msg::PointField::FLOAT64: {
+        double val;
+        std::memcpy(&val, time_ptr, sizeof(double));
+        val += dt;
+        std::memcpy(time_ptr, &val, sizeof(double));
+        break;
+      }
+      case sensor_msgs::msg::PointField::UINT8: {
+        if (time_count == 8) {
+          uint64_t val;
+          std::memcpy(&val, time_ptr, sizeof(uint64_t));
+          int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
+          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
+          std::memcpy(time_ptr, &val, sizeof(uint64_t));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
 static sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
   const sensor_msgs::msg::PointCloud2::SharedPtr& primary,
   std::vector<AuxLidarSensor>& aux_sensors,
@@ -123,6 +193,19 @@ static sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
     if (find_xyz_offsets(*match, ax, ay, az)) {
       transform_cloud_data(data, point_step, ax, ay, az, aux.T_primary_sensor);
     }
+
+    // Rebase per-point timestamps from aux clock to primary clock.
+    // dt is the header time difference: points in the aux cloud need their
+    // timestamps shifted so they are relative to the primary scan's timebase.
+    int time_off;
+    uint8_t time_datatype;
+    int time_count;
+    if (find_time_field(*match, time_off, time_datatype, time_count)) {
+      double dt = stamp_to_sec(match->header.stamp) - t_primary;
+      shift_cloud_timestamps(data, point_step, time_off, time_datatype, time_count, dt);
+      spdlog::debug("lidar_concat: shifted timestamps for {} by {:.6f}s", aux.topic, dt);
+    }
+
     merged->data.insert(merged->data.end(), data.begin(), data.end());
     total_points += match->width * match->height;
 
