@@ -166,6 +166,14 @@ private:
   std::mutex mtx_imu;
   std::atomic<bool> first_imu_received;
 
+  // IMU calibration state
+  std::atomic<bool> imu_calibrated_;
+  double imu_calib_time_;           // seconds to accumulate for calibration
+  double imu_calib_start_stamp_;
+  int imu_calib_count_;
+  Eigen::Vector3f imu_calib_gyro_sum_;
+  Eigen::Vector3f imu_calib_accel_sum_;
+
   // Pose tracking
   struct Pose {
     Eigen::Vector3f p;
@@ -259,7 +267,10 @@ private:
   bool flip_y_;
   bool is_luminar_;  // Luminar LiDAR: timestamp field is uint64 hardware ns, not Unix epoch
 
-  // Geometric observer parameters (bias correction gains)
+  // Geometric observer parameters
+  double geo_Kp_;
+  double geo_Kv_;
+  double geo_Kq_;
   double geo_Kab_;
   double geo_Kgb_;
   double geo_abias_max_;
@@ -285,11 +296,16 @@ private:
     Eigen::Matrix4f baselink2lidar_T;
   }; Extrinsics extrinsics;
   bool extrinsics_cached_;  // True once baselink2lidar_T has been populated from TF
+  bool imu_extrinsics_cached_;  // True once baselink2imu has been populated from TF
 
   // Map visualization
   bool visualize_map_;
   double map_voxel_size_vis_;
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
+
+  // Pre-localization initial pose republisher (publishes initial guess + TF
+  // until GICP produces a real result, so RViz has something to show).
+  rclcpp::TimerBase::SharedPtr initial_pose_pub_timer_;
 
 };
 

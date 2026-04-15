@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/terramaster/lc_three_lidar_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/media/terramaster/merged_run2_new_attempt.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
@@ -34,16 +34,21 @@
     # Use odometry for pose initialization
     # If true, waits for first odometry message to initialize
     # If false, waits for initial pose from RViz or topic
-    localization/use_odom_init: true
+    localization/use_odom_init: false
 
-    # Optional initial pose (Set use=true and update pose to skip RViz initialization)
-    localization/initial_pose/use: false
-    localization/initial_pose/x: 0.0    # meters
-    localization/initial_pose/y: 0.0    # meters
-    localization/initial_pose/z: 0.0    # meters
-    localization/initial_pose/roll: 0.0 # radians
-    localization/initial_pose/pitch: 0.0 # radians
-    localization/initial_pose/yaw: 0.0  # radians
+    # Initial pose taken directly from GLIM traj_lidar.txt first row.
+    # The launch file publishes IDENTITY for base_link->luminar_front, and
+    # localization.cc deliberately keeps extrinsics.baselink2lidar_T == I (see
+    # the comment in callbackPointCloud), so the node's "base_link" is
+    # physically co-located with the LiDAR. Use the raw LiDAR-in-map pose; do
+    # NOT subtract the URDF lever arm here or the prior ends up ~2 m off.
+    localization/initial_pose/use: true
+    localization/initial_pose/x: 30.056033    # meters (LiDAR == base_link in this node)
+    localization/initial_pose/y: 1.804275     # meters
+    localization/initial_pose/z: 2.827113     # meters
+    localization/initial_pose/roll: -0.155869  # radians (-8.93 deg)
+    localization/initial_pose/pitch: -0.037753 # radians (-2.16 deg)
+    localization/initial_pose/yaw: -0.451546   # radians (-25.87 deg)
 
     # Preprocessing Parameters (override defaults for localization)
     # Crop box filter: keeps points within ±size meters of sensor origin (sensor frame).
@@ -64,10 +69,14 @@
     dlio/deskew: true  # Enable pointcloud deskewing using IMU (essential for high-speed racing)
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
+    dlio/imu/calibTime: 3.0  # Seconds of stationary IMU data for bias/gravity calibration
 
-    # Geometric Observer Parameters (bias correction only; pose is snapped to GICP)
-    odom/geo/Kab: 0.1     # Accelerometer bias correction gain
-    odom/geo/Kgb: 0.1     # Gyroscope bias correction gain
+    # Geometric Observer Parameters (proportional correction gains, matching upstream DLIO)
+    odom/geo/Kp: 4.5      # Position correction gain
+    odom/geo/Kv: 11.25    # Velocity correction gain
+    odom/geo/Kq: 4.0      # Orientation correction gain
+    odom/geo/Kab: 2.25    # Accelerometer bias correction gain
+    odom/geo/Kgb: 1.0     # Gyroscope bias correction gain
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 

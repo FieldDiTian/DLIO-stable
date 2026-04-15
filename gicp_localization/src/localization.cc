@@ -176,6 +176,13 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   // Initialize IMU buffer
   this->imu_buffer.set_capacity(this->imu_buffer_size_);
 
+  // Initialize IMU calibration state
+  this->imu_calibrated_ = false;
+  this->imu_calib_start_stamp_ = -1.0;
+  this->imu_calib_count_ = 0;
+  this->imu_calib_gyro_sum_ = Eigen::Vector3f::Zero();
+  this->imu_calib_accel_sum_ = Eigen::Vector3f::Zero();
+
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
   this->last_scan_input_frame_.clear();
@@ -218,6 +225,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->extrinsics.baselink2imu_T = Eigen::Matrix4f::Identity();
   this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
   this->extrinsics_cached_ = false;
+  this->imu_extrinsics_cached_ = false;
 
   // Initialize point clouds
   this->map_cloud = std::make_shared<pcl::PointCloud<PointType>>();
@@ -454,6 +462,10 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/flip_y", false);
   this->get_parameter("localization/flip_y", this->flip_y_);
 
+  // IMU calibration time (seconds of stationary data to average for bias/gravity)
+  this->declare_parameter<double>("dlio/imu/calibTime", 3.0);
+  this->get_parameter("dlio/imu/calibTime", this->imu_calib_time_);
+
   // Sensor type for per-point timestamp handling during deskewing
   this->declare_parameter<std::string>("localization/sensor_type", "ouster");
   std::string sensor_type_str;
@@ -471,12 +483,18 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
-  // Geometric Observer parameters (bias correction only; Kp/Kv/Kq removed — state is snapped to GICP)
-  this->declare_parameter<double>("odom/geo/Kab", 1.0);
+  // Geometric Observer parameters (proportional correction gains, matching upstream DLIO)
+  this->declare_parameter<double>("odom/geo/Kp", 4.5);
+  this->declare_parameter<double>("odom/geo/Kv", 11.25);
+  this->declare_parameter<double>("odom/geo/Kq", 4.0);
+  this->declare_parameter<double>("odom/geo/Kab", 2.25);
   this->declare_parameter<double>("odom/geo/Kgb", 1.0);
-  this->declare_parameter<double>("odom/geo/abias_max", 1.0);
-  this->declare_parameter<double>("odom/geo/gbias_max", 1.0);
+  this->declare_parameter<double>("odom/geo/abias_max", 5.0);
+  this->declare_parameter<double>("odom/geo/gbias_max", 0.5);
 
+  this->get_parameter("odom/geo/Kp", this->geo_Kp_);
+  this->get_parameter("odom/geo/Kv", this->geo_Kv_);
+  this->get_parameter("odom/geo/Kq", this->geo_Kq_);
   this->get_parameter("odom/geo/Kab", this->geo_Kab_);
   this->get_parameter("odom/geo/Kgb", this->geo_Kgb_);
   this->get_parameter("odom/geo/abias_max", this->geo_abias_max_);
@@ -501,8 +519,8 @@ void gicp_localization::LocalizationNode::getParams() {
               this->crop_size_, this->vf_use_ ? "ENABLED" : "DISABLED", this->vf_res_);
   RCLCPP_INFO(this->get_logger(), "IMU config: deskew=%s, gravity=%.2f, buffer_size=%d",
               this->deskew_ ? "ENABLED" : "DISABLED", this->gravity_, this->imu_buffer_size_);
-  RCLCPP_INFO(this->get_logger(), "Geometric Observer: Kab=%.2f, Kgb=%.2f",
-              this->geo_Kab_, this->geo_Kgb_);
+  RCLCPP_INFO(this->get_logger(), "Geometric Observer: Kp=%.2f, Kv=%.2f, Kq=%.2f, Kab=%.2f, Kgb=%.2f",
+              this->geo_Kp_, this->geo_Kv_, this->geo_Kq_, this->geo_Kab_, this->geo_Kgb_);
   RCLCPP_INFO(this->get_logger(), "Localization mode: %s",
               this->imu_only_mode_ ? "IMU-only (GICP disabled)" : "GICP + IMU");
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
@@ -579,6 +597,34 @@ void gicp_localization::LocalizationNode::start() {
       this->map_pub->publish(map_msg);
     };
     this->map_pub_timer_ = this->create_wall_timer(std::chrono::seconds(1), timer_callback);
+  }
+
+  // Republish the configured initial pose (PoseStamped only — NOT TF) until
+  // GICP produces a real result, so RViz has something to show before scans
+  // arrive. We deliberately do NOT publish a map->base_link TF here because
+  // under use_sim_time, this->now() returns 0 until /clock is active, and
+  // a TF stamped at time 0 poisons the TF buffer with OLD_DATA warnings.
+  if (this->initialized) {
+    auto initial_pose_cb = [this]() {
+      if (this->last_gicp_valid_) {
+        this->initial_pose_pub_timer_->cancel();
+        return;
+      }
+      const rclcpp::Time stamp = this->now();
+      // Skip while sim time is still 0 (clock not yet flowing)
+      if (stamp.nanoseconds() == 0) {
+        return;
+      }
+      Eigen::Matrix4f pose;
+      {
+        std::lock_guard<std::mutex> lock(this->pose_mutex);
+        pose = this->current_pose;
+      }
+      this->dbg_initial_guess_pose_pub->publish(
+          poseStampedFromMatrix(pose, stamp, this->map_frame));
+    };
+    this->initial_pose_pub_timer_ =
+        this->create_wall_timer(std::chrono::milliseconds(200), initial_pose_cb);
   }
 }
 
@@ -750,31 +796,13 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   this->scan_stamp = pc_transformed->header.stamp;
   this->last_scan_input_frame_ = pc->header.frame_id;
 
-  // Cache base_link -> lidar extrinsic from TF (used by deskewing)
-  if (!this->extrinsics_cached_) {
-    try {
-      auto tf_bl = this->tf_buffer->lookupTransform(
-          this->base_frame, this->lidar_frame, tf2::TimePointZero);
-      Eigen::Quaternionf q_bl(
-          tf_bl.transform.rotation.w, tf_bl.transform.rotation.x,
-          tf_bl.transform.rotation.y, tf_bl.transform.rotation.z);
-      Eigen::Vector3f t_bl(
-          tf_bl.transform.translation.x, tf_bl.transform.translation.y,
-          tf_bl.transform.translation.z);
-      this->extrinsics.baselink2lidar.R = q_bl.toRotationMatrix();
-      this->extrinsics.baselink2lidar.t = t_bl;
-      this->extrinsics.baselink2lidar_T.setIdentity();
-      this->extrinsics.baselink2lidar_T.block<3, 3>(0, 0) = q_bl.toRotationMatrix();
-      this->extrinsics.baselink2lidar_T.block<3, 1>(0, 3) = t_bl;
-      this->extrinsics_cached_ = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "Cached baselink->lidar extrinsic: t=[%.3f,%.3f,%.3f]",
-                  t_bl.x(), t_bl.y(), t_bl.z());
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "Cannot cache baselink->lidar TF: %s (using identity)", ex.what());
-    }
-  }
+  // NOTE: extrinsics.baselink2lidar_T must remain IDENTITY here.
+  // Points were already transformed from lidar_frame to base_link by the
+  // tf2::doTransform call above, which absorbs the static lever arm into
+  // the point data itself. The deskewing code applies
+  // `T_world_baselink * extrinsics.baselink2lidar_T` to those points; if
+  // we set this to the real lever-arm TF, the offset would be applied
+  // twice (~2m off), causing GICP to find solutions far from the prior.
 
   // Convert to PCL format using manual field extraction for robustness
   pcl::PointCloud<PointType>::Ptr raw_scan = std::make_shared<pcl::PointCloud<PointType>>();
@@ -1598,10 +1626,58 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
 
   double stamp = imu->header.stamp.sec + imu->header.stamp.nanosec * 1e-9;
 
+  Eigen::Vector3f ang_vel(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
+  Eigen::Vector3f lin_accel(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
+
+  // Cache IMU-to-baselink transform from TF (once)
+  if (!this->imu_extrinsics_cached_) {
+    try {
+      auto tf_bi = this->tf_buffer->lookupTransform(
+          this->base_frame, this->imu_frame, tf2::TimePointZero);
+      Eigen::Quaternionf q_bi(
+          tf_bi.transform.rotation.w, tf_bi.transform.rotation.x,
+          tf_bi.transform.rotation.y, tf_bi.transform.rotation.z);
+      Eigen::Vector3f t_bi(
+          tf_bi.transform.translation.x, tf_bi.transform.translation.y,
+          tf_bi.transform.translation.z);
+      this->extrinsics.baselink2imu.R = q_bi.toRotationMatrix();
+      this->extrinsics.baselink2imu.t = t_bi;
+      this->extrinsics.baselink2imu_T.setIdentity();
+      this->extrinsics.baselink2imu_T.block<3, 3>(0, 0) = q_bi.toRotationMatrix();
+      this->extrinsics.baselink2imu_T.block<3, 1>(0, 3) = t_bi;
+      this->imu_extrinsics_cached_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "Cached baselink->imu extrinsic: t=[%.3f,%.3f,%.3f]",
+                  t_bi.x(), t_bi.y(), t_bi.z());
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Cannot cache baselink->imu TF: %s (using identity)", ex.what());
+    }
+  }
+
+  // Transform IMU measurements from IMU frame to baselink frame
+  if (this->imu_extrinsics_cached_) {
+    const Eigen::Matrix3f& R = this->extrinsics.baselink2imu.R;
+    const Eigen::Vector3f& t = this->extrinsics.baselink2imu.t;
+
+    // Rotate angular velocity and linear acceleration to baselink frame
+    Eigen::Vector3f ang_vel_bl = R * ang_vel;
+    Eigen::Vector3f lin_accel_bl = R * lin_accel;
+
+    // Lever-arm compensation: account for centripetal and tangential acceleration
+    // at the IMU location offset from baselink origin
+    // a_baselink = a_imu + omega x (omega x t) + alpha x t
+    // We approximate alpha ~ 0 (angular acceleration term is small at 100Hz)
+    lin_accel_bl += ang_vel_bl.cross(ang_vel_bl.cross(t));
+
+    ang_vel = ang_vel_bl;
+    lin_accel = lin_accel_bl;
+  }
+
   ImuMeas imu_meas_temp;
   imu_meas_temp.stamp = stamp;
-  imu_meas_temp.ang_vel << imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z;
-  imu_meas_temp.lin_accel << imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z;
+  imu_meas_temp.ang_vel = ang_vel;
+  imu_meas_temp.lin_accel = lin_accel;
 
   // Calculate dt
   {
@@ -1619,6 +1695,62 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   if (!this->first_imu_received) {
     this->first_imu_received = true;
     RCLCPP_INFO(this->get_logger(), "First IMU message received");
+  }
+
+  // IMU calibration: accumulate gyro/accel over calibration period to estimate biases
+  // and gravity direction. Must happen after frame transform above.
+  if (!this->imu_calibrated_) {
+    if (this->imu_calib_start_stamp_ < 0.0) {
+      this->imu_calib_start_stamp_ = stamp;
+    }
+
+    this->imu_calib_gyro_sum_ += ang_vel;
+    this->imu_calib_accel_sum_ += lin_accel;
+    this->imu_calib_count_++;
+
+    double elapsed = stamp - this->imu_calib_start_stamp_;
+    if (elapsed >= this->imu_calib_time_ && this->imu_calib_count_ > 0) {
+      // Compute average
+      Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
+      Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
+
+      // Gyro bias = average angular velocity at rest
+      this->state.b.gyro = gyro_avg;
+
+      // Gravity alignment: compute initial orientation from measured gravity direction.
+      // At rest, the accelerometer measures -gravity in body frame.
+      // We want to find a quaternion that rotates [0,0,-g] (world gravity) to accel_avg.
+      Eigen::Vector3f grav_world(0.f, 0.f, -1.f);
+      Eigen::Vector3f grav_body = accel_avg.normalized();
+      Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(grav_body, grav_world);
+
+      // Accel bias = measured - expected gravity in body frame
+      Eigen::Vector3f expected_grav_body = q_init.conjugate()._transformVector(
+          Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
+      this->state.b.accel = accel_avg - expected_grav_body;
+
+      // If initial pose was already set from params, keep that orientation.
+      // Otherwise use gravity-aligned orientation.
+      if (!this->use_param_initial_pose_) {
+        std::lock_guard<std::mutex> lock(this->geo.mtx);
+        this->state.q = q_init;
+        this->geo.prev_q = q_init;
+      }
+
+      this->imu_calibrated_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "IMU calibrated (%d samples, %.1fs): gyro_bias=[%.4f,%.4f,%.4f] "
+                  "accel_bias=[%.3f,%.3f,%.3f] gravity_dir=[%.3f,%.3f,%.3f]",
+                  this->imu_calib_count_, elapsed,
+                  gyro_avg.x(), gyro_avg.y(), gyro_avg.z(),
+                  this->state.b.accel.x(), this->state.b.accel.y(), this->state.b.accel.z(),
+                  grav_body.x(), grav_body.y(), grav_body.z());
+    } else {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                           "IMU calibrating... %.1f/%.1fs (%d samples)",
+                           elapsed, this->imu_calib_time_, this->imu_calib_count_);
+      return;  // Don't propagate during calibration
+    }
   }
 
   // Propagate state with geometric observer (only after initialization)
@@ -1926,7 +2058,7 @@ void gicp_localization::LocalizationNode::propagateState() {
   // Apply accel bias correction
   Eigen::Vector3f lin_accel_corrected = imu_local.lin_accel - bias_accel;
 
-  // Transform accel from body to world frame
+  // Transform accel from body to world frame and subtract gravity
   world_accel = qhat._transformVector(lin_accel_corrected);
 
   // Log propagation status periodically
@@ -1942,13 +2074,11 @@ void gicp_localization::LocalizationNode::propagateState() {
   // Position propagation (with gravity compensation)
   Eigen::Vector3f new_p = current_p;
   new_p += current_v_lin_w*dt + 0.5f*dt*dt*world_accel;
+  new_p[2] -= 0.5f * dt * dt * static_cast<float>(this->gravity_);
 
-  // Velocity propagation
-  // Dampen Z-velocity to prevent IMU drift while allowing transient vertical motion
-  // (banked turns, bumps). Full propagation in XY; exponential decay in Z.
+  // Velocity propagation (with gravity compensation)
   Eigen::Vector3f new_v_lin_w = current_v_lin_w + world_accel*dt;
-  constexpr float kZVelDamping = 0.95f;  // ~50 ms time constant at 100 Hz
-  new_v_lin_w[2] *= kZVelDamping;
+  new_v_lin_w[2] -= dt * static_cast<float>(this->gravity_);
 
   // Orientation propagation
   omega.w() = 0;
@@ -2172,18 +2302,17 @@ void gicp_localization::LocalizationNode::updateState() {
   this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
   this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
 
-  // For localization: directly snap position and orientation to GICP measurement
-  // The gradual correction gains (Kp, Kq) are too slow for 30 Hz GICP updates
-  // Instead, trust GICP when it converges and directly update state
-  this->state.p = pin;
-  this->state.q = qin;
+  // Proportional observer correction (matching upstream DLIO design)
+  // Position correction
+  this->state.p += dt * this->geo_Kp_ * err;
 
-  // Estimate velocity from GICP-to-GICP displacement (not from IMU correction error).
-  // geo.prev_p holds the previous GICP result, so this gives true vehicle velocity.
-  // Using err/dt would include IMU drift in the velocity, causing oscillating T_prior.
-  if (dt > 0.001) {
-    this->state.v.lin.w = (pin - this->geo.prev_p) / dt;
-  }
+  // Velocity correction
+  this->state.v.lin.w += dt * this->geo_Kv_ * err;
+
+  // Orientation correction
+  this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
+  this->state.q.vec() += dt * this->geo_Kq_ * qcorr.vec();
+  this->state.q.normalize();
 
   // Validate updated state
   bool state_valid_after = std::isfinite(this->state.p.x()) && std::isfinite(this->state.p.y()) &&
