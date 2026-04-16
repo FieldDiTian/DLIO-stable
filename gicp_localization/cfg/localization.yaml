@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/home/bryan/Downloads/test_segment_3_lidar.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/home/bryan/Downloads/ls_3_lidar_map_0415.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
@@ -44,9 +44,9 @@
     # you already computed T_world_baselink yourself.
     localization/initial_pose/use: true
     localization/initial_pose/frame: "lidar"   # "lidar" (GLIM traj_lidar.txt) or "base_link"
-    localization/initial_pose/x: 10.607724     # meters
+    localization/initial_pose/x: 10.614864     # meters
     localization/initial_pose/y: 0.349238      # meters
-    localization/initial_pose/z: 2.355232      # meters
+    localization/initial_pose/z: 0.355232      # meters
     localization/initial_pose/roll: -0.002346  # radians (-0.134 deg)
     localization/initial_pose/pitch: -0.035031 # radians (-2.007 deg)
     localization/initial_pose/yaw: -0.005040   # radians (-0.289 deg)
@@ -56,7 +56,7 @@
     # NOTE: when dlio/deskew=true, preprocessing runs after deskewing in world frame,
     # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
     dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
-    dlio/preprocessing/voxelFilter/use: false   # Re-enabled: leaf size below is appropriate for Luminar
+    dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
     dlio/preprocessing/voxelFilter/res: 0.3   # 0.3 m voxel — good balance of density vs. speed
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z)
@@ -99,16 +99,19 @@
 
     # Maximum correspondence distance (meters)
     # Points further apart than this won't be considered correspondences
-    # Increased to handle larger initial errors
+    # Tightened from 5.0 to cut spurious matches against the dense full map.
     gicp/maxCorrespondenceDistance: 5.0
 
     # Convergence criteria — tightened now that downsampling is re-enabled
-    gicp/transformationEpsilon: 0.001
-    gicp/rotationEpsilon: 0.001
+    gicp/transformationEpsilon: 0.004
+    gicp/rotationEpsilon: 0.004
 
     # GICP result gating: reject poor registrations and fall back to IMU dead-reckoning.
-    # fitness score = mean squared distance of correspondences; < 0.5 is good, > 1.0 is suspect.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    # Good alignments on the full map hit fitness ~0.01–0.05 (p90 0.04, p99 0.39).
+    # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
+    # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
+    # those and the node gets stuck at initial pose with no GICP updates to recover from.
+    gicp/fitnessRejectThreshold: 0.4   # Reject GICP if fitness score exceeds this value
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
   
 
