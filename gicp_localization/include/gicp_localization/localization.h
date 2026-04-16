@@ -140,6 +140,7 @@ private:
   pcl::PointCloud<PointType>::Ptr original_scan;
   rclcpp::Time scan_stamp;
   double prev_scan_stamp;
+  double observer_dt_;
   std::string last_scan_input_frame_;
   size_t last_raw_point_count_;
   size_t last_preprocessed_point_count_;
@@ -239,6 +240,8 @@ private:
   bool imu_only_mode_;
   bool use_odom_init_;
   bool use_param_initial_pose_;
+  std::string initial_pose_frame_;  // "lidar" or "base_link"
+  bool pending_initial_pose_;  // true when initial pose needs conversion via baselink2lidar_T
   double initial_pose_x_;
   double initial_pose_y_;
   double initial_pose_z_;
@@ -273,6 +276,7 @@ private:
   double geo_Kq_;
   double geo_Kab_;
   double geo_Kgb_;
+  double geo_Kz_damping_;
   double geo_abias_max_;
   double geo_gbias_max_;
 

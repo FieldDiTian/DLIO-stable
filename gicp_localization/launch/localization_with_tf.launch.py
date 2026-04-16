@@ -8,6 +8,8 @@
 #   Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu
 #
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
@@ -15,129 +17,69 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+
 def generate_launch_description():
     current_pkg = FindPackageShare('gicp_localization')
 
-    # Set default arguments
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_bot/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
-    # Don't set default for map_path - let it come from config file
-
-    # Static TF parameters (base_link -> lidar/sensor frame)
-    # Identity transform: axis correction (Y flip) is handled in code via localization/flip_y param
-    tf_x = LaunchConfiguration('tf_x', default='0.0')
-    tf_y = LaunchConfiguration('tf_y', default='0.0')
-    tf_z = LaunchConfiguration('tf_z', default='0.0')
-    tf_qx = LaunchConfiguration('tf_qx', default='0.0')
-    tf_qy = LaunchConfiguration('tf_qy', default='0.0')
-    tf_qz = LaunchConfiguration('tf_qz', default='0.0')
-    tf_qw = LaunchConfiguration('tf_qw', default='1.0')
+    urdf_path = LaunchConfiguration(
+        'urdf_path',
+        default='/home/bryan/DLIO_plusplus/av24.urdf')
     parent_frame = LaunchConfiguration('parent_frame', default='base_link')
     child_frame = LaunchConfiguration('child_frame', default='luminar_front')
 
-    # Define arguments
     declare_rviz_arg = DeclareLaunchArgument(
-        'rviz',
-        default_value=rviz,
-        description='Launch RViz'
-    )
+        'rviz', default_value=rviz, description='Launch RViz')
     declare_pointcloud_topic_arg = DeclareLaunchArgument(
-        'pointcloud_topic',
-        default_value=pointcloud_topic,
-        description='Pointcloud topic name'
-    )
+        'pointcloud_topic', default_value=pointcloud_topic, description='Pointcloud topic name')
     declare_imu_topic_arg = DeclareLaunchArgument(
-        'imu_topic',
-        default_value=imu_topic,
-        description='IMU topic name (for deskewing)'
-    )
+        'imu_topic', default_value=imu_topic, description='IMU topic name (for deskewing)')
     declare_odom_topic_arg = DeclareLaunchArgument(
-        'odom_topic',
-        default_value=odom_topic,
-        description='Odometry topic name (for initialization)'
-    )
+        'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
     declare_imu_only_arg = DeclareLaunchArgument(
-        'imu_only',
-        default_value=imu_only,
-        description='If true, disable GICP and run IMU-only propagation'
-    )
-    declare_tf_x_arg = DeclareLaunchArgument(
-        'tf_x', default_value=tf_x,
-        description='Static TF translation X'
-    )
-    declare_tf_y_arg = DeclareLaunchArgument(
-        'tf_y', default_value=tf_y,
-        description='Static TF translation Y'
-    )
-    declare_tf_z_arg = DeclareLaunchArgument(
-        'tf_z', default_value=tf_z,
-        description='Static TF translation Z'
-    )
-    declare_tf_qx_arg = DeclareLaunchArgument(
-        'tf_qx', default_value=tf_qx,
-        description='Static TF rotation quaternion X'
-    )
-    declare_tf_qy_arg = DeclareLaunchArgument(
-        'tf_qy', default_value=tf_qy,
-        description='Static TF rotation quaternion Y'
-    )
-    declare_tf_qz_arg = DeclareLaunchArgument(
-        'tf_qz', default_value=tf_qz,
-        description='Static TF rotation quaternion Z'
-    )
-    declare_tf_qw_arg = DeclareLaunchArgument(
-        'tf_qw', default_value=tf_qw,
-        description='Static TF rotation quaternion W'
-    )
+        'imu_only', default_value=imu_only,
+        description='If true, disable GICP and run IMU-only propagation')
+    declare_urdf_path_arg = DeclareLaunchArgument(
+        'urdf_path', default_value=urdf_path,
+        description='Absolute path to the vehicle URDF used by robot_state_publisher '
+                    '(provides base_link -> {luminar_front, gps_bottom, imu_bottom, ...} TFs)')
     declare_parent_frame_arg = DeclareLaunchArgument(
         'parent_frame', default_value=parent_frame,
-        description='Parent frame for static TF'
-    )
+        description='Parent frame of the LiDAR sensor in the URDF')
     declare_child_frame_arg = DeclareLaunchArgument(
         'child_frame', default_value=child_frame,
-        description='Child frame for static TF (sensor frame)'
-    )
+        description='LiDAR sensor frame (must match incoming PointCloud2 header.frame_id and URDF link)')
     declare_map_path_arg = DeclareLaunchArgument(
-        'map_path', default_value='/media/terramaster/lc_three_lidar_map.pcd',
-        description='Path to PCD map file for localization'
-    )
+        'map_path', default_value='',
+        description='Path to PCD map file for localization (overrides localization.yaml when non-empty)')
 
-    # Load parameters
     localization_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'localization.yaml'])
 
-    # Static Transform Publisher (base_link -> lidar frame)
-    static_tf_publisher = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='base_to_lidar_publisher',
-        arguments=[
-            tf_x, tf_y, tf_z,
-            tf_qx, tf_qy, tf_qz, tf_qw,
-            parent_frame, child_frame
-        ],
-        output='screen'
-    )
-
-    # Static Transform Publisher (base_link -> gps_bot/IMU frame)
-    # From URDF gps_bottom_joint: xyz="1.63574 -0.075 -1.0075"
-    # imu_bottom is co-located with gps_bottom (zero offset joint)
-    static_tf_imu_publisher = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='base_to_gps_bot_publisher',
-        arguments=[
-            '1.63574', '-0.075', '-1.0075',  # Translation from base_link to gps_bot
-            '0', '0', '0', '1',              # Identity rotation
-            'base_link', 'gps_bot'
-        ],
-        output='screen'
-    )
+    # Publish the full vehicle URDF via robot_state_publisher. This provides the
+    # real base_link -> luminar_front and base_link -> gps_bottom/imu_bottom
+    # transforms from the URDF, replacing the hand-maintained static TFs.
+    def make_robot_state_publisher(context):
+        urdf_file = LaunchConfiguration('urdf_path').perform(context).strip()
+        if not os.path.isfile(urdf_file):
+            raise RuntimeError(
+                f"URDF file not found at '{urdf_file}'. "
+                f"Pass a different path with urdf_path:=<abs-path>.")
+        with open(urdf_file, 'r') as f:
+            robot_description = f.read()
+        node = Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='screen',
+            parameters=[{'robot_description': robot_description}],
+        )
+        return [node]
 
     # GICP Localization Node
-    # map_path arg overrides the value in localization.yaml
     def make_localization_node(context):
         map_path_value = LaunchConfiguration('map_path').perform(context).strip()
         child_frame_value = LaunchConfiguration('child_frame').perform(context).strip()
@@ -145,8 +87,9 @@ def generate_launch_description():
             localization_yaml_path,
             {'localization/lidar_frame': child_frame_value},
             {'localization/imu_only': LaunchConfiguration('imu_only')},
-            {'localization/map_path': map_path_value},
         ]
+        if map_path_value:
+            params.append({'localization/map_path': map_path_value})
 
         node = Node(
             package='gicp_localization',
@@ -154,7 +97,7 @@ def generate_launch_description():
             output='screen',
             parameters=params,
             remappings=[
-                ('pointcloud', pointcloud_topic),  # Localization node transforms internally
+                ('pointcloud', pointcloud_topic),
                 ('imu', imu_topic),
                 ('odom', odom_topic),
                 ('localized_pose', 'gicp/localization/pose'),
@@ -166,7 +109,6 @@ def generate_launch_description():
         )
         return [node]
 
-    # RViz node
     rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'localization.rviz'])
     rviz_node = Node(
         package='rviz2',
@@ -183,18 +125,11 @@ def generate_launch_description():
         declare_imu_topic_arg,
         declare_odom_topic_arg,
         declare_imu_only_arg,
-        declare_map_path_arg,
-        declare_tf_x_arg,
-        declare_tf_y_arg,
-        declare_tf_z_arg,
-        declare_tf_qx_arg,
-        declare_tf_qy_arg,
-        declare_tf_qz_arg,
-        declare_tf_qw_arg,
+        declare_urdf_path_arg,
         declare_parent_frame_arg,
         declare_child_frame_arg,
-        static_tf_publisher,
-        static_tf_imu_publisher,
+        declare_map_path_arg,
+        OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
-        rviz_node
+        rviz_node,
     ])
