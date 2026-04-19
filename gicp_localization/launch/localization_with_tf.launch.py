@@ -28,7 +28,7 @@ def generate_launch_description():
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
-        default='/home/bryan/DLIO_plusplus/av24.urdf')
+        default='')
     parent_frame = LaunchConfiguration('parent_frame', default='base_link')
     child_frame = LaunchConfiguration('child_frame', default='luminar_front')
 
@@ -64,6 +64,16 @@ def generate_launch_description():
     # transforms from the URDF, replacing the hand-maintained static TFs.
     def make_robot_state_publisher(context):
         urdf_file = LaunchConfiguration('urdf_path').perform(context).strip()
+        # If no explicit path was given, walk up from this launch file to find
+        # av24.urdf.  Works from both the source tree and the colcon install tree.
+        if not urdf_file:
+            d = os.path.dirname(os.path.abspath(__file__))
+            for _ in range(10):
+                candidate = os.path.join(d, 'av24.urdf')
+                if os.path.isfile(candidate):
+                    urdf_file = candidate
+                    break
+                d = os.path.dirname(d)
         if not os.path.isfile(urdf_file):
             raise RuntimeError(
                 f"URDF file not found at '{urdf_file}'. "

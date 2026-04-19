@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/home/bryan/Downloads/ls_3_lidar_map_0415.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/media/terramaster/ls_3_lidar_map_0415.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
