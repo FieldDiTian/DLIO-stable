@@ -130,6 +130,118 @@ double hessianConditionProxy(const Eigen::Matrix<double, 6, 6>& hessian) {
   return max_eigenvalue / min_nonzero_eigenvalue;
 }
 
+// Find x/y/z field offsets in a PointCloud2 message. Returns false if any are missing.
+bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y_off, int& z_off) {
+  x_off = y_off = z_off = -1;
+  for (const auto& f : msg.fields) {
+    if (f.name == "x") x_off = static_cast<int>(f.offset);
+    else if (f.name == "y") y_off = static_cast<int>(f.offset);
+    else if (f.name == "z") z_off = static_cast<int>(f.offset);
+  }
+  return x_off >= 0 && y_off >= 0 && z_off >= 0;
+}
+
+// Apply rigid transform to xyz of every point in a raw byte buffer (in place).
+void transformCloudData(std::vector<uint8_t>& data, uint32_t point_step,
+                        int x_off, int y_off, int z_off,
+                        const Eigen::Matrix4f& T) {
+  const Eigen::Matrix3f R = T.block<3, 3>(0, 0);
+  const Eigen::Vector3f t = T.block<3, 1>(0, 3);
+  const size_t num_points = data.size() / point_step;
+  for (size_t i = 0; i < num_points; ++i) {
+    const size_t base = i * point_step;
+    float x, y, z;
+    std::memcpy(&x, &data[base + x_off], sizeof(float));
+    std::memcpy(&y, &data[base + y_off], sizeof(float));
+    std::memcpy(&z, &data[base + z_off], sizeof(float));
+    Eigen::Vector3f p = R * Eigen::Vector3f(x, y, z) + t;
+    std::memcpy(&data[base + x_off], &p.x(), sizeof(float));
+    std::memcpy(&data[base + y_off], &p.y(), sizeof(float));
+    std::memcpy(&data[base + z_off], &p.z(), sizeof(float));
+  }
+}
+
+bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
+                   uint8_t& time_datatype, int& time_count) {
+  time_off = -1;
+  time_datatype = 0;
+  time_count = 0;
+  for (const auto& f : msg.fields) {
+    if (f.name == "t" || f.name == "time" || f.name == "time_stamp" || f.name == "timestamp") {
+      time_off = static_cast<int>(f.offset);
+      time_datatype = f.datatype;
+      time_count = static_cast<int>(f.count);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Shift per-point timestamps by `dt` seconds. When `luminar_uint64` is set the
+// 8 bytes at the time field are reinterpreted as uint64 hardware nanoseconds
+// regardless of the declared field type — Luminar publishes the raw uint64 bits
+// even when the field datatype is FLOAT64, so generic FP arithmetic would
+// scramble them.
+void shiftCloudTimestamps(std::vector<uint8_t>& data, uint32_t point_step,
+                          int time_off, uint8_t time_datatype, int time_count,
+                          double dt, bool luminar_uint64) {
+  if (time_off < 0) return;
+  const size_t num_points = data.size() / point_step;
+
+  if (luminar_uint64) {
+    const int64_t dt_ns = static_cast<int64_t>(dt * 1e9);
+    for (size_t i = 0; i < num_points; ++i) {
+      uint8_t* p = &data[i * point_step + time_off];
+      uint64_t v;
+      std::memcpy(&v, p, sizeof(uint64_t));
+      const int64_t shifted = static_cast<int64_t>(v) + dt_ns;
+      v = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
+      std::memcpy(p, &v, sizeof(uint64_t));
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < num_points; ++i) {
+    uint8_t* time_ptr = &data[i * point_step + time_off];
+    switch (time_datatype) {
+      case sensor_msgs::msg::PointField::UINT32: {
+        uint32_t val;
+        std::memcpy(&val, time_ptr, sizeof(uint32_t));
+        const int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
+        val = static_cast<uint32_t>(std::max<int64_t>(0, shifted));
+        std::memcpy(time_ptr, &val, sizeof(uint32_t));
+        break;
+      }
+      case sensor_msgs::msg::PointField::FLOAT32: {
+        float val;
+        std::memcpy(&val, time_ptr, sizeof(float));
+        val += static_cast<float>(dt);
+        std::memcpy(time_ptr, &val, sizeof(float));
+        break;
+      }
+      case sensor_msgs::msg::PointField::FLOAT64: {
+        double val;
+        std::memcpy(&val, time_ptr, sizeof(double));
+        val += dt;
+        std::memcpy(time_ptr, &val, sizeof(double));
+        break;
+      }
+      case sensor_msgs::msg::PointField::UINT8: {
+        if (time_count == 8) {
+          uint64_t val;
+          std::memcpy(&val, time_ptr, sizeof(uint64_t));
+          const int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
+          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
+          std::memcpy(time_ptr, &val, sizeof(uint64_t));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
 visualization_msgs::msg::Marker makeArrowMarker(const Eigen::Matrix4f& pose,
                                                 const std::string& frame_id,
                                                 const rclcpp::Time& stamp,
@@ -274,6 +386,28 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       "initialpose", 10,
       std::bind(&gicp_localization::LocalizationNode::callbackInitialPose, this, std::placeholders::_1),
       initial_pose_sub_opt);
+
+  // Aux LiDAR subscribers (multi-LiDAR concatenation). Use a Reentrant group so
+  // aux scans can land in parallel with the primary callback and with each
+  // other; each aux only writes to its own buffer (mutex-protected), so no
+  // shared mutable state is touched here.
+  if (this->concat_enabled_ && !this->aux_lidars_.empty()) {
+    this->aux_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    auto aux_sub_opt = rclcpp::SubscriptionOptions();
+    aux_sub_opt.callback_group = this->aux_cb_group_;
+    for (size_t i = 0; i < this->aux_lidars_.size(); ++i) {
+      const std::string topic = this->aux_lidars_[i]->topic;
+      const int idx = static_cast<int>(i);
+      auto sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+          topic, rclcpp::SensorDataQoS(),
+          [this, idx](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+            this->callbackAuxPointCloud(idx, std::move(msg));
+          },
+          aux_sub_opt);
+      this->aux_subs_.push_back(sub);
+      RCLCPP_INFO(this->get_logger(), "Subscribed to aux LiDAR topic: %s", topic.c_str());
+    }
+  }
 
   // Use Reentrant callback group so IMU can process in parallel with pointcloud processing
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -465,6 +599,53 @@ void gicp_localization::LocalizationNode::getParams() {
 
   this->declare_parameter<bool>("localization/flip_y", false);
   this->get_parameter("localization/flip_y", this->flip_y_);
+
+  // Multi-LiDAR concatenation: merge nearest-in-time aux scans into the primary
+  // PointCloud2 before the existing pipeline runs. Aux XYZ are transformed into
+  // the primary sensor frame via TF (URDF), and per-point timestamps are rebased
+  // by the inter-header dt so the merged sweep shares one clock.
+  this->declare_parameter<bool>("localization/lidar_concat/enabled", false);
+  this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_topics", std::vector<std::string>{});
+  this->declare_parameter<std::vector<std::string>>("localization/lidar_concat/aux_frames", std::vector<std::string>{});
+  this->declare_parameter<double>("localization/lidar_concat/time_threshold", 0.05);
+  this->declare_parameter<int>("localization/lidar_concat/buffer_size", 20);
+
+  this->get_parameter("localization/lidar_concat/enabled", this->concat_enabled_);
+  std::vector<std::string> aux_topics_param, aux_frames_param;
+  this->get_parameter("localization/lidar_concat/aux_topics", aux_topics_param);
+  this->get_parameter("localization/lidar_concat/aux_frames", aux_frames_param);
+  this->get_parameter("localization/lidar_concat/time_threshold", this->concat_time_threshold_);
+  int concat_buffer_size_int = 20;
+  this->get_parameter("localization/lidar_concat/buffer_size", concat_buffer_size_int);
+  this->concat_buffer_size_ = static_cast<size_t>(std::max(1, concat_buffer_size_int));
+
+  if (this->concat_enabled_) {
+    if (aux_topics_param.size() != aux_frames_param.size()) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "lidar_concat: aux_topics size (%zu) != aux_frames size (%zu); disabling concat",
+                   aux_topics_param.size(), aux_frames_param.size());
+      this->concat_enabled_ = false;
+    } else if (aux_topics_param.empty()) {
+      RCLCPP_WARN(this->get_logger(), "lidar_concat enabled but no aux_topics configured; disabling concat");
+      this->concat_enabled_ = false;
+    } else {
+      for (size_t i = 0; i < aux_topics_param.size(); ++i) {
+        auto aux = std::make_unique<AuxLidar>();
+        aux->topic = aux_topics_param[i];
+        aux->frame = aux_frames_param[i];
+        aux->T_primary_aux = Eigen::Matrix4f::Identity();
+        aux->extrinsic_cached = false;
+        this->aux_lidars_.push_back(std::move(aux));
+      }
+      RCLCPP_INFO(this->get_logger(),
+                  "lidar_concat enabled: %zu aux lidars, time_threshold=%.3fs, buffer_size=%zu",
+                  this->aux_lidars_.size(), this->concat_time_threshold_, this->concat_buffer_size_);
+      for (const auto& a : this->aux_lidars_) {
+        RCLCPP_INFO(this->get_logger(), "  aux lidar: topic='%s' frame='%s'",
+                    a->topic.c_str(), a->frame.c_str());
+      }
+    }
+  }
 
   // IMU calibration time (seconds of stationary data to average for bias/gravity)
   this->declare_parameter<double>("dlio/imu/calibTime", 3.0);
@@ -792,13 +973,21 @@ void gicp_localization::LocalizationNode::callbackInitialPose(
 }
 
 void gicp_localization::LocalizationNode::callbackPointCloud(
-    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc) {
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc_in) {
 
   if (this->imu_only_mode_) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                          "IMU-only mode enabled: skipping pointcloud/GICP updates.");
     return;
   }
+
+  // Multi-LiDAR concatenation: merge nearest aux scans into the primary cloud
+  // before any other processing. Downstream steps (TF cache, manual field
+  // extraction, Luminar timestamp read, Y-flip, deskew, GICP) all run on the
+  // merged cloud unchanged — primary frame_id, point_step, and field layout
+  // are preserved.
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr pc =
+      this->concat_enabled_ ? this->mergeAuxClouds(pc_in) : pc_in;
 
   // Cache base_link -> lidar extrinsic from TF once. With
   // robot_state_publisher providing the URDF TF tree, this is the true
@@ -1044,6 +1233,135 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   RCLCPP_DEBUG(this->get_logger(), "Calling publishPose()...");
   this->publishPose();
   RCLCPP_DEBUG(this->get_logger(), "publishPose() completed");
+}
+
+void gicp_localization::LocalizationNode::callbackAuxPointCloud(
+    int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  if (aux_index < 0 || static_cast<size_t>(aux_index) >= this->aux_lidars_.size()) {
+    return;
+  }
+  auto& aux = *this->aux_lidars_[aux_index];
+  std::lock_guard<std::mutex> lk(aux.mtx);
+  aux.buffer.push_back(std::move(msg));
+  while (aux.buffer.size() > this->concat_buffer_size_) {
+    aux.buffer.pop_front();
+  }
+}
+
+sensor_msgs::msg::PointCloud2::ConstSharedPtr
+gicp_localization::LocalizationNode::mergeAuxClouds(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary) {
+
+  if (this->aux_lidars_.empty()) return primary;
+
+  const double t_primary = rclcpp::Time(primary->header.stamp).seconds();
+  const uint32_t point_step = primary->point_step;
+  const std::string& primary_frame = primary->header.frame_id;
+
+  int x_off, y_off, z_off;
+  if (!findXYZOffsets(*primary, x_off, y_off, z_off)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "lidar_concat: cannot find xyz fields in primary cloud (frame='%s')",
+                         primary_frame.c_str());
+    return primary;
+  }
+
+  // Start the merged cloud as a copy of the primary; we'll append aux bytes.
+  auto merged = std::make_shared<sensor_msgs::msg::PointCloud2>(*primary);
+  size_t total_points = static_cast<size_t>(primary->width) * primary->height;
+  size_t merged_aux_count = 0;
+
+  for (auto& aux_ptr : this->aux_lidars_) {
+    auto& aux = *aux_ptr;
+
+    // Cache T_primary_aux from TF on first use. Skip this aux until TF is available.
+    if (!aux.extrinsic_cached) {
+      try {
+        auto tf = this->tf_buffer->lookupTransform(
+            primary_frame, aux.frame, tf2::TimePointZero);
+        Eigen::Quaternionf q(
+            tf.transform.rotation.w, tf.transform.rotation.x,
+            tf.transform.rotation.y, tf.transform.rotation.z);
+        Eigen::Vector3f t(
+            tf.transform.translation.x, tf.transform.translation.y,
+            tf.transform.translation.z);
+        aux.T_primary_aux.setIdentity();
+        aux.T_primary_aux.block<3, 3>(0, 0) = q.toRotationMatrix();
+        aux.T_primary_aux.block<3, 1>(0, 3) = t;
+        aux.extrinsic_cached = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "lidar_concat: cached T(%s <- %s): t=[%.3f, %.3f, %.3f]",
+                    primary_frame.c_str(), aux.frame.c_str(), t.x(), t.y(), t.z());
+      } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "lidar_concat: waiting for TF '%s' -> '%s': %s",
+                             primary_frame.c_str(), aux.frame.c_str(), ex.what());
+        continue;
+      }
+    }
+
+    // Pick the aux scan whose header is closest in time to the primary header,
+    // within the configured threshold.
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr match;
+    double best_dt = std::numeric_limits<double>::max();
+    {
+      std::lock_guard<std::mutex> lk(aux.mtx);
+      for (const auto& msg : aux.buffer) {
+        const double dt = std::abs(rclcpp::Time(msg->header.stamp).seconds() - t_primary);
+        if (dt < best_dt) {
+          best_dt = dt;
+          match = msg;
+        }
+      }
+    }
+    if (!match || best_dt > this->concat_time_threshold_) {
+      RCLCPP_DEBUG(this->get_logger(),
+                   "lidar_concat: no match for '%s' within %.3fs of primary t=%.3f (best_dt=%.3fs)",
+                   aux.topic.c_str(), this->concat_time_threshold_, t_primary,
+                   match ? best_dt : -1.0);
+      continue;
+    }
+    if (match->point_step != point_step) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "lidar_concat: skipping '%s' — point_step mismatch (%u vs primary %u)",
+                           aux.topic.c_str(), match->point_step, point_step);
+      continue;
+    }
+
+    // Copy aux raw bytes; transform xyz into primary frame; rebase per-point timestamps.
+    std::vector<uint8_t> data(match->data.begin(), match->data.end());
+    int ax, ay, az;
+    if (findXYZOffsets(*match, ax, ay, az)) {
+      transformCloudData(data, point_step, ax, ay, az, aux.T_primary_aux);
+    }
+
+    int time_off;
+    uint8_t time_dt_type;
+    int time_count;
+    if (findTimeField(*match, time_off, time_dt_type, time_count)) {
+      // dt = aux header - primary header. Adding dt rebases aux per-point times
+      // onto the primary clock so deskewing sees one coherent sweep.
+      const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
+      const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
+      shiftCloudTimestamps(data, point_step, time_off, time_dt_type, time_count, dt, luminar_u64);
+    }
+
+    merged->data.insert(merged->data.end(), data.begin(), data.end());
+    total_points += static_cast<size_t>(match->width) * match->height;
+    ++merged_aux_count;
+  }
+
+  // The merged cloud is unorganized (height=1); width = total appended points.
+  merged->width = static_cast<uint32_t>(total_points);
+  merged->height = 1;
+  merged->is_dense = false;
+  merged->row_step = point_step * static_cast<uint32_t>(total_points);
+
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                       "lidar_concat: merged %zu/%zu aux scans, total %zu points",
+                       merged_aux_count, this->aux_lidars_.size(), total_points);
+
+  return merged;
 }
 
 void gicp_localization::LocalizationNode::deskewPointcloud() {

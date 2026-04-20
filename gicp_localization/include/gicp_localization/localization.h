@@ -31,6 +31,9 @@
 
 // STL
 #include <atomic>
+#include <deque>
+#include <memory>
+#include <vector>
 
 namespace gicp_localization {
 
@@ -70,6 +73,15 @@ private:
   void publishPose();
   void applyInitialPoseFromParams();
 
+  // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
+  // buffers, then `mergeAuxClouds` (called from the primary callback) finds
+  // the nearest aux scan per sensor, transforms its XYZ into the primary
+  // sensor frame, rebases per-point timestamps onto the primary clock, and
+  // appends the bytes to a copy of the primary PointCloud2.
+  void callbackAuxPointCloud(int aux_index, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr mergeAuxClouds(
+      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& primary);
+
   // Geometric Observer functions
   void propagateState();
   void updateState();
@@ -92,6 +104,22 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::CallbackGroup::SharedPtr pointcloud_cb_group, initial_pose_cb_group, imu_cb_group;
+
+  // Multi-LiDAR concatenation
+  struct AuxLidar {
+    std::string topic;
+    std::string frame;                          // header.frame_id of the aux sensor (URDF link)
+    Eigen::Matrix4f T_primary_aux;              // p_primary = T * p_aux, cached from TF
+    bool extrinsic_cached;
+    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> buffer;
+    std::mutex mtx;
+  };
+  std::vector<std::unique_ptr<AuxLidar>> aux_lidars_;
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> aux_subs_;
+  rclcpp::CallbackGroup::SharedPtr aux_cb_group_;
+  bool concat_enabled_;
+  double concat_time_threshold_;
+  size_t concat_buffer_size_;
 
   // Publishers
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;

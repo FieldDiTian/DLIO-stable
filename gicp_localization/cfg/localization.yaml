@@ -57,10 +57,23 @@
     # so this crop box acts on world-frame coords. Disable or set very large if using deskew.
     dlio/preprocessing/cropBoxFilter/size: 80.0  # metres; 160m cube around sensor (sensor frame when deskew=false)
     dlio/preprocessing/voxelFilter/use: true    # Enabled for full-map localization to reduce correspondence ambiguity
-    dlio/preprocessing/voxelFilter/res: 0.3   # 0.3 m voxel — good balance of density vs. speed
+    dlio/preprocessing/voxelFilter/res: 0.5   # 0.3 m voxel — good balance of density vs. speed
 
-    # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z)
+    # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
+    # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
     localization/flip_y: true
+
+    # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
+    # subscribes to each aux topic, buffers the latest scans, and on every primary
+    # scan finds the nearest aux scan in time, transforms its XYZ into the primary
+    # sensor frame via TF (URDF), rebases per-point timestamps onto the primary clock,
+    # and appends the bytes to the primary PointCloud2. Downstream steps see a single
+    # cloud in primary frame with one coherent timebase.
+    localization/lidar_concat/enabled: true
+    localization/lidar_concat/aux_topics: ["/luminar_right/points", "/luminar_left/points"]  
+    localization/lidar_concat/aux_frames: ["luminar_right", "luminar_left"]
+    localization/lidar_concat/time_threshold: 0.05  # seconds; aux scans further than this from primary are dropped
+    localization/lidar_concat/buffer_size: 20       # per-aux ring buffer depth
 
     # LiDAR sensor type for per-point timestamp handling during deskewing
     # Options: ouster, velodyne, hesai, livox, luminar
@@ -100,7 +113,7 @@
     # Maximum correspondence distance (meters)
     # Points further apart than this won't be considered correspondences
     # Tightened from 5.0 to cut spurious matches against the dense full map.
-    gicp/maxCorrespondenceDistance: 5.0
+    gicp/maxCorrespondenceDistance: 2.0
 
     # Convergence criteria — tightened now that downsampling is re-enabled
     gicp/transformationEpsilon: 0.004
@@ -111,7 +124,7 @@
     # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 0.4   # Reject GICP if fitness score exceeds this value
+    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
   
 
