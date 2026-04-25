@@ -91,7 +91,7 @@
     odom/geo/Kq: 4.0      # Orientation correction gain
     odom/geo/Kab: 2.25    # Accelerometer bias correction gain
     odom/geo/Kgb: 1.0     # Gyroscope bias correction gain
-    odom/geo/Kz_damping: 0.0  # Disabled — road has real elevation change
+    odom/geo/Kz_damping: 0.0  # increased to deal with flying off the track after 1st lap
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
