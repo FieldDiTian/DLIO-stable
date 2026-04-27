@@ -6,3 +6,4 @@ tmp/
 CLAUDE.md
 .codex
 *.png
+.claude/

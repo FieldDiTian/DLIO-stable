@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/terramaster/ls_3_lidar_map_0415.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/media/terramaster/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
@@ -89,9 +89,9 @@
     odom/geo/Kp: 4.5      # Position correction gain
     odom/geo/Kv: 11.25    # Velocity correction gain
     odom/geo/Kq: 4.0      # Orientation correction gain
-    odom/geo/Kab: 2.25    # Accelerometer bias correction gain
-    odom/geo/Kgb: 1.0     # Gyroscope bias correction gain
-    odom/geo/Kz_damping: 0.0  # increased to deal with flying off the track after 1st lap
+    odom/geo/Kab: 0.5    # Accelerometer bias correction gain
+    odom/geo/Kgb: 0.5    # Gyroscope bias correction gain
+    odom/geo/Kz_damping: 0.0  
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
@@ -100,8 +100,8 @@
     localization/debug/enable_jump_log: true
     localization/debug/verbose_scan_log: true
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
-    localization/debug/jump_trans_m: 8.0      # Log/reject if pose jumps > this (meters); 10Hz @ 30m/s = 3m/scan
-    localization/debug/jump_rot_deg: 20.0     # Log/reject if pose jumps > this (degrees)
+    localization/debug/jump_trans_m: 30.0      # Log/reject if pose jumps > this (meters); 10Hz @ 30m/s = 3m/scan
+    localization/debug/jump_rot_deg: 30.0     # Log/reject if pose jumps > this (degrees)
 
     # GICP Registration Parameters
     # Maximum number of iterations (increased for better convergence)
@@ -113,7 +113,7 @@
     # Maximum correspondence distance (meters)
     # Points further apart than this won't be considered correspondences
     # Tightened from 5.0 to cut spurious matches against the dense full map.
-    gicp/maxCorrespondenceDistance: 2.0
+    gicp/maxCorrespondenceDistance: 4.0
 
     # Convergence criteria — tightened now that downsampling is re-enabled
     gicp/transformationEpsilon: 0.004
@@ -124,7 +124,7 @@
     # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
+    gicp/fitnessRejectThreshold: 25.0   # Reject GICP if fitness score exceeds this value
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
   
 
