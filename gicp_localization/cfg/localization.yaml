@@ -9,7 +9,7 @@
 
     # Frame IDs
     localization/map_frame: "map"
-    localization/base_frame: "base_link"
+    localization/base_frame: "imu_bottom"
     localization/imu_frame: "imu_bottom"  # Must match a URDF link (IMU is mounted at GPS bottom)
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
