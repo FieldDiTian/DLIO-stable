@@ -2,6 +2,8 @@
 #include <atomic>
 #include <thread>
 #include <numeric>
+#include <fstream>
+#include <iomanip>
 #include <Eigen/Core>
 
 #define GLIM_ROS2
@@ -83,6 +85,12 @@ public:
   ~GNSSGlobal() {
     kill_switch = true;
     thread.join();
+  }
+
+  virtual void at_exit(const std::string& dump_path) override {
+    if (transformation_initialized) {
+      save_transformation_to_file(dump_path);
+    }
   }
 
   virtual std::vector<GenericTopicSubscription::Ptr> create_subscriptions() override {
@@ -227,6 +235,35 @@ public:
   }
 
 private:
+  void save_transformation_to_file(const std::string& dump_path) {
+    const std::string filename = dump_path + "/T_world_utm.txt";
+    std::ofstream ofs(filename);
+
+    if (!ofs.is_open()) {
+      logger->error("failed to open file for writing: {}", filename);
+      return;
+    }
+
+    ofs << "# SE(3) Transformation from GNSS/UTM to Odom (World) Frame\n";
+    ofs << "# This transformation aligns GNSS coordinates with GLIM's world frame\n";
+    ofs << "# Format: 4x4 homogeneous transformation matrix\n";
+    ofs << "T_world_utm:\n";
+
+    const Eigen::Matrix4d mat = T_world_utm.matrix();
+    ofs << std::fixed << std::setprecision(10);
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4; j++) {
+        ofs << std::setw(15) << mat(i, j);
+        if (j < 3) {
+          ofs << " ";
+        }
+      }
+      ofs << "\n";
+    }
+
+    logger->info("saved T_world_utm (4x4 SE(3)) to: {}", filename);
+  }
+
   void push_gnss_data(double stamp, double x, double y, double z) {
     Eigen::Vector4d gnss_data;
     gnss_data << stamp, x, y, z;

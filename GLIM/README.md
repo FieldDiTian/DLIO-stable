@@ -245,7 +245,7 @@ The transformation is logged when alignment initializes:
 
 And saved to the map directory when mapping completes:
 ```
-[gnss_global] ✓ Saved T_world_utm (4x4 SE(3)) to: <dump_path>/T_world_utm.txt
+[gnss_global] saved T_world_utm (4x4 SE(3)) to: <dump_path>/T_world_utm.txt
 ```
 
 ## Troubleshooting

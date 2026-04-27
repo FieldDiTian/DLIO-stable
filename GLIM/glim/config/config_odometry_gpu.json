@@ -40,7 +40,7 @@
     "so_name": "libodometry_estimation_gpu.so",
     // Initialization params
     "initialization_mode": "LOOSE",
-    "initialization_window_size": 1.0,
+    "initialization_window_size": 3.0,
     "init_pose_damping_scale": 1e10,
     // Optimization params
     "smoother_lag": 5.0,

@@ -45,12 +45,12 @@
   */
   "sensors": {
     // IMU config
-    "imu_acc_noise": 0.05,
-    "imu_gyro_noise": 0.02,
+    "imu_acc_noise": 0.2,
+    "imu_gyro_noise": 0.05,
     "imu_int_noise": 0.001,
-    "imu_bias_noise": 1e-5,
+    "imu_bias_noise": 1e-4,
     // LiDAR config
-    "global_shutter_lidar": false,
+    "global_shutter_lidar": true,
     "flip_points_y": true,
     // URDF-based T_lidar_imu: if all three fields are set, T_lidar_imu is computed from the URDF at runtime
     "urdf_path": "av24.urdf",
@@ -123,7 +123,7 @@
   //                        (suffix matches the topic name with '/' replaced by '_' and leading '_' removed)
   "lidar_concat": {
     "enabled": true,
-    "time_threshold": 0.05,
+    "time_threshold": 0.01,
     "buffer_size": 200,
     "aux_topics": ["/luminar_left/points", "/luminar_right/points"],
     "aux_frames": ["luminar_left", "luminar_right"],
