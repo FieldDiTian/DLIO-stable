@@ -159,10 +159,11 @@ ros2 launch glim_ros glim_ros.launch.py config_path:=config use_sim_time:=true |
 
 Watch for these key log messages:
 ```
-[gnss_global] GNSS messages received: <count>
-[gnss_global] Alignment check: submaps=<N>, baseline=<X>m, initialized=<true/false>
-[gnss_global] T_world_utm=<transformation matrix>
-[gnss_global] ✓ Inserting <N> GNSS prior factors to global graph
+[gnss_global] initializing GNSS global constraints
+[gnss_global] gnss_global_config_path=<path>
+[gnss_global] T_world_utm=<transformation>
+[gnss_global] insert <N> GNSS prior factors        # debug level
+[gnss_global] saved T_world_utm (4x4 SE(3)) to: <dump_path>/T_world_utm.txt
 ```
 
 ### Map Output
@@ -192,7 +193,7 @@ Each directory contains:
 - `config_preprocess.json` - Point cloud preprocessing
 - `config_global_mapping_pose_graph.json` - Loop closure and global optimization
 
-**GNSS Extension (`glim/config/`):**
+**GNSS Extension (`glim_ext/config/`):**
 - `config_gnss_global.json` - GPS constraint parameters
 
 ### Key Parameters
@@ -201,19 +202,20 @@ Each directory contains:
 ```json
 {
   "gnss": {
-    "gnss_topic": "/gps/pose",
-    "min_baseline": 2.0,              // Minimum travel for alignment (meters)
-    "prior_inf_scale": [1e3, 1e3, 500.0]  // XY, XY, Z information values
+    "gnss_topic": "/gps_nav/odom",
+    "gnss_msg_type": "nav_msgs/msg/Odometry",
+    "min_baseline": 1.0,              // Minimum travel for alignment (meters)
+    "prior_inf_scale": [1e4, 1e4, 1e4]  // X, Y, Z information values
   }
 }
 ```
 
 **Threading (adjust based on your CPU):**
 ```json
-"odometry_estimation": { "num_threads": 12 },
-"preprocess": { "num_threads": 8 },
-"global_mapping": { "num_threads": 4 }
+"odometry_estimation": { "num_threads": 2 },
+"preprocess":          { "num_threads": 2 }
 ```
+Sub/global mapping use library defaults; tune up if you have spare cores.
 
 ## Coordinate Transformation
 
@@ -224,7 +226,7 @@ The GNSS module automatically computes the transformation between:
 **Transformation variable:** `T_world_utm`
 
 This transformation is:
-- Computed once per session after achieving minimum baseline distance (default: 2.0m)
+- Computed once per session after achieving minimum baseline distance (default: 1.0m)
 - Remains static throughout the mapping run
 - **Automatically saved to `T_world_utm.txt` in the map directory**
 
@@ -251,14 +253,14 @@ And saved to the map directory when mapping completes:
 ## Troubleshooting
 
 ### GNSS not aligning
-- Check GPS messages are being received: `ros2 topic echo /gps/pose`
+- Check GPS messages are being received: `ros2 topic echo /gps_nav/odom`
 - Verify timestamps match between sensors (check for retiming issues)
 - Ensure vehicle has traveled > `min_baseline` distance
 - Check logs for timestamp warnings
 
 ### Low performance
 - Reduce thread counts if CPU usage is 100%
-- Increase downsampling: `random_downsample_target: 5000`
+- Increase downsampling: lower `random_downsample_target` from the default `10000`
 - Disable viewers if running headless
 
 ### CUDA errors
@@ -266,9 +268,10 @@ And saved to the map directory when mapping completes:
 - System falls back to CPU automatically
 
 ### Map not saving
-- Don't interrupt GLIM with Ctrl+C while using grep/pipes
-- Use `tee` for logging: `ros2 launch ... | tee output.log`
-- Check `~/glim_maps/` permissions
+- Use `tee` for logging instead of piping through `grep` so the SIGINT shutdown
+  sequence reaches GLIM directly: `ros2 launch ... | tee output.log`
+- Default dump path is `/tmp/dump`; override with `-p dump_path:=<dir>` and
+  check write permissions on the chosen directory
 
 ## Credits
 
