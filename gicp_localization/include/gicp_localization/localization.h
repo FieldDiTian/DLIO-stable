@@ -315,6 +315,7 @@ private:
   bool debug_lm_print_;
   double debug_jump_trans_m_;
   double debug_jump_rot_deg_;
+  bool verbose_;
 
   // Extrinsics
   struct Extrinsics {

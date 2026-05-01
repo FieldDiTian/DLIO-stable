@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/terramaster/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/run/media/bryan/98bb92ee-2f10-4788-91bc-b0523532d79f/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"
@@ -30,6 +30,10 @@
     localization/publish_tf: true
     # If true, disable GICP scan matching and propagate pose using IMU/geometric observer only.
     localization/imu_only: false
+
+    # Logging verbosity. true = current behavior (INFO + raw stderr debug prints).
+    # false = silence INFO/DEBUG; WARN/ERROR still pass through.
+    localization/verbose: false
 
     # Use odometry for pose initialization
     # If true, waits for first odometry message to initialize
@@ -89,8 +93,8 @@
     odom/geo/Kp: 4.5      # Position correction gain
     odom/geo/Kv: 11.25    # Velocity correction gain
     odom/geo/Kq: 4.0      # Orientation correction gain
-    odom/geo/Kab: 0.5    # Accelerometer bias correction gain
-    odom/geo/Kgb: 0.5    # Gyroscope bias correction gain
+    odom/geo/Kab: 2.25    # Accelerometer bias correction gain
+    odom/geo/Kgb: 1.0    # Gyroscope bias correction gain
     odom/geo/Kz_damping: 0.0  
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)

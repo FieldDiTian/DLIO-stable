@@ -694,6 +694,7 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/debug/nano_gicp_lm_debug", false);
   this->declare_parameter<double>("localization/debug/jump_trans_m", 1.0);
   this->declare_parameter<double>("localization/debug/jump_rot_deg", 10.0);
+  this->declare_parameter<bool>("localization/verbose", true);
 
   this->get_parameter("localization/debug/enable_pub", this->debug_pub_enabled_);
   this->get_parameter("localization/debug/enable_jump_log", this->debug_jump_log_enabled_);
@@ -701,6 +702,13 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("localization/debug/nano_gicp_lm_debug", this->debug_lm_print_);
   this->get_parameter("localization/debug/jump_trans_m", this->debug_jump_trans_m_);
   this->get_parameter("localization/debug/jump_rot_deg", this->debug_jump_rot_deg_);
+  this->get_parameter("localization/verbose", this->verbose_);
+
+  // Suppress INFO/DEBUG logs when verbose is off; WARN/ERROR still pass through.
+  if (!this->verbose_) {
+    rcutils_logging_set_logger_level(this->get_logger().get_name(),
+                                     RCUTILS_LOG_SEVERITY_WARN);
+  }
 
   RCLCPP_INFO(this->get_logger(), "Preprocessing config: crop_size=%.2f, voxel_filter=%s, voxel_res=%.2f",
               this->crop_size_, this->vf_use_ ? "ENABLED" : "DISABLED", this->vf_res_);
@@ -1471,12 +1479,14 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
     memcpy(&ts0, &deskewed_scan_->points.front().timestamp, sizeof(uint64_t));
     memcpy(&tsN, &deskewed_scan_->points.back().timestamp, sizeof(uint64_t));
     memcpy(&ts_mid, &deskewed_scan_->points[mid].timestamp, sizeof(uint64_t));
-    std::fprintf(stderr,
-                 "[LUMINAR_DBG] %zu pts, %zu unique, ts0=%lu tsMid=%lu tsN=%lu span_ns=%ld\n",
-                 deskewed_scan_->points.size(), timestamps.size(),
-                 (unsigned long)ts0, (unsigned long)ts_mid, (unsigned long)tsN,
-                 (long)((long long)tsN - (long long)ts0));
-    std::fflush(stderr);
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[LUMINAR_DBG] %zu pts, %zu unique, ts0=%lu tsMid=%lu tsN=%lu span_ns=%ld\n",
+                   deskewed_scan_->points.size(), timestamps.size(),
+                   (unsigned long)ts0, (unsigned long)ts_mid, (unsigned long)tsN,
+                   (long)((long long)tsN - (long long)ts0));
+      std::fflush(stderr);
+    }
   }
 
   if (timestamps.empty()) {
@@ -2261,12 +2271,14 @@ gicp_localization::LocalizationNode::integrateImu(
   const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
 
   if (sorted_timestamps.empty() || start_time > sorted_timestamps.front()) {
-    std::fprintf(stderr,
-                 "[IMU_INT] REJECT guard: empty=%d start=%.6f front=%.6f (start>front=%d)\n",
-                 (int)sorted_timestamps.empty(), start_time,
-                 sorted_timestamps.empty() ? 0.0 : sorted_timestamps.front(),
-                 (int)(!sorted_timestamps.empty() && start_time > sorted_timestamps.front()));
-    std::fflush(stderr);
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[IMU_INT] REJECT guard: empty=%d start=%.6f front=%.6f (start>front=%d)\n",
+                   (int)sorted_timestamps.empty(), start_time,
+                   sorted_timestamps.empty() ? 0.0 : sorted_timestamps.front(),
+                   (int)(!sorted_timestamps.empty() && start_time > sorted_timestamps.front()));
+      std::fflush(stderr);
+    }
     return empty;
   }
 
@@ -2280,20 +2292,24 @@ gicp_localization::LocalizationNode::integrateImu(
       sz = this->imu_buffer.size();
       if (sz > 0) { front_s = this->imu_buffer.front().stamp; back_s = this->imu_buffer.back().stamp; }
     }
-    std::fprintf(stderr,
-                 "[IMU_INT] REJECT range: start=%.6f end=%.6f buf_sz=%zu front=%.6f back=%.6f (front<end=%d)\n",
-                 start_time, sorted_timestamps.back(), sz, front_s, back_s,
-                 (int)(sz > 0 && front_s < sorted_timestamps.back()));
-    std::fflush(stderr);
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[IMU_INT] REJECT range: start=%.6f end=%.6f buf_sz=%zu front=%.6f back=%.6f (front<end=%d)\n",
+                   start_time, sorted_timestamps.back(), sz, front_s, back_s,
+                   (int)(sz > 0 && front_s < sorted_timestamps.back()));
+      std::fflush(stderr);
+    }
     return empty;
   }
 
   if ((begin_imu_it + 1) == end_imu_it) {
-    std::fprintf(stderr,
-                 "[IMU_INT] REJECT begin+1==end: start=%.6f end=%.6f begin.stamp=%.6f end.base.stamp=%.6f\n",
-                 start_time, sorted_timestamps.back(),
-                 begin_imu_it->stamp, end_imu_it.base()->stamp);
-    std::fflush(stderr);
+    if (this->verbose_) {
+      std::fprintf(stderr,
+                   "[IMU_INT] REJECT begin+1==end: start=%.6f end=%.6f begin.stamp=%.6f end.base.stamp=%.6f\n",
+                   start_time, sorted_timestamps.back(),
+                   begin_imu_it->stamp, end_imu_it.base()->stamp);
+      std::fflush(stderr);
+    }
     return empty;
   }
 
@@ -2304,9 +2320,11 @@ gicp_localization::LocalizationNode::integrateImu(
   double dt = f2.dt;
 
   if (dt < 1e-6) {
-    std::fprintf(stderr, "[IMU_INT] REJECT dt: f1.stamp=%.6f f2.stamp=%.6f f2.dt=%.9f\n",
-                 f1.stamp, f2.stamp, dt);
-    std::fflush(stderr);
+    if (this->verbose_) {
+      std::fprintf(stderr, "[IMU_INT] REJECT dt: f1.stamp=%.6f f2.stamp=%.6f f2.dt=%.9f\n",
+                   f1.stamp, f2.stamp, dt);
+      std::fflush(stderr);
+    }
     return empty;
   }
 

@@ -40,8 +40,16 @@
     "so_name": "libodometry_estimation_gpu.so",
     // Initialization params
     "initialization_mode": "LOOSE",
-    "initialization_window_size": 3.0,
+    "initialization_window_size": 5.0,
     "init_pose_damping_scale": 1e10,
+    // URDF-based init: assumes chassis level + IMU mount per av24.urdf (imu_bottom rpy = 0,0,0)
+    // → R_world_imu = identity. Translation gauge-fixed at origin. Velocity assumed zero (stationary start).
+    // Presence of these two params disables LOOSE estimator (see odometry_estimation_imu.cpp:53-57).
+    // Comment both out to fall back to LOOSE gravity-averaging.
+    // "init_T_world_imu": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    // "init_v_world_imu": [0.0, 0.0, 0.0],
+    "init_T_world_imu": [0.0, 0.0, 0.0, -0.005250, 0.011631, 0.947658, 0.319032],
+    "init_v_world_imu": [-7.5108, 5.8182, -0.3548],
     // Optimization params
     "smoother_lag": 5.0,
     "use_isam2_dogleg": false,

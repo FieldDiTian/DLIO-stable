@@ -50,7 +50,7 @@
     "imu_int_noise": 0.001,
     "imu_bias_noise": 1e-4,
     // LiDAR config
-    "global_shutter_lidar": true,
+    "global_shutter_lidar": false,
     "flip_points_y": true,
     // URDF-based T_lidar_imu: if all three fields are set, T_lidar_imu is computed from the URDF at runtime
     "urdf_path": "av24.urdf",
