@@ -133,6 +133,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_initial_guess_cloud_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dbg_pose_markers_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_fitness_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gicp_elapsed_ms_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_corr_norm_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_scan_dt_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_imu_age_pub;

@@ -451,6 +451,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   // Debug publishers (small scalar topics for plotting)
   this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
+  this->dbg_gicp_elapsed_ms_pub =
+      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gicp_elapsed_ms", 10);
   this->dbg_corr_norm_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/corr_norm", 10);
   this->dbg_scan_dt_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_dt", 10);
   this->dbg_imu_age_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_age", 10);
@@ -1742,6 +1744,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     };
 
     publish_float(this->dbg_fitness_pub, fitness_score);
+    publish_float(this->dbg_gicp_elapsed_ms_pub, elapsed_ms);
     publish_float(this->dbg_corr_norm_pub, guess_to_solution_trans);
     publish_float(this->dbg_scan_dt_pub, scan_dt);
     publish_float(this->dbg_imu_age_pub, imu_buffer_span);

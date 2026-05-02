@@ -77,6 +77,11 @@ ament_package()
 install( TARGETS gicp_localization_node
          DESTINATION lib/${PROJECT_NAME}
 )
+install( PROGRAMS
+         scripts/profile_localization_resources.py
+         scripts/plot_localization_profile.py
+         DESTINATION lib/${PROJECT_NAME}
+)
 install( DIRECTORY cfg launch
          DESTINATION share/${PROJECT_NAME}
 )

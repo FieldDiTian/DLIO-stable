@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/run/media/bryan/98bb92ee-2f10-4788-91bc-b0523532d79f/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/media/terramaster/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # Frame IDs
     localization/map_frame: "map"

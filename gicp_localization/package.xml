@@ -12,6 +12,9 @@
   <!-- ROS2 dependencies -->
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
