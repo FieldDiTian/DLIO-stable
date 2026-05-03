@@ -66,11 +66,11 @@
       "libmemory_monitor.so",
       "libstandard_viewer.so",
       "librviz_viewer.so",
-      "libgnss_global.so"
-      // "libimu_validator.so"
+      "libgnss_global.so",
+      "libimu_validator.so"
     ],
     // Topics
-    "imu_topic": "/gps_bot/imu",
+    "imu_topic": "/atlas/imu_calibrated",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
     // QoS options

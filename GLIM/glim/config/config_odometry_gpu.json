@@ -48,8 +48,8 @@
     // Comment both out to fall back to LOOSE gravity-averaging.
     // "init_T_world_imu": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
     // "init_v_world_imu": [0.0, 0.0, 0.0],
-    "init_T_world_imu": [0.0, 0.0, 0.0, -0.005250, 0.011631, 0.947658, 0.319032],
-    "init_v_world_imu": [-7.5108, 5.8182, -0.3548],
+    // "init_T_world_imu": [0.0, 0.0, 0.0, -0.005250, 0.011631, 0.947658, 0.319032],
+    // "init_v_world_imu": [-7.5108, 5.8182, -0.3548],
     // Optimization params
     "smoother_lag": 5.0,
     "use_isam2_dogleg": false,

@@ -19,6 +19,7 @@ find_package(glim REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBXML2 REQUIRED libxml-2.0)
+find_library(PCAP_LIBRARY pcap REQUIRED)
 
 if(DEFINED GLIM_USE_OPENCV AND NOT GLIM_USE_OPENCV AND BUILD_WITH_CV_BRIDGE)
   message(WARNING "BUILD_WITH_CV_BRIDGE is disabled because glim is not built with OpenCV.")
@@ -75,6 +76,18 @@ target_include_directories(glim_rosbag PRIVATE ${LIBXML2_INCLUDE_DIRS})
 target_link_libraries(glim_rosbag
   glim_ros
   ${LIBXML2_LIBRARIES}
+)
+
+### glim_pcap_rosbag ###
+ament_auto_add_executable(glim_pcap_rosbag
+  src/glim_pcap_rosbag.cpp
+  src/iris_pcap_reader.cpp
+)
+target_include_directories(glim_pcap_rosbag PRIVATE ${LIBXML2_INCLUDE_DIRS})
+target_link_libraries(glim_pcap_rosbag
+  glim_ros
+  ${LIBXML2_LIBRARIES}
+  ${PCAP_LIBRARY}
 )
 
 ### validator_node ###

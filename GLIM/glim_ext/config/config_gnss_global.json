@@ -1,12 +1,12 @@
 {
   "gnss": {
-    "gnss_topic": "/gps_nav/odom",
+    "gnss_topic": "/vks/global_odom",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
     "prior_inf_scale": [
-      1e4,
-      1e4,
-      1e4
+      10,
+      10,
+      10
     ]
   }
 }

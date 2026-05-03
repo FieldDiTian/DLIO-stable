@@ -100,7 +100,7 @@
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
-    localization/debug/enable_pub: true
+    localization/debug/enable_pub: false
     localization/debug/enable_jump_log: true
     localization/debug/verbose_scan_log: true
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
