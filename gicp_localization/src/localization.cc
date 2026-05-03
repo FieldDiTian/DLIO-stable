@@ -22,6 +22,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <chrono>
 #include <algorithm>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -437,6 +438,9 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->localized_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("localized_odom", odom_qos);
 
   this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
+  this->utm_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/pose_utm", 10);
+  this->utm_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("gicp/localization/odom_utm", odom_qos);
+  this->utm_path_pub = this->create_publisher<nav_msgs::msg::Path>("gicp/localization/path_utm", 10);
   this->aligned_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_cloud", 10);
   this->dbg_initial_guess_pose_pub =
       this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
@@ -507,6 +511,32 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
 gicp_localization::LocalizationNode::~LocalizationNode() {}
 
+bool gicp_localization::LocalizationNode::loadUTMTransform(const std::string& path) {
+  std::ifstream f(path);
+  if (!f.is_open()) {
+    RCLCPP_ERROR(this->get_logger(), "Cannot open UTM transform file: %s", path.c_str());
+    return false;
+  }
+  Eigen::Matrix4f T_world_utm = Eigen::Matrix4f::Identity();
+  std::string line;
+  int row = 0;
+  while (std::getline(f, line) && row < 4) {
+    if (line.empty() || line[0] == '#' || line.find("T_world_utm") != std::string::npos) continue;
+    std::istringstream ss(line);
+    for (int col = 0; col < 4; ++col) ss >> T_world_utm(row, col);
+    ++row;
+  }
+  if (row < 4) {
+    RCLCPP_ERROR(this->get_logger(), "UTM transform file malformed (only %d rows parsed): %s", row, path.c_str());
+    return false;
+  }
+  this->T_utm_map_ = T_world_utm.inverse();
+  RCLCPP_INFO(this->get_logger(), "Loaded UTM transform from %s (T_utm_map origin: [%.2f, %.2f, %.2f])",
+    path.c_str(),
+    this->T_utm_map_(0, 3), this->T_utm_map_(1, 3), this->T_utm_map_(2, 3));
+  return true;
+}
+
 void gicp_localization::LocalizationNode::getParams() {
 
   // Frame IDs
@@ -524,6 +554,8 @@ void gicp_localization::LocalizationNode::getParams() {
 
   // Map parameters
   this->declare_parameter<std::string>("localization/map_path", "");
+  this->declare_parameter<std::string>("localization/utm_transform_path", "");
+  this->declare_parameter<std::string>("localization/utm_frame", "utm");
   this->declare_parameter<double>("localization/voxel_leaf_size", 0.25);
   this->declare_parameter<bool>("localization/visualize_map", true);
   this->declare_parameter<double>("localization/map_voxel_size_vis", 0.5);
@@ -532,6 +564,15 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/map_rotation/yaw_deg", 0.0);
 
   this->get_parameter("localization/map_path", this->map_path_);
+
+  std::string utm_transform_path;
+  this->get_parameter("localization/utm_transform_path", utm_transform_path);
+  this->get_parameter("localization/utm_frame", this->utm_frame);
+  this->utm_enabled_ = false;
+  this->T_utm_map_ = Eigen::Matrix4f::Identity();
+  if (!utm_transform_path.empty()) {
+    this->utm_enabled_ = loadUTMTransform(utm_transform_path);
+  }
   this->get_parameter("localization/voxel_leaf_size", this->voxel_leaf_size_);
   this->get_parameter("localization/visualize_map", this->visualize_map_);
   this->get_parameter("localization/map_voxel_size_vis", this->map_voxel_size_vis_);
@@ -2054,6 +2095,34 @@ void gicp_localization::LocalizationNode::publishPose() {
   this->path_msg.poses.push_back(pose_msg);
   this->path_pub->publish(this->path_msg);
 
+  // Publish UTM-frame pose/path
+  if (this->utm_enabled_) {
+    Eigen::Matrix4f T_utm_base = this->T_utm_map_ * this->current_pose;
+    Eigen::Vector3f utm_pos = T_utm_base.block<3, 1>(0, 3);
+    Eigen::Quaternionf utm_q(T_utm_base.block<3, 3>(0, 0));
+    utm_q.normalize();
+
+    geometry_msgs::msg::PoseStamped utm_pose_msg;
+    utm_pose_msg.header.stamp = this->scan_stamp;
+    utm_pose_msg.header.frame_id = this->utm_frame;
+    utm_pose_msg.pose.position.x = utm_pos.x();
+    utm_pose_msg.pose.position.y = utm_pos.y();
+    utm_pose_msg.pose.position.z = utm_pos.z();
+    utm_pose_msg.pose.orientation.w = utm_q.w();
+    utm_pose_msg.pose.orientation.x = utm_q.x();
+    utm_pose_msg.pose.orientation.y = utm_q.y();
+    utm_pose_msg.pose.orientation.z = utm_q.z();
+    this->utm_pose_pub->publish(utm_pose_msg);
+
+    this->utm_path_msg_.header.stamp = this->scan_stamp;
+    this->utm_path_msg_.header.frame_id = this->utm_frame;
+    if (this->utm_path_msg_.poses.size() >= 10000) {
+      this->utm_path_msg_.poses.erase(this->utm_path_msg_.poses.begin());
+    }
+    this->utm_path_msg_.poses.push_back(utm_pose_msg);
+    this->utm_path_pub->publish(this->utm_path_msg_);
+  }
+
   // Publish TF
   if (this->publish_tf_) {
     geometry_msgs::msg::TransformStamped transform_stamped;
@@ -2624,6 +2693,38 @@ void gicp_localization::LocalizationNode::propagateState() {
   odom_msg.twist.twist.angular.z = new_v_ang_w.z();
 
   this->localized_odom_pub->publish(odom_msg);
+
+  // Publish UTM-frame odometry
+  if (this->utm_enabled_) {
+    Eigen::Matrix4f T_map_base = Eigen::Matrix4f::Identity();
+    T_map_base.block<3, 3>(0, 0) = new_q.toRotationMatrix();
+    T_map_base.block<3, 1>(0, 3) = new_p;
+    Eigen::Matrix4f T_utm_base = this->T_utm_map_ * T_map_base;
+    Eigen::Vector3f utm_p = T_utm_base.block<3, 1>(0, 3);
+    Eigen::Quaternionf utm_q(T_utm_base.block<3, 3>(0, 0));
+    utm_q.normalize();
+    // Rotate velocity into UTM frame
+    Eigen::Vector3f utm_v_lin = this->T_utm_map_.block<3, 3>(0, 0) * new_v_lin_w;
+
+    nav_msgs::msg::Odometry utm_odom_msg;
+    utm_odom_msg.header.stamp = current_time;
+    utm_odom_msg.header.frame_id = this->utm_frame;
+    utm_odom_msg.child_frame_id = this->base_frame;
+    utm_odom_msg.pose.pose.position.x = utm_p.x();
+    utm_odom_msg.pose.pose.position.y = utm_p.y();
+    utm_odom_msg.pose.pose.position.z = utm_p.z();
+    utm_odom_msg.pose.pose.orientation.w = utm_q.w();
+    utm_odom_msg.pose.pose.orientation.x = utm_q.x();
+    utm_odom_msg.pose.pose.orientation.y = utm_q.y();
+    utm_odom_msg.pose.pose.orientation.z = utm_q.z();
+    utm_odom_msg.twist.twist.linear.x = utm_v_lin.x();
+    utm_odom_msg.twist.twist.linear.y = utm_v_lin.y();
+    utm_odom_msg.twist.twist.linear.z = utm_v_lin.z();
+    utm_odom_msg.twist.twist.angular.x = new_v_ang_w.x();
+    utm_odom_msg.twist.twist.angular.y = new_v_ang_w.y();
+    utm_odom_msg.twist.twist.angular.z = new_v_ang_w.z();
+    this->utm_odom_pub->publish(utm_odom_msg);
+  }
 
   if (this->imu_only_mode_) {
     // Publish pose/TF directly from propagated IMU state when GICP is disabled.

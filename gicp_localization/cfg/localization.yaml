@@ -5,7 +5,11 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/terramaster/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/home/tanishaa/Downloads/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+
+    # UTM output: path to GLIM's T_world_utm.txt for the map being used
+    localization/utm_transform_path: "/home/tanishaa/Downloads/T_world_utm.txt"
+    localization/utm_frame: "utm"
 
     # Frame IDs
     localization/map_frame: "map"

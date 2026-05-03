@@ -72,6 +72,7 @@ private:
   void performLocalization();
   void publishPose();
   void applyInitialPoseFromParams();
+  bool loadUTMTransform(const std::string& path);
 
   // Multi-LiDAR concatenation: pushes incoming aux scans into per-sensor ring
   // buffers, then `mergeAuxClouds` (called from the primary callback) finds
@@ -125,6 +126,9 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr localized_odom_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr utm_pose_pub;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr utm_odom_pub;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr utm_path_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_cloud_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_initial_guess_pose_pub;
@@ -258,6 +262,13 @@ private:
   std::string odom_frame;
   std::string imu_frame;
   std::string lidar_frame;
+  std::string utm_frame;
+
+  // UTM transform: T_utm_map = T_world_utm.inverse()
+  // Loaded from GLIM's T_world_utm.txt at startup when utm_transform_path is set
+  bool utm_enabled_;
+  Eigen::Matrix4f T_utm_map_;
+  nav_msgs::msg::Path utm_path_msg_;
 
   // Parameters
   std::string map_path_;
