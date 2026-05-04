@@ -51,6 +51,13 @@ public:
     Eigen::Vector3f lin_accel;
   };
 
+  // Ground-truth odom sample (public so internal helper signatures can reference it).
+  struct GtSample {
+    double stamp;
+    Eigen::Vector3f p;
+    Eigen::Quaternionf q;
+  };
+
   LocalizationNode();
   ~LocalizationNode();
 
@@ -64,6 +71,9 @@ private:
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& pc);
   void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
+  void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
+  bool getGtPoseAt(double stamp, GtSample& out);
   void applyInitialPose(const Eigen::Vector3f& p, const Eigen::Quaternionf& q,
                         const rclcpp::Time& stamp, const std::string& source);
 
@@ -104,7 +114,17 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
-  rclcpp::CallbackGroup::SharedPtr pointcloud_cb_group, initial_pose_cb_group, imu_cb_group;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gt_odom_sub;
+  rclcpp::CallbackGroup::SharedPtr pointcloud_cb_group, initial_pose_cb_group, imu_cb_group, gt_odom_cb_group;
+
+  // Ground-truth odom for divergence cross-check (optional)
+  // Latest message and a small ring buffer for time-matched lookup.
+  bool gt_odom_enabled_;
+  size_t gt_odom_buffer_size_;
+  double gt_odom_max_dt_;  // seconds; reject lookups farther than this from scan stamp
+  std::deque<GtSample> gt_odom_buffer_;
+  std::mutex gt_odom_mtx_;
+  std::atomic<bool> gt_odom_received_{false};
 
   // Multi-LiDAR concatenation
   struct AuxLidar {
@@ -156,6 +176,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_trans_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_jump_rot_deg_pub;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
@@ -297,6 +319,8 @@ private:
   double gicp_rotation_epsilon_;
   double gicp_fitness_reject_threshold_;
   bool gicp_reject_large_jumps_;
+  double gicp_hessian_cond_max_;
+  double gicp_hessian_fitness_warn_;
 
   // Preprocessing parameters
   double crop_size_;

@@ -425,6 +425,24 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       std::bind(&gicp_localization::LocalizationNode::callbackImu, this, std::placeholders::_1),
       imu_sub_opt);
 
+  // Optional ground-truth odom subscriber for divergence cross-check.
+  // Topic is remappable as "gt_odom"; default points to /localization/global/odom in launch.
+  if (this->gt_odom_enabled_) {
+    this->gt_odom_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    auto gt_sub_opt = rclcpp::SubscriptionOptions();
+    gt_sub_opt.callback_group = this->gt_odom_cb_group;
+    auto gt_qos = rclcpp::QoS(rclcpp::KeepLast(this->gt_odom_buffer_size_));
+    gt_qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+    gt_qos.durability(rclcpp::DurabilityPolicy::Volatile);
+    this->gt_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
+        "gt_odom", gt_qos,
+        std::bind(&gicp_localization::LocalizationNode::callbackGtOdom, this, std::placeholders::_1),
+        gt_sub_opt);
+    RCLCPP_INFO(this->get_logger(),
+                "Ground-truth odom cross-check ENABLED (topic remap 'gt_odom', buffer=%zu, max_dt=%.3fs)",
+                this->gt_odom_buffer_size_, this->gt_odom_max_dt_);
+  }
+
   // Setup publishers
   this->pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("localized_pose", 10);
 
@@ -487,6 +505,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->dbg_jump_trans_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_trans", 10);
   this->dbg_jump_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_rot_deg", 10);
   this->dbg_converged_pub = this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/converged", 10);
+  this->dbg_gt_pos_err_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
+  this->dbg_gt_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
 
   if (this->visualize_map_) {
     this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map", 1);
@@ -593,6 +613,18 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("localization/initial_pose/pitch", 0.0);
   this->declare_parameter<double>("localization/initial_pose/yaw", 0.0);
 
+  // Ground-truth odom cross-check (optional). Uses topic remap "gt_odom".
+  this->declare_parameter<bool>("localization/gt_odom/enable", false);
+  this->declare_parameter<int>("localization/gt_odom/buffer_size", 200);
+  this->declare_parameter<double>("localization/gt_odom/max_dt", 0.1);
+  bool gt_enable = false; int gt_buf = 200; double gt_max_dt = 0.1;
+  this->get_parameter("localization/gt_odom/enable", gt_enable);
+  this->get_parameter("localization/gt_odom/buffer_size", gt_buf);
+  this->get_parameter("localization/gt_odom/max_dt", gt_max_dt);
+  this->gt_odom_enabled_ = gt_enable;
+  this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
+  this->gt_odom_max_dt_ = gt_max_dt;
+
   this->get_parameter("localization/publish_tf", this->publish_tf_);
   this->get_parameter("localization/imu_only", this->imu_only_mode_);
   this->get_parameter("localization/use_odom_init", this->use_odom_init_);
@@ -613,6 +645,16 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<double>("gicp/rotationEpsilon", 0.0001);
   this->declare_parameter<double>("gicp/fitnessRejectThreshold", 1.0);
   this->declare_parameter<bool>("gicp/rejectLargeJumps", true);
+  // Reject scans whose Hessian condition number proxy exceeds this threshold.
+  // Straights typically run ~1e4; feature-poor corners spike to 1e8-1e9 and the
+  // optimizer slides along the unconstrained axis. Set <=0 to disable the gate.
+  this->declare_parameter<double>("gicp/hessianCondMax", 1.0e6);
+  // Hessian rejection only fires when fitness ALSO exceeds this "warn" floor.
+  // Healthy GICP scans on degenerate geometry have low fitness (~0.04) — high
+  // hessian alone doesn't mean the solution is bad; combined with elevated
+  // fitness it does. Set fitness warn <= 0 to make the hessian gate fire on
+  // condition number alone (legacy behavior).
+  this->declare_parameter<double>("gicp/hessianFitnessWarnThreshold", 0.15);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
@@ -621,6 +663,8 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/rotationEpsilon", this->gicp_rotation_epsilon_);
   this->get_parameter("gicp/fitnessRejectThreshold", this->gicp_fitness_reject_threshold_);
   this->get_parameter("gicp/rejectLargeJumps", this->gicp_reject_large_jumps_);
+  this->get_parameter("gicp/hessianCondMax", this->gicp_hessian_cond_max_);
+  this->get_parameter("gicp/hessianFitnessWarnThreshold", this->gicp_hessian_fitness_warn_);
 
   // Preprocessing parameters
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
@@ -761,6 +805,13 @@ void gicp_localization::LocalizationNode::getParams() {
               this->geo_Kp_, this->geo_Kv_, this->geo_Kq_, this->geo_Kab_, this->geo_Kgb_);
   RCLCPP_INFO(this->get_logger(), "Localization mode: %s",
               this->imu_only_mode_ ? "IMU-only (GICP disabled)" : "GICP + IMU");
+  RCLCPP_INFO(this->get_logger(),
+              "GICP rejection: fitness>%.3f, large_jump=%s, hessian_cond>%.2e AND fitness>%.3f (%s)",
+              this->gicp_fitness_reject_threshold_,
+              this->gicp_reject_large_jumps_ ? "on" : "off",
+              this->gicp_hessian_cond_max_,
+              this->gicp_hessian_fitness_warn_,
+              this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -1777,6 +1828,25 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const bool large_jump = candidate_pose_valid &&
                           (jump_trans > this->debug_jump_trans_m_ || jump_rot_deg > this->debug_jump_rot_deg_);
 
+  // Ground-truth divergence cross-check (optional). Compares the scan's accepted-or-candidate
+  // pose to a time-matched ground-truth odom sample. Only computes; does NOT influence
+  // accept/reject decisions — purely a diagnostic.
+  double gt_pos_err = -1.0;
+  double gt_rot_err_deg = -1.0;
+  double gt_dt = 0.0;
+  if (this->gt_odom_enabled_ && this->gt_odom_received_.load() && candidate_pose_valid) {
+    GtSample gt;
+    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt)) {
+      const Eigen::Vector3f cand_p = candidate_pose.block<3, 1>(0, 3);
+      const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
+      gt_pos_err = (cand_p - gt.p).norm();
+      Eigen::Quaternionf dq = cand_q.normalized() * gt.q.normalized().conjugate();
+      const double w = std::clamp(static_cast<double>(std::abs(dq.w())), 0.0, 1.0);
+      gt_rot_err_deg = 2.0 * std::acos(w) * 180.0 / M_PI;
+      gt_dt = this->scan_stamp.seconds() - gt.stamp;
+    }
+  }
+
   if (this->debug_pub_enabled_) {
     auto publish_float = [](const rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr& pub, double value) {
       std_msgs::msg::Float64 msg;
@@ -1807,6 +1877,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
     std_msgs::msg::Bool converged_msg;
     converged_msg.data = (converged || (candidate_pose_valid && fitness_score <= this->gicp_fitness_reject_threshold_)) && candidate_pose_valid;
     this->dbg_converged_pub->publish(converged_msg);
+
+    if (gt_pos_err >= 0.0) {
+      publish_float(this->dbg_gt_pos_err_pub, gt_pos_err);
+      publish_float(this->dbg_gt_rot_deg_pub, gt_rot_err_deg);
+    }
 
     this->dbg_initial_guess_pose_pub->publish(
         poseStampedFromMatrix(guess_pose_map, this->scan_stamp, this->map_frame));
@@ -1911,6 +1986,15 @@ void gicp_localization::LocalizationNode::performLocalization() {
     if (this->last_gicp_valid_) {
       oss << " last_good={" << poseSummary(this->last_gicp_pose_) << "}";
     }
+    if (this->gt_odom_enabled_) {
+      if (gt_pos_err >= 0.0) {
+        oss << " gt_err=[" << scalarSummary(gt_pos_err, 3) << "m,"
+            << scalarSummary(gt_rot_err_deg, 2) << "deg,dt="
+            << scalarSummary(gt_dt, 3) << "s]";
+      } else {
+        oss << " gt_err=unavailable";
+      }
+    }
     return oss.str();
   };
 
@@ -1923,14 +2007,28 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
   bool gicp_rejected_fitness = false;
   bool gicp_rejected_jump = false;
+  bool gicp_rejected_hessian = false;
   if (effectively_converged && candidate_pose_valid) {
     if (fitness_score > this->gicp_fitness_reject_threshold_) {
       gicp_rejected_fitness = true;
+    } else if (this->gicp_hessian_cond_max_ > 0.0 &&
+               std::isfinite(hessian_condition) &&
+               hessian_condition > this->gicp_hessian_cond_max_ &&
+               (this->gicp_hessian_fitness_warn_ <= 0.0 ||
+                fitness_score > this->gicp_hessian_fitness_warn_)) {
+      // Combined geometric degeneracy + fitness elevation gate. High Hessian
+      // condition alone is harmless when GICP still found a clean local minimum
+      // (low fitness) — that's just feature-poor geometry, not a bad solution.
+      // Reject only when degenerate geometry AND fitness has crept up — the
+      // signature of the optimizer landing in a wrong local minimum that the
+      // unconstrained axis allowed it to slide into.
+      gicp_rejected_hessian = true;
     } else if (this->gicp_reject_large_jumps_ && large_jump) {
       gicp_rejected_jump = true;
     }
   }
-  const bool gicp_accepted = effectively_converged && candidate_pose_valid && !gicp_rejected_fitness && !gicp_rejected_jump;
+  const bool gicp_accepted = effectively_converged && candidate_pose_valid &&
+                             !gicp_rejected_fitness && !gicp_rejected_hessian && !gicp_rejected_jump;
 
   if (!candidate_pose_valid) {
     RCLCPP_WARN(this->get_logger(), "%s", build_scan_debug_log("invalid_solution").c_str());
@@ -1941,6 +2039,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 "GICP REJECTED (fitness=%.4f > threshold=%.4f): %s",
                 fitness_score, this->gicp_fitness_reject_threshold_,
                 build_scan_debug_log("rejected_fitness").c_str());
+  } else if (gicp_rejected_hessian) {
+    RCLCPP_WARN(this->get_logger(),
+                "GICP REJECTED (hessian_cond=%.3e > %.3e AND fitness=%.4f > %.4f — degenerate slide): %s",
+                hessian_condition, this->gicp_hessian_cond_max_,
+                fitness_score, this->gicp_hessian_fitness_warn_,
+                build_scan_debug_log("rejected_hessian").c_str());
   } else if (gicp_rejected_jump) {
     RCLCPP_WARN(this->get_logger(),
                 "GICP REJECTED (jump dT=%.3fm dR=%.2fdeg): %s",
@@ -2032,9 +2136,16 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
                 this->lidarPose.p.x(), this->lidarPose.p.y(), this->lidarPose.p.z());
-  } else if (gicp_rejected_fitness || gicp_rejected_jump) {
-    // GICP succeeded numerically but was gated out. Fall back to the IMU-integrated prior so
-    // the vehicle continues with dead-reckoning instead of stale pose.
+  } else {
+    // Any non-accepted scan (failed_to_converge, rejected_fitness, rejected_jump, invalid_solution)
+    // falls back to the IMU-integrated prior. Freezing at last_gicp_pose_ causes cascade
+    // divergence at feature-poor corners: each subsequent scan's guess drifts further from
+    // reality, fitness gets worse, and the optimizer never recovers.
+    const char* reason = !candidate_pose_valid ? "invalid solution"
+                       : !effectively_converged ? "failed to converge"
+                       : gicp_rejected_fitness ? "fitness rejected"
+                       : gicp_rejected_hessian ? "degenerate geometry"
+                       : "jump rejected";
     if (matrixFinite(this->T_prior)) {
       this->current_pose = this->T_prior;
       const Eigen::Vector3f new_p = this->T_prior.block<3, 1>(0, 3);
@@ -2047,16 +2158,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
         this->prev_vel = this->geo.prev_vel;
       }
       RCLCPP_WARN(this->get_logger(),
-                  "Localization: ⚠ GICP REJECTED — holding IMU dead-reckoning pose [%.2f, %.2f, %.2f]",
-                  new_p.x(), new_p.y(), new_p.z());
+                  "Localization: ⚠ GICP %s — holding IMU dead-reckoning pose [%.2f, %.2f, %.2f] | fitness=%.4f time=%.2fms",
+                  reason, new_p.x(), new_p.y(), new_p.z(), fitness_score, elapsed_ms);
     } else {
       RCLCPP_WARN(this->get_logger(),
-                  "Localization: ⚠ GICP REJECTED — holding last accepted pose (no valid T_prior)");
+                  "Localization: ⚠ GICP %s — holding last accepted pose (no valid T_prior) | fitness=%.4f time=%.2fms",
+                  reason, fitness_score, elapsed_ms);
     }
-  } else {
-    RCLCPP_WARN(this->get_logger(),
-                "Localization: ✗ FAILED TO CONVERGE | fitness=%.6f | time=%.2fms | Pose NOT updated!",
-                fitness_score, elapsed_ms);
   }
 }
 
@@ -2134,6 +2242,67 @@ void gicp_localization::LocalizationNode::publishPose() {
     transform_stamped.transform.rotation = pose_msg.pose.orientation;
     this->tf_broadcaster->sendTransform(transform_stamped);
   }
+}
+
+void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+  GtSample s;
+  s.stamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+  s.p = Eigen::Vector3f(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+  s.q = Eigen::Quaternionf(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
+                           msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+  s.q.normalize();
+
+  std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+  if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
+    // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
+    return;
+  }
+  this->gt_odom_buffer_.push_back(s);
+  while (this->gt_odom_buffer_.size() > this->gt_odom_buffer_size_) {
+    this->gt_odom_buffer_.pop_front();
+  }
+  if (!this->gt_odom_received_.exchange(true)) {
+    RCLCPP_INFO(this->get_logger(),
+                "First ground-truth odom received at stamp=%.3f frame=%s",
+                s.stamp, msg->header.frame_id.c_str());
+  }
+}
+
+bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
+  std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+  if (this->gt_odom_buffer_.size() < 2) {
+    if (this->gt_odom_buffer_.size() == 1 &&
+        std::abs(this->gt_odom_buffer_.front().stamp - stamp) <= this->gt_odom_max_dt_) {
+      out = this->gt_odom_buffer_.front();
+      return true;
+    }
+    return false;
+  }
+  // Buffer is monotone non-decreasing. Find the first sample with stamp >= query.
+  auto it = std::lower_bound(
+      this->gt_odom_buffer_.begin(), this->gt_odom_buffer_.end(), stamp,
+      [](const GtSample& s, double t) { return s.stamp < t; });
+
+  if (it == this->gt_odom_buffer_.begin()) {
+    if (std::abs(it->stamp - stamp) > this->gt_odom_max_dt_) return false;
+    out = *it; return true;
+  }
+  if (it == this->gt_odom_buffer_.end()) {
+    auto last = std::prev(it);
+    if (std::abs(last->stamp - stamp) > this->gt_odom_max_dt_) return false;
+    out = *last; return true;
+  }
+  auto a = std::prev(it);
+  auto b = it;
+  const double dt_total = b->stamp - a->stamp;
+  if (dt_total <= 0.0 || std::min(stamp - a->stamp, b->stamp - stamp) > this->gt_odom_max_dt_) {
+    return false;
+  }
+  const float u = static_cast<float>((stamp - a->stamp) / dt_total);
+  out.stamp = stamp;
+  out.p = (1.0f - u) * a->p + u * b->p;
+  out.q = a->q.slerp(u, b->q).normalized();
+  return true;
 }
 
 void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu) {

@@ -25,6 +25,7 @@ def generate_launch_description():
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_bot/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
+    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/localization/global/odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
@@ -40,6 +41,9 @@ def generate_launch_description():
         'imu_topic', default_value=imu_topic, description='IMU topic name (for deskewing)')
     declare_odom_topic_arg = DeclareLaunchArgument(
         'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
+    declare_gt_odom_topic_arg = DeclareLaunchArgument(
+        'gt_odom_topic', default_value=gt_odom_topic,
+        description='Ground-truth odometry topic for divergence cross-check (only used when localization/gt_odom/enable=true)')
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
@@ -110,6 +114,7 @@ def generate_launch_description():
                 ('pointcloud', pointcloud_topic),
                 ('imu', imu_topic),
                 ('odom', odom_topic),
+                ('gt_odom', gt_odom_topic),
                 ('localized_pose', 'gicp/localization/pose'),
                 ('localized_odom', 'gicp/localization/odom'),
                 ('localized_path', 'gicp/localization/path'),
@@ -134,6 +139,7 @@ def generate_launch_description():
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
         declare_odom_topic_arg,
+        declare_gt_odom_topic_arg,
         declare_imu_only_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,

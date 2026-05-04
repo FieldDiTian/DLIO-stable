@@ -5,16 +5,17 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/home/tanishaa/Downloads/better_loop_closure_0427.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/run/media/bryan/ART-D5/putnam/may_4/run_1/ins_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
-    # UTM output: path to GLIM's T_world_utm.txt for the map being used
-    localization/utm_transform_path: "/home/tanishaa/Downloads/T_world_utm.txt"
+    # UTM output: path to GLIM's T_world_utm.txt for the map being used.
+    # Leave empty to disable UTM-frame publishing.
+    localization/utm_transform_path: ""
     localization/utm_frame: "utm"
 
     # Frame IDs
     localization/map_frame: "map"
-    localization/base_frame: "imu_bottom"
-    localization/imu_frame: "imu_bottom"  # Must match a URDF link (IMU is mounted at GPS bottom)
+    localization/base_frame: "novatel_a"
+    localization/imu_frame: "novatel_a"  # Must match a URDF link (IMU is mounted at GPS bottom)
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
     # Map downsampling for GICP (smaller = more accurate but slower)
@@ -37,12 +38,21 @@
 
     # Logging verbosity. true = current behavior (INFO + raw stderr debug prints).
     # false = silence INFO/DEBUG; WARN/ERROR still pass through.
-    localization/verbose: false
+    localization/verbose: true
 
     # Use odometry for pose initialization
     # If true, waits for first odometry message to initialize
     # If false, waits for initial pose from RViz or topic
     localization/use_odom_init: false
+
+    # Ground-truth odom cross-check. When enabled, the node subscribes to the
+    # `gt_odom` remap (default /localization/global/odom in launch) and reports
+    # gt_err=[trans,rot,dt] in every SCAN DEBUG line + publishes the deltas on
+    # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg. Diagnostic only —
+    # never feeds back into accept/reject decisions.
+    localization/gt_odom/enable: true
+    localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
+    localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -52,12 +62,12 @@
     # you already computed T_world_baselink yourself.
     localization/initial_pose/use: true
     localization/initial_pose/frame: "lidar"   # "lidar" (GLIM traj_lidar.txt) or "base_link"
-    localization/initial_pose/x: 10.614864     # meters
-    localization/initial_pose/y: 0.349238      # meters
-    localization/initial_pose/z: 0.355232      # meters
-    localization/initial_pose/roll: -0.002346  # radians (-0.134 deg)
-    localization/initial_pose/pitch: -0.035031 # radians (-2.007 deg)
-    localization/initial_pose/yaw: -0.005040   # radians (-0.289 deg)
+    localization/initial_pose/x: 12.602963     # meters
+    localization/initial_pose/y: -9.739742      # meters
+    localization/initial_pose/z: -33.576455      # meters
+    localization/initial_pose/roll: -0.021723   # radians (-0.134 deg)
+    localization/initial_pose/pitch: 0.024880 # radians (-2.007 deg)
+    localization/initial_pose/yaw: 2.711203   # radians (-0.289 deg)
 
     # Preprocessing Parameters (override defaults for localization)
     # Crop box filter: keeps points within ±size meters of sensor origin (sensor frame).
@@ -69,7 +79,7 @@
 
     # Flip Y axis of incoming point cloud (e.g. SAE Y-right -> ROS Y-left without touching Z).
     # When lidar_concat is enabled this runs AFTER merge, so it flips the merged primary+aux cloud.
-    localization/flip_y: true
+    localization/flip_y: false
 
     # Multi-LiDAR concatenation (mirrors GLIM's lidar_concat). When enabled, the node
     # subscribes to each aux topic, buffers the latest scans, and on every primary
@@ -132,8 +142,23 @@
     # Keep this at 1.0, not tighter: during the first ~4 scans the initial pose is still
     # settling, so fitness spikes to 1.2–1.4 on correct geometry; a 0.3 threshold rejects
     # those and the node gets stuck at initial pose with no GICP updates to recover from.
-    gicp/fitnessRejectThreshold: 25.0   # Reject GICP if fitness score exceeds this value
+    gicp/fitnessRejectThreshold: 1.0   # Reject GICP if fitness score exceeds this value
     gicp/rejectLargeJumps: true        # Hard-reject results that exceed the jump thresholds below
+    # Combined geometric-degeneracy gate. The hessian condition proxy alone
+    # over-rejects: feature-poor corners legitimately spike condition number while
+    # GICP still finds a clean low-fitness solution anchored by the IMU prior. So
+    # we only reject when BOTH signals fire: high condition number AND elevated
+    # fitness — the signature of the optimizer landing in a wrong local minimum
+    # that the unconstrained axis let it slide into.
+    #
+    # Data-driven thresholds (Putnam May 4 run, full run with IMU+lidar_concat):
+    #   healthy at corners: hessian 1–4e9, fitness 0.03–0.06, gt_err ≈ 0.7m
+    #   bad accepts:        hessian 6–13e9, fitness 0.15–0.35, gt_err 10–23m
+    # 5e9 / 0.15 sits cleanly between the two populations.
+    # Set hessianCondMax <= 0 to disable; set hessianFitnessWarnThreshold <= 0 to
+    # restore the old "hessian alone" behavior.
+    gicp/hessianCondMax: 5.0e9
+    gicp/hessianFitnessWarnThreshold: 0.15
   
 
   
