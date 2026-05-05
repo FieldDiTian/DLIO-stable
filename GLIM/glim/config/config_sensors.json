@@ -25,9 +25,9 @@
       1
     ],
     "T_lidar_imu": [
-      -0.32400000000000007,
-      0.022,
-      0.0020000000000000018,
+      -0.5860000000000001,
+      -0.08,
+      -0.347,
       0.0,
       0.0,
       0.0,
@@ -43,9 +43,9 @@
       -0.03279627881588615
     ],
     "distortion_model": "plumb_bob",
-    "flip_points_y": true,
+    "flip_points_y": false,
     "global_shutter_camera": true,
-    "global_shutter_lidar": false,
+    "global_shutter_lidar": true,
     "image_size": [
       752,
       480
@@ -64,7 +64,7 @@
     "perpoint_relative_time": false,
     "perpoint_time_scale": 1.0,
     "ring_field": "line_index",
-    "urdf_imu_frame": "pointonenav",
+    "urdf_imu_frame": "novatel_a",
     "urdf_lidar_frame": "luminar_front",
     "urdf_path": "av24.urdf"
   }

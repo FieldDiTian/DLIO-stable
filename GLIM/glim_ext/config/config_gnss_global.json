@@ -1,12 +1,26 @@
 {
   "gnss": {
-    "gnss_topic": "/vks/global_odom",
+    "gnss_topic": "/gps_na/odom",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
+    "enable_orientation_prior": false,
+    // Diagnostic: very loose 2D translation anchor only, no orientation constraint.
+    // sigma = 1/sqrt(precision) -> 1m sigma on x,y; z effectively unconstrained.
     "prior_inf_scale": [
-      10,
-      10,
-      10
-    ]
+      1e6,
+      1e6,
+      1e-6
+    ],
+    "orientation_prior_inf_scale": [
+      1e-6,
+      1e-6,
+      1e2
+    ],
+    // Name of the GNSS antenna link in the URDF. The IMU->antenna transform is read at startup
+    // from urdf_path/urdf_imu_frame in config_sensors.json, and only the translation (lever arm)
+    // is used to correct the reported antenna position to the IMU origin in UTM.
+    // Requires the GNSS message to publish orientation; otherwise compensation is skipped.
+    // Leave empty to disable lever-arm compensation. Examples: "gps_antenna_top", "gps_antenna_front".
+    "urdf_gnss_frame": "gps_antenna_right"
   }
 }

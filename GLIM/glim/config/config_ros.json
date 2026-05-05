@@ -66,11 +66,11 @@
       "libmemory_monitor.so",
       "libstandard_viewer.so",
       "librviz_viewer.so",
-      "libgnss_global.so",
       "libimu_validator.so"
+      // "libgnss_global.so"
     ],
     // Topics
-    "imu_topic": "/atlas/imu_calibrated",
+    "imu_topic": "/gps_na/imu",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
     // External INS / GNSS-aided odometry. Leave blank to disable.
