@@ -510,6 +510,7 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->dbg_converged_pub = this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/converged", 10);
   this->dbg_gt_pos_err_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
   this->dbg_gt_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
+  this->gt_snap_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/gt_snap", 10);
 
   if (this->visualize_map_) {
     this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map", 1);
@@ -2509,6 +2510,20 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
               v_base_world.x(), v_base_world.y(), v_base_world.z(),
               omega_base_body.x(), omega_base_body.y(), omega_base_body.z(),
               this->gt_body_frame_.c_str());
+
+  {
+    geometry_msgs::msg::PoseStamped snap_msg;
+    snap_msg.header.stamp = this->scan_stamp;
+    snap_msg.header.frame_id = this->map_frame;
+    snap_msg.pose.position.x = p_new.x();
+    snap_msg.pose.position.y = p_new.y();
+    snap_msg.pose.position.z = p_new.z();
+    snap_msg.pose.orientation.w = q_new.w();
+    snap_msg.pose.orientation.x = q_new.x();
+    snap_msg.pose.orientation.y = q_new.y();
+    snap_msg.pose.orientation.z = q_new.z();
+    this->gt_snap_pub->publish(snap_msg);
+  }
 
   this->consecutive_failures_ = 0;
   return true;

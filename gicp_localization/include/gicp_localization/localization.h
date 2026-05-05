@@ -194,6 +194,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dbg_converged_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_pos_err_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gt_rot_deg_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr gt_snap_pub;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
