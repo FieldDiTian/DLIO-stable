@@ -1,0 +1,35 @@
+{
+  /*** INS-driven odometry with optional light LiDAR refinement ***
+  // Pose state is sourced from an external nav_msgs/msg/Odometry topic (e.g. /localization/global/odom).
+  // Each LiDAR frame is deskewed using INS-interpolated poses across the scan window.
+  // If enable_lidar_refinement is true, a single-step GICP solve refines the pose against a rolling
+  // iVox target — but only if the refinement delta stays within max_refinement_(translation|rotation).
+  // Otherwise the raw INS pose is kept (this is the failure-mode behavior for sparse-feature regions).
+  //
+  // Note: this estimator emits frames in the world frame defined by the INS topic header.frame_id
+  // (typically UTM/ENU), so resulting maps will be geo-referenced.
+  */
+  "odometry_estimation": {
+    "so_name": "libodometry_estimation_ins.so",
+    // INS frame mapping (URDF). If urdf_ins_frame is blank here, falls back to sensors.urdf_ins_frame in config_sensors.json.
+    "urdf_ins_frame": "novatel_a",
+    // Refinement
+    "enable_lidar_refinement": false,
+    "max_refinement_translation": 0.30,
+    "max_refinement_rotation": 0.05,
+    "refinement_max_iterations": 5,
+    "ins_prior_sigma_trans": 0.05,
+    "ins_prior_sigma_rot": 0.0087,
+    "target_downsampling_rate": 0.1,
+    // Target voxelmap (iVox)
+    "ivox_resolution": 0.5,
+    "ivox_min_dist": 0.1,
+    "ivox_lru_thresh": 200,
+    // INS / sync
+    "max_ins_wait_seconds": 0.05,
+    "ins_buffer_seconds": 2.0,
+    // Misc
+    "save_imu_rate_trajectory": true,
+    "num_threads": 2
+  }
+}

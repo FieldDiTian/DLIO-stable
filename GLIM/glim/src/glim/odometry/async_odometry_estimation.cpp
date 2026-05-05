@@ -9,6 +9,7 @@ AsyncOdometryEstimation::AsyncOdometryEstimation(const std::shared_ptr<OdometryE
 : odometry_estimation(odometry_estimation),
   logger(create_module_logger("odom")) {
   this->enable_imu = enable_imu;
+  this->enable_external_pose = odometry_estimation->requires_external_pose();
   kill_switch = false;
   end_of_sequence = false;
   internal_frame_queue_size = 0;
@@ -36,6 +37,10 @@ void AsyncOdometryEstimation::insert_frame(const PreprocessedFrame::Ptr& frame) 
   input_frame_queue.push_back(frame);
 }
 
+void AsyncOdometryEstimation::insert_external_pose(const double stamp, const Eigen::Isometry3d& T_world_ins) {
+  input_external_pose_queue.push_back(std::make_pair(stamp, T_world_ins));
+}
+
 void AsyncOdometryEstimation::join() {
   end_of_sequence = true;
   if (thread.joinable()) {
@@ -54,6 +59,7 @@ void AsyncOdometryEstimation::get_results(std::vector<EstimationFrame::ConstPtr>
 
 void AsyncOdometryEstimation::run() {
   double last_imu_time = enable_imu ? 0.0 : std::numeric_limits<double>::max();
+  double last_external_pose_time = enable_external_pose ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::max();
 #ifdef GLIM_USE_OPENCV
   std::deque<std::pair<double, cv::Mat>> images;
 #endif
@@ -61,6 +67,7 @@ void AsyncOdometryEstimation::run() {
 
   while (!kill_switch) {
     auto imu_frames = input_imu_queue.get_all_and_clear();
+    auto external_poses = input_external_pose_queue.get_all_and_clear();
     auto new_raw_frames = input_frame_queue.get_all_and_clear();
     raw_frames.insert(raw_frames.end(), new_raw_frames.begin(), new_raw_frames.end());
     internal_frame_queue_size = raw_frames.size();
@@ -74,13 +81,20 @@ void AsyncOdometryEstimation::run() {
 #ifdef GLIM_USE_OPENCV
       images.empty() &&
 #endif
-      imu_frames.empty() && raw_frames.empty()) {
+      imu_frames.empty() && external_poses.empty() && raw_frames.empty()) {
       if (end_of_sequence) {
         break;
       }
 
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
+    }
+
+    for (const auto& ext : external_poses) {
+      odometry_estimation->insert_external_pose(ext.first, ext.second);
+      if (ext.first > last_external_pose_time) {
+        last_external_pose_time = ext.first;
+      }
     }
 
     for (const auto& imu : imu_frames) {
@@ -118,6 +132,25 @@ void AsyncOdometryEstimation::run() {
 
         if (raw_frames.size() > 10) {
           logger->warn("waiting for IMU data (scan_end_time={:.6f}, last_imu_time={:.6f} |frames|={})", raw_frames.front()->scan_end_time, last_imu_time, raw_frames.size());
+        }
+
+        break;
+      }
+
+      if (!end_of_sequence && raw_frames.front()->scan_end_time > last_external_pose_time) {
+        logger->debug(
+          "waiting for external pose data (scan_end_time={:.6f}, last_external_pose_time={:.6f} |frames|={})",
+          raw_frames.front()->scan_end_time,
+          last_external_pose_time,
+          raw_frames.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        if (raw_frames.size() > 10) {
+          logger->warn(
+            "waiting for external pose data (scan_end_time={:.6f}, last_external_pose_time={:.6f} |frames|={})",
+            raw_frames.front()->scan_end_time,
+            last_external_pose_time,
+            raw_frames.size());
         }
 
         break;

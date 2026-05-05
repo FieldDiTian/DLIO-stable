@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
 #include <rosbag2_compression/sequential_compression_reader.hpp>
@@ -110,7 +111,11 @@ int main(int argc, char** argv) {
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "/imu");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
+  const std::string external_odom_topic = config_ros.param<std::string>("glim_ros", "external_odom_topic", "");
   std::vector<std::string> topics = {imu_topic, points_topic, image_topic};
+  if (!external_odom_topic.empty()) {
+    topics.push_back(external_odom_topic);
+  }
 
   // Load multi-LiDAR concatenation config
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
@@ -248,6 +253,7 @@ int main(int argc, char** argv) {
 
     rclcpp::Serialization<sensor_msgs::msg::Imu> imu_serialization;
     rclcpp::Serialization<sensor_msgs::msg::PointCloud2> points_serialization;
+    rclcpp::Serialization<nav_msgs::msg::Odometry> odometry_serialization;
 #ifdef BUILD_WITH_CV_BRIDGE
     rclcpp::Serialization<sensor_msgs::msg::Image> image_serialization;
     rclcpp::Serialization<sensor_msgs::msg::CompressedImage> compressed_image_serialization;
@@ -310,10 +316,13 @@ int main(int argc, char** argv) {
       }
 
       const auto bag_elapsed = std::chrono::nanoseconds(msg_time - bag_t0);
-      while (playback_speed > 0.0 && (std::chrono::system_clock::now() - real_t0) * playback_speed < bag_elapsed) {
+      while (rclcpp::ok() && playback_speed > 0.0 && (std::chrono::system_clock::now() - real_t0) * playback_speed < bag_elapsed) {
         const double real_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - real_t0).count() / 1e9;
         spdlog::debug("throttling (real_elapsed={} bag_elapsed={} playback_speed={})", real_elapsed, bag_elapsed.count() / 1e9, playback_speed);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (!rclcpp::ok()) {
+        return false;
       }
 
       // Check if this message is for an auxiliary LiDAR sensor
@@ -373,6 +382,14 @@ int main(int argc, char** argv) {
           spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
           std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
         }
+      } else if (!external_odom_topic.empty() && msg->topic_name == external_odom_topic) {
+        if (topic_type != "nav_msgs/msg/Odometry") {
+          spdlog::error("topic_type mismatch: {} != nav_msgs/msg/Odometry (topic={})", topic_type, msg->topic_name);
+          return false;
+        }
+        auto odom_msg = std::make_shared<nav_msgs::msg::Odometry>();
+        odometry_serialization.deserialize_message(&serialized_msg, odom_msg.get());
+        glim->external_odom_callback(odom_msg);
       }
 #ifdef BUILD_WITH_CV_BRIDGE
       else if (msg->topic_name == image_topic) {
@@ -405,7 +422,7 @@ int main(int argc, char** argv) {
       speed_counter.update(msg_time / 1e9);
 
       const auto t0 = std::chrono::high_resolution_clock::now();
-      while (glim->needs_wait()) {
+      while (rclcpp::ok() && glim->needs_wait()) {
         rclcpp::spin_some(glim);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         spdlog::debug("throttling (waiting for odometry estimation)");
@@ -413,6 +430,9 @@ int main(int argc, char** argv) {
           spdlog::warn("throttling timeout (an extension module may be hanged)");
           break;
         }
+      }
+      if (!rclcpp::ok()) {
+        return false;
       }
     }
 

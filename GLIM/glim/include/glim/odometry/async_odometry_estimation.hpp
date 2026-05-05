@@ -55,6 +55,13 @@ public:
   void insert_frame(const PreprocessedFrame::Ptr& frame);
 
   /**
+   * @brief Insert an external pose (forwarded to the wrapped odometry estimator)
+   * @param stamp        Timestamp
+   * @param T_world_ins  Pose of the INS body frame in the world frame
+   */
+  void insert_external_pose(const double stamp, const Eigen::Isometry3d& T_world_ins);
+
+  /**
    * @brief Wait for the odometry estimation thread
    */
   void join();
@@ -85,12 +92,14 @@ private:
 #endif
   ConcurrentVector<Eigen::Matrix<double, 7, 1>> input_imu_queue;
   ConcurrentVector<PreprocessedFrame::Ptr> input_frame_queue;
+  ConcurrentVector<std::pair<double, Eigen::Isometry3d>> input_external_pose_queue;
 
   // Output queues
   ConcurrentVector<EstimationFrame::ConstPtr> output_estimation_results;
   ConcurrentVector<EstimationFrame::ConstPtr> output_marginalized_frames;
 
   bool enable_imu;
+  bool enable_external_pose;
   std::atomic_int internal_frame_queue_size;
   std::shared_ptr<OdometryEstimationBase> odometry_estimation;
 

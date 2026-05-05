@@ -19,6 +19,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 
 #include <gtsam_points/optimizers/linearization_hook.hpp>
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
@@ -36,7 +37,7 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
-#include <glim_ros/urdf_transforms.hpp>
+#include <glim/util/urdf_transforms.hpp>
 
 namespace glim {
 
@@ -215,6 +216,15 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
 #endif
 
+  const std::string external_odom_topic = config_ros.param<std::string>("glim_ros", "external_odom_topic", "");
+  if (!external_odom_topic.empty()) {
+    rclcpp::QoS default_external_odom_qos(100);
+    auto external_odom_qos = get_qos_settings(config_ros, "glim_ros", "external_odom_qos", default_external_odom_qos);
+    external_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
+      external_odom_topic, external_odom_qos, std::bind(&GlimROS::external_odom_callback, this, _1));
+    spdlog::info("subscribed to external odometry topic: {}", external_odom_topic);
+  }
+
   for (const auto& sub : this->extension_subscriptions()) {
     spdlog::debug("subscribe to {}", sub->topic);
     sub->create_subscriber(*this);
@@ -339,6 +349,21 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   spdlog::debug("workload={}", workload);
 
   return workload;
+}
+
+void GlimROS::external_odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+  if (!GlobalConfig::instance()->has_param("meta", "ins_frame_id") && !msg->child_frame_id.empty()) {
+    spdlog::debug("auto-detecting INS frame ID: {}", msg->child_frame_id);
+    GlobalConfig::instance()->override_param<std::string>("meta", "ins_frame_id", msg->child_frame_id);
+  }
+
+  const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+  Eigen::Isometry3d T_world_ins = Eigen::Isometry3d::Identity();
+  T_world_ins.translation() << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
+  const Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+  T_world_ins.linear() = q.normalized().toRotationMatrix();
+
+  odometry_estimation->insert_external_pose(stamp, T_world_ins);
 }
 
 bool GlimROS::needs_wait() {

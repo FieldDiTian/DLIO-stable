@@ -28,6 +28,7 @@ find_package(GTSAM 4.2 REQUIRED)
 find_package(gtsam_points 1.2.0 REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(spdlog REQUIRED)
+find_package(LibXml2 REQUIRED)
 
 if(BUILD_WITH_VIEWER)
   find_package(Iridescence REQUIRED)
@@ -84,6 +85,7 @@ add_library(glim SHARED
   src/glim/odometry/odometry_estimation_imu.cpp
   src/glim/odometry/odometry_estimation_ct.cpp
   src/glim/odometry/odometry_estimation_cpu.cpp
+  src/glim/odometry/odometry_estimation_ins.cpp
   # mapping
   src/glim/mapping/callbacks.cpp
   src/glim/mapping/sub_map.cpp
@@ -103,6 +105,7 @@ target_include_directories(glim PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/json/include>
   $<INSTALL_INTERFACE:include/glim>
   ${OpenCV_INCLUDE_DIRS}
+  ${LIBXML2_INCLUDE_DIR}
 )
 target_link_libraries(glim
   Boost::boost
@@ -112,6 +115,7 @@ target_link_libraries(glim
   gtsam_points::gtsam_points
   OpenMP::OpenMP_CXX
   spdlog::spdlog
+  ${LIBXML2_LIBRARIES}
   $<TARGET_NAME_IF_EXISTS:Iridescence::Iridescence>
   ${OpenCV_LIBRARIES}
 )
@@ -124,6 +128,7 @@ list(APPEND glim_LIBRARIES glim)
 list(APPEND module_srcs
   src/glim/odometry/odometry_estimation_ct_create.cpp
   src/glim/odometry/odometry_estimation_cpu_create.cpp
+  src/glim/odometry/odometry_estimation_ins_create.cpp
   src/glim/mapping/sub_mapping_create.cpp
   src/glim/mapping/sub_mapping_passthrough_create.cpp
   src/glim/mapping/global_mapping_create.cpp

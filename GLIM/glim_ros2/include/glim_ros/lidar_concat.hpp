@@ -19,7 +19,7 @@
 #include <sensor_msgs/msg/point_field.hpp>
 
 #include <glim/util/config.hpp>
-#include <glim_ros/urdf_transforms.hpp>
+#include <glim/util/urdf_transforms.hpp>
 
 namespace glim_ros {
 

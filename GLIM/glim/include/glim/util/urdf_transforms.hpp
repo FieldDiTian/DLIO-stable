@@ -31,7 +31,6 @@ inline std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>
       continue;
     }
 
-    // Get joint type
     xmlChar* type_attr = xmlGetProp(joint, BAD_CAST "type");
     std::string joint_type = type_attr ? reinterpret_cast<const char*>(type_attr) : "";
     xmlFree(type_attr);
@@ -89,7 +88,6 @@ inline Eigen::Isometry3d compute_transform(
   const std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>>& transforms,
   const std::string& from_frame,
   const std::string& to_frame) {
-  // Build chain from a frame to the root
   auto chain_to_root = [&](const std::string& frame) {
     std::vector<std::pair<std::string, Eigen::Isometry3d>> chain;
     std::string current = frame;
@@ -98,14 +96,13 @@ inline Eigen::Isometry3d compute_transform(
       chain.push_back({current, T_parent_child});
       current = parent;
     }
-    chain.push_back({current, Eigen::Isometry3d::Identity()});  // root
+    chain.push_back({current, Eigen::Isometry3d::Identity()});
     return chain;
   };
 
   auto from_chain = chain_to_root(from_frame);
   auto to_chain = chain_to_root(to_frame);
 
-  // Find common ancestor
   std::unordered_map<std::string, size_t> from_set;
   for (size_t i = 0; i < from_chain.size(); i++) {
     from_set[from_chain[i].first] = i;
@@ -127,8 +124,6 @@ inline Eigen::Isometry3d compute_transform(
 
   size_t from_idx = from_set[ancestor];
 
-  // T_root_from = T_root_p1 * T_p1_p2 * ... * T_pN_from
-  // We compute T_ancestor_from and T_ancestor_to, then T_from_to = T_ancestor_from^-1 * T_ancestor_to
   Eigen::Isometry3d T_ancestor_from = Eigen::Isometry3d::Identity();
   for (size_t i = from_idx; i > 0; i--) {
     T_ancestor_from = T_ancestor_from * from_chain[i - 1].second;

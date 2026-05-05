@@ -7,6 +7,7 @@
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #ifdef BUILD_WITH_CV_BRIDGE
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -35,6 +36,7 @@ public:
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg);
 #endif
   size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void external_odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
@@ -66,6 +68,7 @@ private:
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr external_odom_sub;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
 #endif

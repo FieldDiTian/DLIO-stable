@@ -73,6 +73,13 @@
     "imu_topic": "/atlas/imu_calibrated",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
+    // External INS / GNSS-aided odometry. Leave blank to disable.
+    // Consumed by the INS odometry estimator (libodometry_estimation_ins.so) when enabled.
+    "external_odom_topic": "/localization/global/odom",
+    "external_odom_qos": {
+      "profile": "default",
+      "depth": 100
+    },
     // QoS options
     "imu_qos": {
       "profile": "sensor_data",

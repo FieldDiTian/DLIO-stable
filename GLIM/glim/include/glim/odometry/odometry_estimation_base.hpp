@@ -29,6 +29,13 @@ public:
    */
   virtual bool requires_imu() const { return true; }
 
+  /**
+   * @brief Returns true if the odometry estimation module requires external pose data
+   *        (e.g. from an INS / GNSS-aided IMU). When true, AsyncOdometryEstimation gates
+   *        frames on the latest external pose timestamp, just like it does for IMU.
+   */
+  virtual bool requires_external_pose() const { return false; }
+
 #ifdef GLIM_USE_OPENCV
   /**
    * @brief Insert an image
@@ -45,6 +52,13 @@ public:
    * @param angular_vel  Angular velocity
    */
   virtual void insert_imu(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel);
+
+  /**
+   * @brief Insert an external pose (e.g. from an INS / GNSS-aided IMU). Default no-op.
+   * @param stamp         Timestamp
+   * @param T_world_ins   Pose of the INS body frame in the world frame
+   */
+  virtual void insert_external_pose(const double stamp, const Eigen::Isometry3d& T_world_ins) {}
 
   /**
    * @brief Insert a point cloud
