@@ -322,6 +322,9 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   this->geo.first_opt_done = false;
   this->geo.update_seq = 0;
+  this->consecutive_failures_ = 0;
+  this->gt_extrinsics_cached_ = false;
+  this->T_base_gtbody_.setIdentity();
   this->geo.dp = 0.0;
   this->geo.dq_deg = 0.0;
   this->geo.prev_p = Eigen::Vector3f::Zero();
@@ -625,6 +628,22 @@ void gicp_localization::LocalizationNode::getParams() {
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
 
+  // GT-driven pose recovery (optional). Independent of gt_odom/enable; recovery
+  // requires the same subscriber to be active, so it implies gt_odom/enable.
+  this->declare_parameter<bool>("localization/gt_recovery/enable", false);
+  this->declare_parameter<int>("localization/gt_recovery/min_consecutive_failures", 3);
+  this->get_parameter("localization/gt_recovery/enable", this->gt_recovery_enabled_);
+  this->get_parameter("localization/gt_recovery/min_consecutive_failures",
+                      this->gt_recovery_min_consecutive_failures_);
+  if (this->gt_recovery_enabled_ && !this->gt_odom_enabled_) {
+    RCLCPP_WARN(this->get_logger(),
+                "localization/gt_recovery/enable=true but gt_odom/enable=false — forcing gt_odom on so the buffer fills.");
+    this->gt_odom_enabled_ = true;
+  }
+  if (this->gt_recovery_min_consecutive_failures_ < 1) {
+    this->gt_recovery_min_consecutive_failures_ = 1;
+  }
+
   this->get_parameter("localization/publish_tf", this->publish_tf_);
   this->get_parameter("localization/imu_only", this->imu_only_mode_);
   this->get_parameter("localization/use_odom_init", this->use_odom_init_);
@@ -812,6 +831,10 @@ void gicp_localization::LocalizationNode::getParams() {
               this->gicp_hessian_cond_max_,
               this->gicp_hessian_fitness_warn_,
               this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
+  RCLCPP_INFO(this->get_logger(),
+              "GT recovery: %s (min consecutive failures=%d)",
+              this->gt_recovery_enabled_ ? "ENABLED" : "DISABLED",
+              this->gt_recovery_min_consecutive_failures_);
   RCLCPP_INFO(this->get_logger(), "Debug: publish=%s jump_log=%s thresholds=[%.2fm, %.1fdeg]",
               this->debug_pub_enabled_ ? "ENABLED" : "DISABLED",
               this->debug_jump_log_enabled_ ? "ENABLED" : "DISABLED",
@@ -2127,6 +2150,10 @@ void gicp_localization::LocalizationNode::performLocalization() {
       this->last_gicp_valid_ = true;
     }
 
+    // Reset consecutive-failure counter on any accepted scan so the GT-recovery
+    // trigger only fires on sustained losing streaks.
+    this->consecutive_failures_ = 0;
+
     // Log pose and correction
     Eigen::Vector3f t_corr = optimizer_solution.block<3, 1>(0, 3);
     RCLCPP_INFO(this->get_logger(),
@@ -2141,6 +2168,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     // falls back to the IMU-integrated prior. Freezing at last_gicp_pose_ causes cascade
     // divergence at feature-poor corners: each subsequent scan's guess drifts further from
     // reality, fitness gets worse, and the optimizer never recovers.
+    ++this->consecutive_failures_;
     const char* reason = !candidate_pose_valid ? "invalid solution"
                        : !effectively_converged ? "failed to converge"
                        : gicp_rejected_fitness ? "fitness rejected"
@@ -2165,6 +2193,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
                   "Localization: ⚠ GICP %s — holding last accepted pose (no valid T_prior) | fitness=%.4f time=%.2fms",
                   reason, fitness_score, elapsed_ms);
     }
+
+    // GT-driven pose recovery: if enabled and the failure streak has hit the
+    // configured threshold, snap state.{pose,velocity} to the time-matched GT
+    // sample (transformed into base_frame). The snap overrides the dead-reckoned
+    // pose and resets the counter; logs its own warn line.
+    this->maybeSnapPoseToGT(reason);
   }
 }
 
@@ -2251,6 +2285,57 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   s.q = Eigen::Quaternionf(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                            msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
   s.q.normalize();
+  s.v_lin_body = Eigen::Vector3f(msg->twist.twist.linear.x,
+                                 msg->twist.twist.linear.y,
+                                 msg->twist.twist.linear.z);
+  s.v_ang_body = Eigen::Vector3f(msg->twist.twist.angular.x,
+                                 msg->twist.twist.angular.y,
+                                 msg->twist.twist.angular.z);
+
+  // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
+  // extrinsic caching pattern in callbackImu). Required before the snap helper
+  // can compose poses; callback keeps appending samples even while TF is missing.
+  if (!this->gt_extrinsics_cached_) {
+    if (this->gt_body_frame_.empty()) {
+      this->gt_body_frame_ = msg->child_frame_id;
+      if (this->gt_body_frame_.empty()) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "GT odom message has empty child_frame_id; assuming GT body == base_frame ('%s')",
+                             this->base_frame.c_str());
+        this->gt_body_frame_ = this->base_frame;
+      }
+    }
+    if (this->gt_body_frame_ == this->base_frame) {
+      this->T_base_gtbody_.setIdentity();
+      this->gt_extrinsics_cached_ = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "GT recovery: gt_body == base_frame ('%s'), using identity extrinsic",
+                  this->base_frame.c_str());
+    } else {
+      try {
+        auto tf_bg = this->tf_buffer->lookupTransform(
+            this->base_frame, this->gt_body_frame_, tf2::TimePointZero);
+        Eigen::Quaternionf q_bg(
+            tf_bg.transform.rotation.w, tf_bg.transform.rotation.x,
+            tf_bg.transform.rotation.y, tf_bg.transform.rotation.z);
+        Eigen::Vector3f t_bg(
+            tf_bg.transform.translation.x, tf_bg.transform.translation.y,
+            tf_bg.transform.translation.z);
+        this->T_base_gtbody_.setIdentity();
+        this->T_base_gtbody_.block<3, 3>(0, 0) = q_bg.toRotationMatrix();
+        this->T_base_gtbody_.block<3, 1>(0, 3) = t_bg;
+        this->gt_extrinsics_cached_ = true;
+        RCLCPP_INFO(this->get_logger(),
+                    "GT recovery: cached %s ← %s extrinsic: t=[%.3f,%.3f,%.3f]",
+                    this->base_frame.c_str(), this->gt_body_frame_.c_str(),
+                    t_bg.x(), t_bg.y(), t_bg.z());
+      } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "GT recovery: cannot cache %s ← %s TF: %s — deferring snap",
+                             this->base_frame.c_str(), this->gt_body_frame_.c_str(), ex.what());
+      }
+    }
+  }
 
   std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
   if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
@@ -2263,8 +2348,9 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   }
   if (!this->gt_odom_received_.exchange(true)) {
     RCLCPP_INFO(this->get_logger(),
-                "First ground-truth odom received at stamp=%.3f frame=%s",
-                s.stamp, msg->header.frame_id.c_str());
+                "First ground-truth odom received at stamp=%.3f frame=%s child_frame=%s",
+                s.stamp, msg->header.frame_id.c_str(),
+                msg->child_frame_id.empty() ? "(empty)" : msg->child_frame_id.c_str());
   }
 }
 
@@ -2302,6 +2388,129 @@ bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& ou
   out.stamp = stamp;
   out.p = (1.0f - u) * a->p + u * b->p;
   out.q = a->q.slerp(u, b->q).normalized();
+  out.v_lin_body = (1.0f - u) * a->v_lin_body + u * b->v_lin_body;
+  out.v_ang_body = (1.0f - u) * a->v_ang_body + u * b->v_ang_body;
+  return true;
+}
+
+bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
+  // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
+  RCLCPP_INFO(this->get_logger(),
+              "GT recovery: maybeSnapPoseToGT entered (enabled=%d streak=%d/%d gt_received=%d cached=%d) reason='%s'",
+              this->gt_recovery_enabled_,
+              this->consecutive_failures_, this->gt_recovery_min_consecutive_failures_,
+              this->gt_odom_received_.load(), this->gt_extrinsics_cached_, reason);
+  // Guards. Below-threshold guard is silent (frequent on every rejection until
+  // streak builds up); the others log throttled info so a misconfiguration
+  // doesn't silently disable recovery.
+  if (!this->gt_recovery_enabled_) return false;
+  if (this->consecutive_failures_ < this->gt_recovery_min_consecutive_failures_) return false;
+  if (!this->gt_odom_received_.load()) {
+    RCLCPP_WARN(this->get_logger(),
+                "GT recovery: deferring snap — no GT odom received yet (streak=%d)",
+                this->consecutive_failures_);
+    return false;
+  }
+  if (!this->gt_extrinsics_cached_) {
+    RCLCPP_WARN(this->get_logger(),
+                "GT recovery: deferring snap — base→%s TF not cached yet (streak=%d)",
+                this->gt_body_frame_.c_str(), this->consecutive_failures_);
+    return false;
+  }
+
+  GtSample gt;
+  // Log buffer state before the lookup so we can diagnose silent failures.
+  size_t buf_size = 0;
+  double buf_oldest = 0.0, buf_newest = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
+    buf_size = this->gt_odom_buffer_.size();
+    if (buf_size > 0) {
+      buf_oldest = this->gt_odom_buffer_.front().stamp;
+      buf_newest = this->gt_odom_buffer_.back().stamp;
+    }
+  }
+  bool got = this->getGtPoseAt(this->scan_stamp.seconds(), gt);
+  RCLCPP_INFO(this->get_logger(),
+              "GT recovery: lookup scan_stamp=%.3f got=%d buf=[size=%zu oldest=%.3f newest=%.3f] max_dt=%.3f",
+              this->scan_stamp.seconds(), got, buf_size, buf_oldest, buf_newest, this->gt_odom_max_dt_);
+  if (!got) {
+    RCLCPP_WARN(this->get_logger(),
+                "GT recovery: deferring snap — no GT sample within max_dt=%.3fs of scan stamp %.3f (streak=%d)",
+                this->gt_odom_max_dt_, this->scan_stamp.seconds(), this->consecutive_failures_);
+    return false;
+  }
+
+  // T_map_base = T_map_gtbody * inv(T_base_gtbody).
+  // Decomposed: q_new and p_new express the base_frame pose in map.
+  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
+  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
+  const Eigen::Quaternionf q_gtbody_in_base(R_base_gtbody);
+  const Eigen::Quaternionf q_new = (gt.q * q_gtbody_in_base.conjugate()).normalized();
+  const Eigen::Vector3f p_new = gt.p - q_new * t_base_gtbody;
+
+  // Twist composition: GT twist is at gt_body. Move it to base via the lever-arm
+  // correction (mirrors callbackImu's centripetal-acceleration term).
+  // r_gtbody_to_base in gt_body frame:
+  const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
+  const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
+  Eigen::Vector3f v_base_body;
+  Eigen::Vector3f omega_base_body;
+  const bool twist_is_zero = gt.v_lin_body.norm() < 0.05f && gt.v_ang_body.norm() < 0.01f;
+  if (twist_is_zero) {
+    static bool warned_zero_twist = false;
+    if (!warned_zero_twist) {
+      warned_zero_twist = true;
+      RCLCPP_INFO(this->get_logger(),
+                  "GT recovery: incoming GT twist appears empty (lin=%.3f, ang=%.3f rad/s); "
+                  "snapping with zero velocity",
+                  gt.v_lin_body.norm(), gt.v_ang_body.norm());
+    }
+    v_base_body = Eigen::Vector3f::Zero();
+    omega_base_body = Eigen::Vector3f::Zero();
+  } else {
+    omega_base_body = R_gtbody_base * gt.v_ang_body;
+    v_base_body = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+  }
+  const Eigen::Vector3f v_base_world = q_new * v_base_body;
+  const Eigen::Vector3f omega_base_world = q_new * omega_base_body;
+
+  // Apply state. Caller (performLocalization) already holds pose_mutex (line 1768),
+  // so we MUST NOT re-acquire it here — std::mutex is non-recursive and that would
+  // deadlock the entire scan callback. geo.mtx, however, is taken in narrow scopes
+  // by performLocalization, never held across this call site, so locking it here
+  // is correct.
+  this->current_pose.setIdentity();
+  this->current_pose.block<3, 3>(0, 0) = q_new.toRotationMatrix();
+  this->current_pose.block<3, 1>(0, 3) = p_new;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    this->state.p = p_new;
+    this->state.q = q_new;
+    this->state.v.lin.b = v_base_body;
+    this->state.v.lin.w = v_base_world;
+    this->state.v.ang.b = omega_base_body;
+    this->state.v.ang.w = omega_base_world;
+    // state.b.gyro and state.b.accel intentionally preserved.
+    this->geo.prev_p = p_new;
+    this->geo.prev_q = q_new;
+    this->geo.prev_vel = v_base_world;
+    ++this->geo.update_seq;  // discard any in-flight propagateState computations
+  }
+  this->lidarPose.p = p_new;
+  this->lidarPose.q = q_new;
+  this->prev_vel = v_base_world;
+
+  RCLCPP_WARN(this->get_logger(),
+              "Localization: ⟳ snapped pose to GT (%s after %d consecutive non-accepts) — "
+              "pose=[%.2f,%.2f,%.2f] v=[%.2f,%.2f,%.2f]m/s ω=[%.2f,%.2f,%.2f]rad/s | gt_body=%s",
+              reason, this->consecutive_failures_,
+              p_new.x(), p_new.y(), p_new.z(),
+              v_base_world.x(), v_base_world.y(), v_base_world.z(),
+              omega_base_body.x(), omega_base_body.y(), omega_base_body.z(),
+              this->gt_body_frame_.c_str());
+
+  this->consecutive_failures_ = 0;
   return true;
 }
 

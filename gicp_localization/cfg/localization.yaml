@@ -54,6 +54,16 @@
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
+    # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
+    # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
+    # time-matched GT sample so GICP can re-acquire from a known-good state.
+    # The GT pose+twist is transformed from msg->child_frame_id into base_frame
+    # via TF (cached on first GT message). IMU biases are preserved. Disabled by
+    # default — production deployments without a GT topic keep the existing
+    # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
+    localization/gt_recovery/enable: true
+    localization/gt_recovery/min_consecutive_failures: 3
+
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
     # the real base_link -> luminar_front transform, so the node internally

@@ -52,10 +52,13 @@ public:
   };
 
   // Ground-truth odom sample (public so internal helper signatures can reference it).
+  // p/q are header.frame_id=map; v_lin_body / v_ang_body are in child_frame_id (gt_body).
   struct GtSample {
     double stamp;
     Eigen::Vector3f p;
     Eigen::Quaternionf q;
+    Eigen::Vector3f v_lin_body;
+    Eigen::Vector3f v_ang_body;
   };
 
   LocalizationNode();
@@ -74,6 +77,9 @@ private:
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
   // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
   bool getGtPoseAt(double stamp, GtSample& out);
+  // GT-driven pose recovery. Returns true when the snap fired (guards passed and
+  // a time-matched GT sample with finite extrinsic was applied to the state).
+  bool maybeSnapPoseToGT(const char* reason);
   void applyInitialPose(const Eigen::Vector3f& p, const Eigen::Quaternionf& q,
                         const rclcpp::Time& stamp, const std::string& source);
 
@@ -125,6 +131,16 @@ private:
   std::deque<GtSample> gt_odom_buffer_;
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
+
+  // GT-driven pose recovery (optional). Mirrors the IMU extrinsic caching pattern
+  // in callbackImu: on first GT message we record child_frame_id and look up the
+  // base_frame ← gt_body TF once. Snap composes T_map_base = T_map_gtbody * inv(T_base_gtbody).
+  bool gt_recovery_enabled_;
+  int gt_recovery_min_consecutive_failures_;
+  int consecutive_failures_;          // resets to 0 on accept; increments on any non-accept
+  bool gt_extrinsics_cached_;
+  Eigen::Matrix4f T_base_gtbody_;     // pose of gt_body expressed in base_frame
+  std::string gt_body_frame_;          // captured from msg->child_frame_id
 
   // Multi-LiDAR concatenation
   struct AuxLidar {
