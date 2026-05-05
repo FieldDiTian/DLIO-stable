@@ -124,9 +124,9 @@
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
-    localization/debug/enable_pub: true
-    localization/debug/enable_jump_log: true
-    localization/debug/verbose_scan_log: true
+    localization/debug/enable_pub: false
+    localization/debug/enable_jump_log: false
+    localization/debug/verbose_scan_log: false
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
     localization/debug/jump_trans_m: 30.0      # Log/reject if pose jumps > this (meters); 10Hz @ 30m/s = 3m/scan
     localization/debug/jump_rot_deg: 30.0     # Log/reject if pose jumps > this (degrees)
