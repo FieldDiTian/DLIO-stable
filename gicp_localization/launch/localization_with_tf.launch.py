@@ -9,7 +9,9 @@
 #
 
 import os
+import tempfile
 
+import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
@@ -125,14 +127,34 @@ def generate_launch_description():
         return [node]
 
     rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'localization.rviz'])
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='gicp_localization_rviz',
-        arguments=['-d', rviz_config_path],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('rviz'))
-    )
+
+    def make_rviz_node(context):
+        yaml_path = PathJoinSubstitution(
+            [FindPackageShare('gicp_localization'), 'cfg', 'localization.yaml']
+        ).perform(context)
+        with open(yaml_path, 'r') as f:
+            ros_params = yaml.safe_load(f).get('/**', {}).get('ros__parameters', {})
+        map_frame = ros_params.get('localization/map_frame', 'map')
+        base_frame = ros_params.get('localization/base_frame', 'base_link')
+
+        template_path = rviz_config_path.perform(context)
+        with open(template_path, 'r') as f:
+            rviz_content = f.read()
+        rviz_content = rviz_content.replace('__MAP_FRAME__', map_frame)
+        rviz_content = rviz_content.replace('__BASE_FRAME__', base_frame)
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.rviz', mode='w', delete=False)
+        tmp.write(rviz_content)
+        tmp.close()
+
+        return [Node(
+            package='rviz2',
+            executable='rviz2',
+            name='gicp_localization_rviz',
+            arguments=['-d', tmp.name],
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('rviz')),
+        )]
 
     return LaunchDescription([
         declare_rviz_arg,
@@ -147,5 +169,5 @@ def generate_launch_description():
         declare_map_path_arg,
         OpaqueFunction(function=make_robot_state_publisher),
         OpaqueFunction(function=make_localization_node),
-        rviz_node,
+        OpaqueFunction(function=make_rviz_node),
     ])

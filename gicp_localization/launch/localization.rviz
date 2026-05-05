@@ -200,7 +200,7 @@ Visualization Manager:
       Length: 2
       Name: Current Pose Axes
       Radius: 0.20000000298023224
-      Reference Frame: imu_bottom
+      Reference Frame: __BASE_FRAME__
       Value: true
 
     - Alpha: 1
@@ -297,7 +297,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: map
+    Fixed Frame: __MAP_FRAME__
     Frame Rate: 10
   Name: root
   Tools:
@@ -356,7 +356,7 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 0.5235987901687622
-      Target Frame: imu_bottom
+      Target Frame: __BASE_FRAME__
       Value: ThirdPersonFollower (rviz_default_plugins)
       Yaw: 0.7853981852531433
     Saved: ~
