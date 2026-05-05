@@ -114,6 +114,15 @@ public:
 
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
 
+  // Override PCL's default getFitnessScore to reuse the squared distances cached
+  // by the last update_correspondences() call (inside align()). The default impl
+  // re-transforms the entire source cloud and runs a single-threaded kd-tree pass
+  // over the target — for a 9.7M-point map this costs ~10-30 ms/scan of pure
+  // duplicated work. The cached values are at the pose one LM step before
+  // convergence, so the fitness differs from the final pose by at most O(eps^2),
+  // which is well below typical fitness thresholds.
+  double getFitnessScore(double max_range = std::numeric_limits<double>::max());
+
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Matrix4& guess) override;
 

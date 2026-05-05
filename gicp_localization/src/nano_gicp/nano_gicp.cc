@@ -302,6 +302,27 @@ double NanoGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& tr
 }
 
 template <typename PointSource, typename PointTarget>
+double NanoGICP<PointSource, PointTarget>::getFitnessScore(double max_range) {
+  if (sq_distances_.empty()) {
+    return std::numeric_limits<double>::max();
+  }
+
+  const float max_sq = (max_range >= 1e30)
+                           ? std::numeric_limits<float>::max()
+                           : static_cast<float>(max_range * max_range);
+
+  double sum = 0.0;
+  size_t n = 0;
+  for (size_t i = 0; i < sq_distances_.size(); ++i) {
+    if (sq_distances_[i] > max_sq) continue;
+    sum += sq_distances_[i];
+    ++n;
+  }
+
+  return n > 0 ? sum / static_cast<double>(n) : std::numeric_limits<double>::max();
+}
+
+template <typename PointSource, typename PointTarget>
 double NanoGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d& trans) {
   double sum_errors = 0.0;
 
