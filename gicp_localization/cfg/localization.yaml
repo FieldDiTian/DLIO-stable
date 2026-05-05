@@ -32,7 +32,7 @@
     localization/map_voxel_size_vis: 1.5  # Downsample map for visualization (increase for faster RViz)
 
     # TF publishing
-    localization/publish_tf: true
+    localization/publish_tf: false
     # If true, disable GICP scan matching and propagate pose using IMU/geometric observer only.
     localization/imu_only: false
 
