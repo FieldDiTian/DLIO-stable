@@ -5,7 +5,7 @@
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/art-mini/8d2fac78-a15f-43b1-8d0d-8655d972668b/may_4/run_1/ins_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "/run/media/bryan/ART-D5/putnam/may_4/run_1/ins_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # UTM output: path to GLIM's T_world_utm.txt for the map being used.
     # Leave empty to disable UTM-frame publishing.
@@ -62,7 +62,7 @@
     # default — production deployments without a GT topic keep the existing
     # dead-reckoning behavior. Setting enable=true forces gt_odom/enable=true.
     localization/gt_recovery/enable: true
-    localization/gt_recovery/min_consecutive_failures: 3
+    localization/gt_recovery/min_consecutive_failures: 1
 
     # Initial pose taken directly from GLIM traj_lidar.txt first row.
     # robot_state_publisher (launched alongside this node from the URDF) provides
@@ -169,6 +169,13 @@
     # restore the old "hessian alone" behavior.
     gicp/hessianCondMax: 5.0e9
     gicp/hessianFitnessWarnThreshold: 0.15
-  
+    # Slide signature in degenerate geometry: GICP applies an unusually large
+    # correction to the IMU prior. Healthy GICP scans need <0.5m / <0.5° of
+    # correction because the IMU prior is already good. A 1.27m or 2.83° GICP
+    # correction at hessian 1e10 is the optimizer sliding along an unconstrained
+    # axis even when fitness looks low. Set <=0 to disable that OR branch.
+    gicp/hessianTransWarnM: 1.0
+    gicp/hessianRotWarnDeg: 1.5
+
 
   

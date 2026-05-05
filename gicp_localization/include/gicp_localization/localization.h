@@ -338,6 +338,8 @@ private:
   bool gicp_reject_large_jumps_;
   double gicp_hessian_cond_max_;
   double gicp_hessian_fitness_warn_;
+  double gicp_hessian_trans_warn_m_;
+  double gicp_hessian_rot_warn_deg_;
 
   // Preprocessing parameters
   double crop_size_;

@@ -669,12 +669,18 @@ void gicp_localization::LocalizationNode::getParams() {
   // Straights typically run ~1e4; feature-poor corners spike to 1e8-1e9 and the
   // optimizer slides along the unconstrained axis. Set <=0 to disable the gate.
   this->declare_parameter<double>("gicp/hessianCondMax", 1.0e6);
-  // Hessian rejection only fires when fitness ALSO exceeds this "warn" floor.
-  // Healthy GICP scans on degenerate geometry have low fitness (~0.04) — high
-  // hessian alone doesn't mean the solution is bad; combined with elevated
-  // fitness it does. Set fitness warn <= 0 to make the hessian gate fire on
-  // condition number alone (legacy behavior).
+  // Hessian rejection fires when condition number is high AND any of:
+  //   - fitness exceeds the warn floor below
+  //   - GICP applied a translation correction larger than transWarn
+  //   - GICP applied a rotation correction larger than rotWarn
+  // The latter two catch the optimizer sliding along an unconstrained axis: in
+  // degenerate geometry IMU already provides a good prior, so a healthy GICP
+  // correction is small. A large correction in degenerate geometry is the
+  // slide signature even when fitness looks fine. Set any threshold <= 0 to
+  // disable that specific OR branch.
   this->declare_parameter<double>("gicp/hessianFitnessWarnThreshold", 0.15);
+  this->declare_parameter<double>("gicp/hessianTransWarnM", 1.0);
+  this->declare_parameter<double>("gicp/hessianRotWarnDeg", 1.5);
 
   this->get_parameter("gicp/maxIterations", this->gicp_max_iter_);
   this->get_parameter("gicp/correspondenceRandomness", this->gicp_corr_randomness_);
@@ -685,6 +691,8 @@ void gicp_localization::LocalizationNode::getParams() {
   this->get_parameter("gicp/rejectLargeJumps", this->gicp_reject_large_jumps_);
   this->get_parameter("gicp/hessianCondMax", this->gicp_hessian_cond_max_);
   this->get_parameter("gicp/hessianFitnessWarnThreshold", this->gicp_hessian_fitness_warn_);
+  this->get_parameter("gicp/hessianTransWarnM", this->gicp_hessian_trans_warn_m_);
+  this->get_parameter("gicp/hessianRotWarnDeg", this->gicp_hessian_rot_warn_deg_);
 
   // Preprocessing parameters
   this->declare_parameter<double>("dlio/preprocessing/cropBoxFilter/size", 80.0);
@@ -826,11 +834,13 @@ void gicp_localization::LocalizationNode::getParams() {
   RCLCPP_INFO(this->get_logger(), "Localization mode: %s",
               this->imu_only_mode_ ? "IMU-only (GICP disabled)" : "GICP + IMU");
   RCLCPP_INFO(this->get_logger(),
-              "GICP rejection: fitness>%.3f, large_jump=%s, hessian_cond>%.2e AND fitness>%.3f (%s)",
+              "GICP rejection: fitness>%.3f, large_jump=%s, hessian_cond>%.2e AND (fitness>%.3f OR trans>%.2fm OR rot>%.2fdeg) (%s)",
               this->gicp_fitness_reject_threshold_,
               this->gicp_reject_large_jumps_ ? "on" : "off",
               this->gicp_hessian_cond_max_,
               this->gicp_hessian_fitness_warn_,
+              this->gicp_hessian_trans_warn_m_,
+              this->gicp_hessian_rot_warn_deg_,
               this->gicp_hessian_cond_max_ > 0.0 ? "on" : "disabled");
   RCLCPP_INFO(this->get_logger(),
               "GT recovery: %s (min consecutive failures=%d)",
@@ -2038,14 +2048,23 @@ void gicp_localization::LocalizationNode::performLocalization() {
     } else if (this->gicp_hessian_cond_max_ > 0.0 &&
                std::isfinite(hessian_condition) &&
                hessian_condition > this->gicp_hessian_cond_max_ &&
-               (this->gicp_hessian_fitness_warn_ <= 0.0 ||
-                fitness_score > this->gicp_hessian_fitness_warn_)) {
-      // Combined geometric degeneracy + fitness elevation gate. High Hessian
-      // condition alone is harmless when GICP still found a clean local minimum
-      // (low fitness) — that's just feature-poor geometry, not a bad solution.
-      // Reject only when degenerate geometry AND fitness has crept up — the
-      // signature of the optimizer landing in a wrong local minimum that the
-      // unconstrained axis allowed it to slide into.
+               ((this->gicp_hessian_fitness_warn_ > 0.0 &&
+                 fitness_score > this->gicp_hessian_fitness_warn_) ||
+                (this->gicp_hessian_trans_warn_m_ > 0.0 &&
+                 guess_to_solution_trans > this->gicp_hessian_trans_warn_m_) ||
+                (this->gicp_hessian_rot_warn_deg_ > 0.0 &&
+                 guess_to_solution_rot_deg > this->gicp_hessian_rot_warn_deg_) ||
+                (this->gicp_hessian_fitness_warn_ <= 0.0 &&
+                 this->gicp_hessian_trans_warn_m_ <= 0.0 &&
+                 this->gicp_hessian_rot_warn_deg_ <= 0.0))) {
+      // Combined geometric degeneracy gate. High hessian condition alone is
+      // harmless when the IMU prior was already good and GICP barely moved.
+      // Reject only when geometry is degenerate AND any of these slide signals
+      // fire: elevated fitness (wrong basin), large translation correction,
+      // or large rotation correction. In degenerate geometry the optimizer can
+      // slide along the unconstrained axis; the magnitude of that slide is
+      // exactly the discrepancy between IMU prior and GICP candidate.
+      // (All warns disabled = legacy "hessian alone" behavior.)
       gicp_rejected_hessian = true;
     } else if (this->gicp_reject_large_jumps_ && large_jump) {
       gicp_rejected_jump = true;
@@ -2065,9 +2084,12 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 build_scan_debug_log("rejected_fitness").c_str());
   } else if (gicp_rejected_hessian) {
     RCLCPP_WARN(this->get_logger(),
-                "GICP REJECTED (hessian_cond=%.3e > %.3e AND fitness=%.4f > %.4f — degenerate slide): %s",
+                "GICP REJECTED (hessian_cond=%.3e > %.3e AND [fitness=%.4f|trans=%.3fm|rot=%.3fdeg] crossed [%.4f|%.3fm|%.3fdeg] — degenerate slide): %s",
                 hessian_condition, this->gicp_hessian_cond_max_,
-                fitness_score, this->gicp_hessian_fitness_warn_,
+                fitness_score, guess_to_solution_trans, guess_to_solution_rot_deg,
+                this->gicp_hessian_fitness_warn_,
+                this->gicp_hessian_trans_warn_m_,
+                this->gicp_hessian_rot_warn_deg_,
                 build_scan_debug_log("rejected_hessian").c_str());
   } else if (gicp_rejected_jump) {
     RCLCPP_WARN(this->get_logger(),
