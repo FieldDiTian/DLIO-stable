@@ -7,7 +7,7 @@ ROS2 perception stack for the AV-24 Cybertruck autonomous race car. Combines GPU
 | Package | Purpose |
 |---|---|
 | [`GLIM/`](GLIM/) | LiDAR-inertial SLAM. Builds a 3D map from IMU + multi-LiDAR + GNSS. Fork of [koide3/GLIM](https://github.com/koide3/glim) with multi-LiDAR concatenation, URDF-based extrinsics, per-point timestamp handling, and GNSS-to-map transform export. |
-| [`gicp_localization/`](gicp_localization/) | GICP scan-to-map localization against a PCD map produced by GLIM (or compatible). Pure scan matching, no odometry fusion. |
+| [`gicp_localization/`](gicp_localization/) | GICP scan-to-map localization against a PCD map produced by GLIM (or compatible). IMU + LiDAR pipeline with dead-reckoning fallback, layered rejection gates (fitness / combined-hessian / large-jump), and optional ground-truth-driven recovery for catastrophic corner failures. |
 
 Each package has its own README covering install, configuration, and usage.
 
@@ -16,8 +16,8 @@ Each package has its own README covering install, configuration, and usage.
 The configs target an AV-24 Cybertruck with:
 
 - 3× Luminar Iris LiDAR (`luminar_front` primary; `luminar_left`, `luminar_right` concatenated via URDF transforms)
-- IMU on the chassis (`imu_bottom` frame)
-- RTK GPS publishing `nav_msgs/msg/Odometry` on `/gps_nav/odom`
+- Novatel INS publishing IMU on `/gps_na/imu` and odometry on `/localization/global/odom` (`novatel_a` URDF link is both `base_frame` and `imu_frame` in the localization config)
+- RTK GPS publishing `nav_msgs/msg/Odometry` on `/gps_nav/odom` (used by GLIM for the world-to-UTM transform)
 - Optional camera (used only by extension modules)
 
 Sensor extrinsics are derived from [`av24.urdf`](av24.urdf) at runtime; see `GLIM/glim/config/config_sensors.json` for the URDF frame names that drive the lookup.
@@ -60,10 +60,13 @@ ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=<out_dir>
 ros2 run glim_ros offline_viewer
 
 # Localization against pre-built PCD map
-ros2 launch gicp_localization localization.launch.py
+ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
+    pointcloud_topic:=/luminar_front/points \
+    imu_topic:=/gps_na/imu \
+    gt_odom_topic:=/localization/global/odom
 ```
 
-If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, you are running an apt-installed `ros-humble-glim-*` package instead of this fork — re-source the workspace overlay (`source install/setup.bash` *after* `/opt/ros/humble/setup.bash`).
+If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, you are running an apt-installed `ros-humble-glim-*` package instead of this fork — re-source the workspace overlay (`source install/setup.bash` *after* `/opt/ros/humble/setup.bash`). Same caveat applies to `gicp_localization` if a sibling workspace is also sourced.
 
 ## Repo Layout
 
