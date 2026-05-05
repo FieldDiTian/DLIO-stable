@@ -120,7 +120,6 @@ def generate_launch_description():
                 ('localized_pose', 'gicp/localization/pose'),
                 ('localized_odom', 'gicp/localization/odom'),
                 ('localized_path', 'gicp/localization/path'),
-                ('aligned_cloud', 'gicp/localization/aligned_cloud'),
                 ('map', 'gicp/localization/map'),
             ],
         )

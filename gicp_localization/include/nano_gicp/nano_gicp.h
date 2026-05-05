@@ -134,11 +134,24 @@ protected:
   bool calculate_covariances(const typename pcl::PointCloud<PointT>::ConstPtr& cloud, const nanoflann::KdTreeFLANN<PointT>& kdtree, CovarianceList& covariances, float& density);
 
 public:
-  std::shared_ptr<const nanoflann::KdTreeFLANN<PointSource>> source_kdtree_;
-  std::shared_ptr<const nanoflann::KdTreeFLANN<PointTarget>> target_kdtree_;
+  // Owning, mutable kd-trees. Reusing the same instance across scans keeps
+  // nanoflann's internal node pool warm and avoids a make_shared per scan.
+  // setInputCloud() rebuilds the index in place.
+  std::shared_ptr<nanoflann::KdTreeFLANN<PointSource>> source_kdtree_;
+  std::shared_ptr<nanoflann::KdTreeFLANN<PointTarget>> target_kdtree_;
 
+  // Active covariance pointers — may alias either *_covs_owned_ (when computed
+  // internally) or an externally-supplied list (via setSourceCovariances etc).
   std::shared_ptr<const CovarianceList> source_covs_;
   std::shared_ptr<const CovarianceList> target_covs_;
+
+protected:
+  // Internal mutable caches; reused across scans via resize() instead of a
+  // fresh make_shared each call.
+  std::shared_ptr<CovarianceList> source_covs_owned_;
+  std::shared_ptr<CovarianceList> target_covs_owned_;
+
+public:
 
   float source_density_;
   float target_density_;

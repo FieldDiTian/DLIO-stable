@@ -130,7 +130,9 @@ void LsqRegistration<PointTarget, PointSource>::computeTransformation(PointCloud
   }
 
   final_transformation_ = x0.cast<float>().matrix();
-  pcl::transformPointCloud(*input_, output, final_transformation_);
+  // The aligned-cloud output is unused by gicp_localization (no aligned-cloud
+  // topic); skip the unconditional pcl::transformPointCloud that PCL's default
+  // would do. Pose still available via getFinalTransformation().
 }
 
 template <typename PointTarget, typename PointSource>

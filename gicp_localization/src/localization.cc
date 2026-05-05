@@ -142,23 +142,25 @@ bool findXYZOffsets(const sensor_msgs::msg::PointCloud2& msg, int& x_off, int& y
   return x_off >= 0 && y_off >= 0 && z_off >= 0;
 }
 
-// Apply rigid transform to xyz of every point in a raw byte buffer (in place).
-void transformCloudData(std::vector<uint8_t>& data, uint32_t point_step,
+// Apply rigid transform to xyz of `num_points` points starting at `data` (in place).
+// Pointer-based variant — operates on a span within a larger buffer so callers
+// can write aux scans directly into the merged cloud's data without an
+// intermediate copy.
+void transformCloudData(uint8_t* data, size_t num_points, uint32_t point_step,
                         int x_off, int y_off, int z_off,
                         const Eigen::Matrix4f& T) {
   const Eigen::Matrix3f R = T.block<3, 3>(0, 0);
   const Eigen::Vector3f t = T.block<3, 1>(0, 3);
-  const size_t num_points = data.size() / point_step;
   for (size_t i = 0; i < num_points; ++i) {
-    const size_t base = i * point_step;
+    uint8_t* base = data + i * point_step;
     float x, y, z;
-    std::memcpy(&x, &data[base + x_off], sizeof(float));
-    std::memcpy(&y, &data[base + y_off], sizeof(float));
-    std::memcpy(&z, &data[base + z_off], sizeof(float));
+    std::memcpy(&x, base + x_off, sizeof(float));
+    std::memcpy(&y, base + y_off, sizeof(float));
+    std::memcpy(&z, base + z_off, sizeof(float));
     Eigen::Vector3f p = R * Eigen::Vector3f(x, y, z) + t;
-    std::memcpy(&data[base + x_off], &p.x(), sizeof(float));
-    std::memcpy(&data[base + y_off], &p.y(), sizeof(float));
-    std::memcpy(&data[base + z_off], &p.z(), sizeof(float));
+    std::memcpy(base + x_off, &p.x(), sizeof(float));
+    std::memcpy(base + y_off, &p.y(), sizeof(float));
+    std::memcpy(base + z_off, &p.z(), sizeof(float));
   }
 }
 
@@ -183,16 +185,15 @@ bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
 // regardless of the declared field type — Luminar publishes the raw uint64 bits
 // even when the field datatype is FLOAT64, so generic FP arithmetic would
 // scramble them.
-void shiftCloudTimestamps(std::vector<uint8_t>& data, uint32_t point_step,
+void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
                           double dt, bool luminar_uint64) {
   if (time_off < 0) return;
-  const size_t num_points = data.size() / point_step;
 
   if (luminar_uint64) {
     const int64_t dt_ns = static_cast<int64_t>(dt * 1e9);
     for (size_t i = 0; i < num_points; ++i) {
-      uint8_t* p = &data[i * point_step + time_off];
+      uint8_t* p = data + i * point_step + time_off;
       uint64_t v;
       std::memcpy(&v, p, sizeof(uint64_t));
       const int64_t shifted = static_cast<int64_t>(v) + dt_ns;
@@ -203,7 +204,7 @@ void shiftCloudTimestamps(std::vector<uint8_t>& data, uint32_t point_step,
   }
 
   for (size_t i = 0; i < num_points; ++i) {
-    uint8_t* time_ptr = &data[i * point_step + time_off];
+    uint8_t* time_ptr = data + i * point_step + time_off;
     switch (time_datatype) {
       case sensor_msgs::msg::PointField::UINT32: {
         uint32_t val;
@@ -466,16 +467,11 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
 
   if (this->debug_pub_enabled_) {
     this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
-    this->aligned_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_cloud", 10);
     this->gt_snap_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/gt_snap", 10);
     this->dbg_initial_guess_pose_pub =
         this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
     this->dbg_final_pose_pub =
         this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/final_pose", 10);
-    this->dbg_input_cloud_base_pub =
-        this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/input_cloud_base", 10);
-    this->dbg_initial_guess_cloud_pub =
-        this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/initial_guess_cloud", 10);
     this->dbg_pose_markers_pub =
         this->create_publisher<visualization_msgs::msg::MarkerArray>("gicp/localization/debug/pose_markers", 10);
     this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
@@ -1190,22 +1186,28 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
     return;
   }
 
-  // Manual conversion using field iterators (most robust for custom formats)
-  sensor_msgs::PointCloud2ConstIterator<float> iter_x(*pc, "x");
-  sensor_msgs::PointCloud2ConstIterator<float> iter_y(*pc, "y");
-  sensor_msgs::PointCloud2ConstIterator<float> iter_z(*pc, "z");
-
-  RCLCPP_DEBUG(this->get_logger(), "Created XYZ iterators successfully");
-
-  // Check if intensity field exists and determine its type
-  bool has_intensity = false;
-  uint8_t intensity_datatype = 0;
+  // Single-pass conversion: resolve field offsets once, then walk pc->data
+  // exactly once doing xyz + intensity + (Luminar) timestamp + flip_y in the
+  // same iteration. Replaces the old triple-pass design (5 PointCloud2ConstIterators
+  // for the first pass, then a separate Luminar-timestamp loop, then a flip_y
+  // loop), which was O(3N) over the same memory.
+  int x_off = -1, y_off = -1, z_off = -1, i_off = -1, ts_off = -1;
+  uint8_t i_type = 0;
   for (const auto& field : pc->fields) {
-    if (field.name == "intensity") {
-      has_intensity = true;
-      intensity_datatype = field.datatype;
-      break;
+    if (field.name == "x") x_off = static_cast<int>(field.offset);
+    else if (field.name == "y") y_off = static_cast<int>(field.offset);
+    else if (field.name == "z") z_off = static_cast<int>(field.offset);
+    else if (field.name == "intensity") {
+      i_off = static_cast<int>(field.offset);
+      i_type = field.datatype;
+    } else if (field.name == "timestamp") {
+      ts_off = static_cast<int>(field.offset);
     }
+  }
+
+  if (x_off < 0 || y_off < 0 || z_off < 0) {
+    RCLCPP_ERROR(this->get_logger(), "Point cloud missing x/y/z fields");
+    return;
   }
 
   raw_scan->points.resize(num_points);
@@ -1213,70 +1215,80 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   raw_scan->height = pc->height;
   raw_scan->is_dense = pc->is_dense;
 
-  RCLCPP_DEBUG(this->get_logger(), "Resized cloud to %lu points, has_intensity=%d, datatype=%d",
-               num_points, has_intensity, intensity_datatype);
+  const bool flip_y = this->flip_y_;
+  const bool luminar_ts = (this->sensor == dlio::SensorType::LUMINAR) && ts_off >= 0;
+  if (this->sensor == dlio::SensorType::LUMINAR && ts_off < 0) {
+    RCLCPP_WARN_ONCE(this->get_logger(),
+                     "Luminar sensor type set but 'timestamp' field not found in point cloud!");
+  }
+  const uint32_t point_step = pc->point_step;
+  const uint8_t* base = pc->data.data();
+
+  // Per-point body templated on the intensity reader, so the dispatch happens
+  // once outside the loop and the compiler can inline + auto-vectorize.
+  auto run = [&](auto&& read_intensity) {
+    for (size_t i = 0; i < num_points; ++i) {
+      const uint8_t* src = base + i * point_step;
+      auto& dst = raw_scan->points[i];
+
+      float x, y, z;
+      std::memcpy(&x, src + x_off, sizeof(float));
+      std::memcpy(&y, src + y_off, sizeof(float));
+      std::memcpy(&z, src + z_off, sizeof(float));
+      dst.x = x;
+      dst.y = flip_y ? -y : y;
+      dst.z = z;
+      dst.intensity = read_intensity(src);
+      dst.time = 0.0f;
+
+      if (luminar_ts) {
+        // Luminar publishes raw uint64 ns even when the field datatype is
+        // FLOAT64; copy the 8 bytes verbatim into the timestamp union slot
+        // (deskew reinterprets them as uint64).
+        uint64_t ts_raw;
+        std::memcpy(&ts_raw, src + ts_off, sizeof(uint64_t));
+        std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
+      }
+    }
+  };
 
   try {
-    if (has_intensity) {
-      RCLCPP_DEBUG(this->get_logger(), "Converting with intensity (type %d)", intensity_datatype);
-      // Handle different intensity data types
-      if (intensity_datatype == sensor_msgs::msg::PointField::UINT16) {
-        sensor_msgs::PointCloud2ConstIterator<uint16_t> iter_i(*pc, "intensity");
-        for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_i) {
-          raw_scan->points[i].x = *iter_x;
-          raw_scan->points[i].y = *iter_y;
-          raw_scan->points[i].z = *iter_z;
-          raw_scan->points[i].intensity = static_cast<float>(*iter_i);
-          raw_scan->points[i].time = 0.0f;
-        }
-        RCLCPP_DEBUG(this->get_logger(), "Converted %lu points with UINT16 intensity", num_points);
-      } else if (intensity_datatype == sensor_msgs::msg::PointField::UINT8) {
-        sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_i(*pc, "intensity");
-        for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_i) {
-          raw_scan->points[i].x = *iter_x;
-          raw_scan->points[i].y = *iter_y;
-          raw_scan->points[i].z = *iter_z;
-          raw_scan->points[i].intensity = static_cast<float>(*iter_i);
-          raw_scan->points[i].time = 0.0f;
-        }
-      } else if (intensity_datatype == sensor_msgs::msg::PointField::FLOAT32) {
-        sensor_msgs::PointCloud2ConstIterator<float> iter_i(*pc, "intensity");
-        for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_i) {
-          raw_scan->points[i].x = *iter_x;
-          raw_scan->points[i].y = *iter_y;
-          raw_scan->points[i].z = *iter_z;
-          raw_scan->points[i].intensity = *iter_i;
-          raw_scan->points[i].time = 0.0f;
-        }
-      } else if (intensity_datatype == sensor_msgs::msg::PointField::FLOAT64) {
-        sensor_msgs::PointCloud2ConstIterator<double> iter_i(*pc, "intensity");
-        for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_i) {
-          raw_scan->points[i].x = *iter_x;
-          raw_scan->points[i].y = *iter_y;
-          raw_scan->points[i].z = *iter_z;
-          raw_scan->points[i].intensity = static_cast<float>(*iter_i);
-          raw_scan->points[i].time = 0.0f;
-        }
-      } else {
-        // Fallback for unknown intensity type
-        RCLCPP_WARN(this->get_logger(), "Unknown intensity type %d, ignoring", intensity_datatype);
-        for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z) {
-          raw_scan->points[i].x = *iter_x;
-          raw_scan->points[i].y = *iter_y;
-          raw_scan->points[i].z = *iter_z;
-          raw_scan->points[i].intensity = 0.0f;
-          raw_scan->points[i].time = 0.0f;
-        }
-      }
+    if (i_off < 0) {
+      run([](const uint8_t*) { return 0.0f; });
     } else {
-      // No intensity field
-      RCLCPP_DEBUG(this->get_logger(), "Converting without intensity");
-      for (size_t i = 0; i < num_points; ++i, ++iter_x, ++iter_y, ++iter_z) {
-        raw_scan->points[i].x = *iter_x;
-        raw_scan->points[i].y = *iter_y;
-        raw_scan->points[i].z = *iter_z;
-        raw_scan->points[i].intensity = 0.0f;
-        raw_scan->points[i].time = 0.0f;
+      const uint8_t i_type_local = i_type;
+      const int i_off_local = i_off;
+      switch (i_type_local) {
+        case sensor_msgs::msg::PointField::FLOAT32:
+          run([i_off_local](const uint8_t* src) {
+            float v;
+            std::memcpy(&v, src + i_off_local, sizeof(float));
+            return v;
+          });
+          break;
+        case sensor_msgs::msg::PointField::UINT16:
+          run([i_off_local](const uint8_t* src) {
+            uint16_t v;
+            std::memcpy(&v, src + i_off_local, sizeof(uint16_t));
+            return static_cast<float>(v);
+          });
+          break;
+        case sensor_msgs::msg::PointField::UINT8:
+          run([i_off_local](const uint8_t* src) {
+            return static_cast<float>(*(src + i_off_local));
+          });
+          break;
+        case sensor_msgs::msg::PointField::FLOAT64:
+          run([i_off_local](const uint8_t* src) {
+            double v;
+            std::memcpy(&v, src + i_off_local, sizeof(double));
+            return static_cast<float>(v);
+          });
+          break;
+        default:
+          RCLCPP_WARN(this->get_logger(), "Unknown intensity type %d, ignoring", i_type_local);
+          run([](const uint8_t*) { return 0.0f; });
+          break;
       }
     }
   } catch (const std::exception& e) {
@@ -1284,51 +1296,10 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
     return;
   }
 
-  RCLCPP_DEBUG(this->get_logger(), "Successfully converted, raw_scan has %lu points", raw_scan->points.size());
   this->last_raw_point_count_ = raw_scan->points.size();
-
-  // For Luminar: read per-point timestamps (uint64 nanoseconds) from the raw PointCloud2 bytes.
-  // The manual conversion loop above only reads x/y/z and leaves pt.timestamp as zero.
-  if (this->sensor == dlio::SensorType::LUMINAR) {
-    uint32_t ts_offset = 0;
-    bool ts_found = false;
-    for (const auto& field : pc->fields) {
-      if (field.name == "timestamp") {
-        ts_offset = field.offset;
-        ts_found = true;
-        break;
-      }
-    }
-    if (ts_found) {
-      for (size_t i = 0; i < num_points; ++i) {
-        uint64_t ts_raw;
-        memcpy(&ts_raw, &pc->data[i * pc->point_step + ts_offset], sizeof(uint64_t));
-        // Store raw uint64 bytes into pt.timestamp (double field, same 8-byte size).
-        // deskewPointcloud will memcpy them back out as uint64.
-        memcpy(&raw_scan->points[i].timestamp, &ts_raw, sizeof(uint64_t));
-      }
-    } else {
-      RCLCPP_WARN_ONCE(this->get_logger(), "Luminar sensor type set but 'timestamp' field not found in point cloud!");
-    }
-  }
-
-  // Optionally negate Y axis (e.g. to convert SAE Y-right to ROS Y-left without flipping Z)
-  if (this->flip_y_) {
-    for (auto& pt : raw_scan->points) {
-      pt.y = -pt.y;
-    }
-  }
 
   // Store as original scan for deskewing
   this->original_scan = raw_scan;
-
-  if (this->debug_pub_enabled_ && this->dbg_input_cloud_base_pub->get_subscription_count() > 0) {
-    sensor_msgs::msg::PointCloud2 input_cloud_msg;
-    pcl::toROSMsg(*this->original_scan, input_cloud_msg);
-    input_cloud_msg.header.stamp = this->scan_stamp;
-    input_cloud_msg.header.frame_id = this->last_scan_input_frame_;
-    this->dbg_input_cloud_base_pub->publish(input_cloud_msg);
-  }
 
   // Save dt for geometric observer BEFORE deskew (which overwrites prev_scan_stamp)
   this->observer_dt_ = (this->prev_scan_stamp > 0.0)
@@ -1414,6 +1385,10 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
   size_t total_points = static_cast<size_t>(primary->width) * primary->height;
   size_t merged_aux_count = 0;
 
+  // Reserve once for primary + all aux clouds (assuming roughly equal sizes).
+  // Avoids per-aux reallocations as we grow merged->data.
+  merged->data.reserve(primary->data.size() * (1 + this->aux_lidars_.size()));
+
   for (auto& aux_ptr : this->aux_lidars_) {
     auto& aux = *aux_ptr;
 
@@ -1471,11 +1446,16 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       continue;
     }
 
-    // Copy aux raw bytes; transform xyz into primary frame; rebase per-point timestamps.
-    std::vector<uint8_t> data(match->data.begin(), match->data.end());
+    // Append aux bytes directly into merged->data, then transform xyz + shift
+    // timestamps in place over the just-appended region. No intermediate copy.
+    const size_t old_size = merged->data.size();
+    merged->data.insert(merged->data.end(), match->data.begin(), match->data.end());
+    uint8_t* appended = merged->data.data() + old_size;
+    const size_t aux_pts = match->data.size() / point_step;
+
     int ax, ay, az;
     if (findXYZOffsets(*match, ax, ay, az)) {
-      transformCloudData(data, point_step, ax, ay, az, aux.T_primary_aux);
+      transformCloudData(appended, aux_pts, point_step, ax, ay, az, aux.T_primary_aux);
     }
 
     int time_off;
@@ -1486,10 +1466,9 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
       // onto the primary clock so deskewing sees one coherent sweep.
       const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
       const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
-      shiftCloudTimestamps(data, point_step, time_off, time_dt_type, time_count, dt, luminar_u64);
+      shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64);
     }
 
-    merged->data.insert(merged->data.end(), data.begin(), data.end());
     total_points += static_cast<size_t>(match->width) * match->height;
     ++merged_aux_count;
   }
@@ -1793,8 +1772,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Input source set");
 
   // Align using IMU-based prior as initial guess (if deskewing is enabled)
-  // Otherwise use the previous pose
-  pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
+  // align() requires an output cloud parameter (PCL API), but we never use the
+  // transformed cloud — LsqRegistration skips the fill, so this stays empty.
+  pcl::PointCloud<PointType> aligned_scratch;
 
   // When deskewing is enabled, points are already in world frame at T_prior,
   // so GICP initial guess is Identity and final pose = T_corr * T_prior.
@@ -1812,7 +1792,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: Starting GICP alignment...");
   auto start = std::chrono::high_resolution_clock::now();
-  this->gicp.align(*aligned, initial_guess);
+  this->gicp.align(aligned_scratch, initial_guess);
   auto end = std::chrono::high_resolution_clock::now();
   RCLCPP_DEBUG(this->get_logger(), "performLocalization: GICP alignment completed");
 
@@ -1932,21 +1912,6 @@ void gicp_localization::LocalizationNode::performLocalization() {
           poseStampedFromMatrix(candidate_pose, this->scan_stamp, this->map_frame));
     }
 
-    if (this->dbg_initial_guess_cloud_pub->get_subscription_count() > 0 && matrixFinite(guess_pose_map)) {
-      pcl::PointCloud<PointType> guessed_cloud;
-      if (this->deskew_) {
-        guessed_cloud = *this->current_scan;
-      } else {
-        pcl::transformPointCloud(*this->current_scan, guessed_cloud, guess_pose_map);
-      }
-
-      sensor_msgs::msg::PointCloud2 guessed_cloud_msg;
-      pcl::toROSMsg(guessed_cloud, guessed_cloud_msg);
-      guessed_cloud_msg.header.stamp = this->scan_stamp;
-      guessed_cloud_msg.header.frame_id = this->map_frame;
-      this->dbg_initial_guess_cloud_pub->publish(guessed_cloud_msg);
-    }
-
     if (this->dbg_pose_markers_pub->get_subscription_count() > 0) {
       visualization_msgs::msg::MarkerArray markers;
 
@@ -1990,14 +1955,6 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
       this->dbg_pose_markers_pub->publish(markers);
     }
-  }
-
-  if (this->aligned_cloud_pub && this->aligned_cloud_pub->get_subscription_count() > 0) {
-    sensor_msgs::msg::PointCloud2 aligned_msg;
-    pcl::toROSMsg(*aligned, aligned_msg);
-    aligned_msg.header.stamp = this->scan_stamp;
-    aligned_msg.header.frame_id = this->map_frame;
-    this->aligned_cloud_pub->publish(aligned_msg);
   }
 
   auto build_scan_debug_log = [&](const char* status) {
@@ -2259,14 +2216,16 @@ void gicp_localization::LocalizationNode::publishPose() {
   // With unreliable IMU, we publish only GICP results instead of propagated poses
   this->pose_pub->publish(pose_msg);
 
-  // Add to trajectory path (capped to avoid unbounded memory growth)
-  this->path_msg.header.stamp = this->scan_stamp;
-  this->path_msg.header.frame_id = this->map_frame;
-  if (this->path_msg.poses.size() >= 10000) {
-    this->path_msg.poses.erase(this->path_msg.poses.begin());
+  // Add to trajectory deque (O(1) pop_front when capping). Only build the Path
+  // message + DDS-publish when a subscriber actually exists.
+  if (this->path_buffer_.size() >= 10000) this->path_buffer_.pop_front();
+  this->path_buffer_.push_back(pose_msg);
+  if (this->path_pub && this->path_pub->get_subscription_count() > 0) {
+    this->path_msg.header.stamp = this->scan_stamp;
+    this->path_msg.header.frame_id = this->map_frame;
+    this->path_msg.poses.assign(this->path_buffer_.begin(), this->path_buffer_.end());
+    this->path_pub->publish(this->path_msg);
   }
-  this->path_msg.poses.push_back(pose_msg);
-  if (this->path_pub) this->path_pub->publish(this->path_msg);
 
   // Publish UTM-frame pose/path
   if (this->utm_enabled_) {
@@ -2287,13 +2246,14 @@ void gicp_localization::LocalizationNode::publishPose() {
     utm_pose_msg.pose.orientation.z = utm_q.z();
     this->utm_pose_pub->publish(utm_pose_msg);
 
-    this->utm_path_msg_.header.stamp = this->scan_stamp;
-    this->utm_path_msg_.header.frame_id = this->utm_frame;
-    if (this->utm_path_msg_.poses.size() >= 10000) {
-      this->utm_path_msg_.poses.erase(this->utm_path_msg_.poses.begin());
+    if (this->utm_path_buffer_.size() >= 10000) this->utm_path_buffer_.pop_front();
+    this->utm_path_buffer_.push_back(utm_pose_msg);
+    if (this->utm_path_pub && this->utm_path_pub->get_subscription_count() > 0) {
+      this->utm_path_msg_.header.stamp = this->scan_stamp;
+      this->utm_path_msg_.header.frame_id = this->utm_frame;
+      this->utm_path_msg_.poses.assign(this->utm_path_buffer_.begin(), this->utm_path_buffer_.end());
+      this->utm_path_pub->publish(this->utm_path_msg_);
     }
-    this->utm_path_msg_.poses.push_back(utm_pose_msg);
-    this->utm_path_pub->publish(this->utm_path_msg_);
   }
 
   // Publish TF
@@ -3215,13 +3175,14 @@ void gicp_localization::LocalizationNode::propagateState() {
     static int path_decimator = 0;
     if (++path_decimator % 10 == 0) {
       std::lock_guard<std::mutex> path_lock(this->pose_mutex);
-      this->path_msg.header.stamp = current_time;
-      this->path_msg.header.frame_id = this->map_frame;
-      if (this->path_msg.poses.size() >= 10000) {
-        this->path_msg.poses.erase(this->path_msg.poses.begin());
+      if (this->path_buffer_.size() >= 10000) this->path_buffer_.pop_front();
+      this->path_buffer_.push_back(pose_msg);
+      if (this->path_pub && this->path_pub->get_subscription_count() > 0) {
+        this->path_msg.header.stamp = current_time;
+        this->path_msg.header.frame_id = this->map_frame;
+        this->path_msg.poses.assign(this->path_buffer_.begin(), this->path_buffer_.end());
+        this->path_pub->publish(this->path_msg);
       }
-      this->path_msg.poses.push_back(pose_msg);
-      if (this->path_pub) this->path_pub->publish(this->path_msg);
     }
 
     if (this->publish_tf_) {

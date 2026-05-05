@@ -96,8 +96,12 @@ void NanoGICP<PointSource, PointTarget>::setRegularizationMethod(RegularizationM
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::swapSourceAndTarget() {
   input_.swap(target_);
+  // NB: source_kdtree_ and target_kdtree_ are now templated on different point
+  // types in general; for our usage PointSource == PointTarget so the swap is
+  // safe.
   source_kdtree_.swap(target_kdtree_);
   source_covs_.swap(target_covs_);
+  source_covs_owned_.swap(target_covs_owned_);
 
   correspondences_.clear();
   sq_distances_.clear();
@@ -107,6 +111,7 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::clearSource() {
   input_.reset();
   source_covs_.reset();
+  // Keep source_covs_owned_ allocated for next scan's reuse.
 }
 
 template <typename PointSource, typename PointTarget>
@@ -139,9 +144,12 @@ void NanoGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceCo
 
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputSource(cloud);
 
-  std::shared_ptr<nanoflann::KdTreeFLANN<PointSource>> source_kdtree = std::make_shared<nanoflann::KdTreeFLANN<PointSource>>();
-  source_kdtree->setInputCloud(cloud);
-  source_kdtree_ = source_kdtree;
+  // Reuse the existing kd-tree object across scans; setInputCloud() rebuilds
+  // the index in place, keeping the underlying node pool warm.
+  if (!source_kdtree_) {
+    source_kdtree_ = std::make_shared<nanoflann::KdTreeFLANN<PointSource>>();
+  }
+  source_kdtree_->setInputCloud(cloud);
 
   source_covs_.reset();
 }
@@ -153,9 +161,10 @@ void NanoGICP<PointSource, PointTarget>::setInputTarget(const PointCloudTargetCo
   }
   pcl::Registration<PointSource, PointTarget, Scalar>::setInputTarget(cloud);
 
-  std::shared_ptr<nanoflann::KdTreeFLANN<PointTarget>> target_kdtree = std::make_shared<nanoflann::KdTreeFLANN<PointTarget>>();
-  target_kdtree->setInputCloud(cloud);
-  target_kdtree_ = target_kdtree;
+  if (!target_kdtree_) {
+    target_kdtree_ = std::make_shared<nanoflann::KdTreeFLANN<PointTarget>>();
+  }
+  target_kdtree_->setInputCloud(cloud);
 
   target_covs_.reset();
 }
@@ -172,21 +181,21 @@ void NanoGICP<PointSource, PointTarget>::setTargetCovariances(const std::shared_
 
 template <typename PointSource, typename PointTarget>
 bool NanoGICP<PointSource, PointTarget>::calculateSourceCovariances() {
-  std::shared_ptr<CovarianceList> source_covs = std::make_shared<CovarianceList>();
-  std::shared_ptr<float> source_density = std::make_shared<float>();
-  bool ret = calculate_covariances(input_, *source_kdtree_, *source_covs, *source_density);
-  source_covs_ = source_covs;
-  source_density_ = *source_density;
+  if (!source_covs_owned_) {
+    source_covs_owned_ = std::make_shared<CovarianceList>();
+  }
+  bool ret = calculate_covariances(input_, *source_kdtree_, *source_covs_owned_, source_density_);
+  source_covs_ = source_covs_owned_;
   return ret;
 }
 
 template <typename PointSource, typename PointTarget>
 bool NanoGICP<PointSource, PointTarget>::calculateTargetCovariances() {
-  std::shared_ptr<CovarianceList> target_covs = std::make_shared<CovarianceList>();
-  std::shared_ptr<float> target_density = std::make_shared<float>();
-  bool ret = calculate_covariances(target_, *target_kdtree_, *target_covs, *target_density);
-  target_covs_ = target_covs;
-  target_density_ = *target_density;
+  if (!target_covs_owned_) {
+    target_covs_owned_ = std::make_shared<CovarianceList>();
+  }
+  bool ret = calculate_covariances(target_, *target_kdtree_, *target_covs_owned_, target_density_);
+  target_covs_ = target_covs_owned_;
   return ret;
 }
 

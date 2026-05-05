@@ -28,6 +28,7 @@
 
 // BOOST
 #include <boost/circular_buffer.hpp>
+#include <deque>
 
 // STL
 #include <atomic>
@@ -166,11 +167,8 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr utm_odom_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr utm_path_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_cloud_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_initial_guess_pose_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr dbg_final_pose_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_input_cloud_base_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dbg_initial_guess_cloud_pub;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dbg_pose_markers_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_fitness_pub;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr dbg_gicp_elapsed_ms_pub;
@@ -232,8 +230,11 @@ private:
   bool last_gicp_valid_;
   double last_fitness_score_{-1.0};  // -1 = no scan yet
 
-  // Trajectory
+  // Trajectory. The actual ring of poses lives in path_buffer_ (deque, O(1)
+  // pop_front when capping); path_msg is filled only when the path topic has
+  // subscribers, so we don't pay an O(N) DDS serialize on every scan.
   nav_msgs::msg::Path path_msg;
+  std::deque<geometry_msgs::msg::PoseStamped> path_buffer_;
 
   // IMU data structures
   boost::circular_buffer<ImuMeas> imu_buffer;
@@ -309,6 +310,7 @@ private:
   bool utm_enabled_;
   Eigen::Matrix4f T_utm_map_;
   nav_msgs::msg::Path utm_path_msg_;
+  std::deque<geometry_msgs::msg::PoseStamped> utm_path_buffer_;
 
   // Parameters
   std::string map_path_;
