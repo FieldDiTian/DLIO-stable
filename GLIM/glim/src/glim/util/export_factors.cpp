@@ -7,6 +7,7 @@
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PoseRotationPrior.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -53,6 +54,7 @@ BOOST_CLASS_EXPORT_GUID(gtsam::BetweenFactor<gtsam::Vector3>, "gtsam::BetweenFac
 BOOST_CLASS_EXPORT_GUID(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>, "gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>");
 
 BOOST_CLASS_EXPORT_GUID(gtsam::PoseTranslationPrior<gtsam::Pose3>, "gtsam::PoseTranslationPrior<gtsam::Pose3>");
+BOOST_CLASS_EXPORT_GUID(gtsam::PoseRotationPrior<gtsam::Pose3>, "gtsam::PoseRotationPrior<gtsam::Pose3>");
 
 BOOST_CLASS_EXPORT_GUID(gtsam::ImuFactor, "gtsam::ImuFactor");
 

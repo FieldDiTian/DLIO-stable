@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #define GLIM_ROS2
 
@@ -38,6 +39,7 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <spdlog/spdlog.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/slam/PoseRotationPrior.h>
 #include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -45,10 +47,21 @@ using ExtensionModuleBase = glim::ExtensionModuleROS;
 #include <glim/util/logging.hpp>
 #include <glim/util/convert_to_string.hpp>
 #include <glim_ext/util/config_ext.hpp>
+#include <glim/util/urdf_transforms.hpp>
 
 namespace glim {
 
 using gtsam::symbol_shorthand::X;
+
+struct GNSSData {
+public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  double stamp = 0.0;
+  Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+  bool has_orientation = false;
+};
 
 /**
  * @brief Naive implementation of GNSS constraints for the global optimization.
@@ -68,10 +81,42 @@ public:
     gnss_topic = config.param<std::string>("gnss", "gnss_topic", "/pose_with_cov");
     gnss_msg_type = config.param<std::string>("gnss", "gnss_msg_type", "geometry_msgs/msg/PoseWithCovarianceStamped");
     prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "prior_inf_scale", Eigen::Vector3d(1e3, 1e3, 0.0));
+    enable_orientation_prior = config.param<bool>("gnss", "enable_orientation_prior", false);
+    orientation_prior_inf_scale = config.param<Eigen::Vector3d>("gnss", "orientation_prior_inf_scale", Eigen::Vector3d(1e2, 1e2, 1e2));
     min_baseline = config.param<double>("gnss", "min_baseline", 5.0);
+
+    if (enable_orientation_prior && orientation_prior_inf_scale.minCoeff() < 0.0) {
+      logger->warn("orientation prior enabled but orientation_prior_inf_scale has negative values; disabling orientation prior");
+      enable_orientation_prior = false;
+    }
+
+    // Resolve IMU -> GNSS antenna lever arm from URDF (if configured).
+    // urdf_path / urdf_imu_frame come from config_sensors.json (shared with the lidar/IMU calibration).
+    // urdf_gnss_frame is gnss_global-specific (e.g., "gps_antenna_top").
+    t_imu_gnss.setZero();
+    warned_missing_orientation_for_lever_arm = false;
+    try {
+      glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
+      const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
+      const std::string urdf_imu_frame = config_sensors.param<std::string>("sensors", "urdf_imu_frame", "");
+      const std::string urdf_gnss_frame = config.param<std::string>("gnss", "urdf_gnss_frame", "");
+
+      if (!urdf_path.empty() && !urdf_imu_frame.empty() && !urdf_gnss_frame.empty()) {
+        const auto urdf_transforms = glim::parse_urdf_transforms(urdf_path);
+        const Eigen::Isometry3d T_imu_gnss = glim::compute_transform(urdf_transforms, urdf_imu_frame, urdf_gnss_frame);
+        t_imu_gnss = T_imu_gnss.translation();
+        logger->info("URDF lever arm t_imu_gnss ({} -> {}): [{:.4f}, {:.4f}, {:.4f}]", urdf_imu_frame, urdf_gnss_frame, t_imu_gnss.x(), t_imu_gnss.y(), t_imu_gnss.z());
+      } else {
+        logger->info("URDF lever arm not configured (urdf_path/urdf_imu_frame/urdf_gnss_frame); GNSS positions used as-is");
+      }
+    } catch (const std::exception& e) {
+      logger->error("failed to compute t_imu_gnss from URDF: {}; lever arm compensation disabled", e.what());
+      t_imu_gnss.setZero();
+    }
 
     transformation_initialized = false;
     T_world_utm.setIdentity();
+    warned_missing_orientation = false;
 
     kill_switch = false;
     thread = std::thread([this] { backend_task(); });
@@ -108,12 +153,14 @@ public:
 
   void gnss_callback(const PoseWithCovarianceStampedConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z);
+    const auto& ori = gnss_msg->pose.pose.orientation;
+    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w);
   }
 
   void gnss_callback(const OdometryConstPtr& gnss_msg) {
     const auto& pos = gnss_msg->pose.pose.position;
-    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z);
+    const auto& ori = gnss_msg->pose.pose.orientation;
+    push_gnss_data(to_sec(gnss_msg->header.stamp), pos.x, pos.y, pos.z, ori.x, ori.y, ori.z, ori.w);
   }
 
   void on_insert_submap(const SubMap::ConstPtr& submap) { input_submap_queue.push_back(submap); }
@@ -128,7 +175,7 @@ public:
 
   void backend_task() {
     logger->info("starting GNSS global thread");
-    std::deque<Eigen::Vector4d> utm_queue;
+    std::deque<GNSSData, Eigen::aligned_allocator<GNSSData>> utm_queue;
     std::deque<SubMap::ConstPtr> submap_queue;
 
     while (!kill_switch) {
@@ -145,28 +192,25 @@ public:
       submap_queue.insert(submap_queue.end(), new_submaps.begin(), new_submaps.end());
 
       // Remove submaps that are created earlier than the oldest GNSS data
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front()[0]) {
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp < utm_queue.front().stamp) {
         submap_queue.pop_front();
       }
 
       // Interpolate UTM coords and associate with submaps
-      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > utm_queue.front()[0] &&
-             submap_queue.front()->frames.back()->stamp < utm_queue.back()[0]) {
+      while (!utm_queue.empty() && !submap_queue.empty() && submap_queue.front()->frames.front()->stamp > utm_queue.front().stamp &&
+             submap_queue.front()->frames.back()->stamp < utm_queue.back().stamp) {
         const auto& submap = submap_queue.front();
         const double stamp = submap->frames[submap->frames.size() / 2]->stamp;
 
-        const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const Eigen::Vector4d& utm, const double t) { return utm[0] < t; });
+        const auto right = std::lower_bound(utm_queue.begin(), utm_queue.end(), stamp, [](const GNSSData& utm, const double t) { return utm.stamp < t; });
         if (right == utm_queue.end() || (right + 1) == utm_queue.end()) {
           logger->warn("invalid condition in GNSS global module!!");
           break;
         }
         const auto left = right - 1;
-        logger->debug("submap={:.6f} utm_left={:.6f} utm_right={:.6f}", stamp, (*left)[0], (*right)[0]);
+        logger->debug("submap={:.6f} utm_left={:.6f} utm_right={:.6f}", stamp, left->stamp, right->stamp);
 
-        const double tl = (*left)[0];
-        const double tr = (*right)[0];
-        const double p = (stamp - tl) / (tr - tl);
-        const Eigen::Vector4d interpolated = (1.0 - p) * (*left) + p * (*right);
+        const GNSSData interpolated = interpolate_gnss_data(*left, *right, stamp);
 
         submaps.push_back(submap);
         submap_coords.push_back(interpolated);
@@ -181,7 +225,7 @@ public:
         Eigen::Vector3d mean_gnss = Eigen::Vector3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
           mean_est += submaps[i]->T_world_origin.translation();
-          mean_gnss += submap_coords[i].tail<3>();
+          mean_gnss += submap_coords[i].position;
         }
         mean_est /= submaps.size();
         mean_gnss /= submaps.size();
@@ -189,7 +233,7 @@ public:
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (int i = 0; i < submaps.size(); i++) {
           const Eigen::Vector3d centered_est = submaps[i]->T_world_origin.translation() - mean_est;
-          const Eigen::Vector3d centered_gnss = submap_coords[i].tail<3>() - mean_gnss;
+          const Eigen::Vector3d centered_gnss = submap_coords[i].position - mean_gnss;
           cov += centered_gnss * centered_est.transpose();
         }
         cov /= submaps.size();
@@ -212,7 +256,7 @@ public:
         T_world_utm = T_utm_world.inverse();
 
         for (int i = 0; i < submaps.size(); i++) {
-          const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].tail<3>();
+          const Eigen::Vector3d gnss = T_world_utm * submap_coords[i].position;
           logger->debug("submap={} gnss={}", convert_to_string(submaps[i]->T_world_origin.translation().eval()), convert_to_string(gnss));
         }
 
@@ -220,9 +264,10 @@ public:
         transformation_initialized = true;
       }
 
-      // Add translation prior factor
+      // Add GNSS prior factors
       if (transformation_initialized) {
-        const Eigen::Vector3d xyz = T_world_utm * submap_coords.back().tail<3>();
+        const GNSSData& gnss = submap_coords.back();
+        const Eigen::Vector3d xyz = T_world_utm * gnss.position;
         logger->debug("submap={} gnss={}", convert_to_string(submaps.back()->T_world_origin.translation().eval()), convert_to_string(xyz));
 
         const auto& submap = submaps.back();
@@ -230,6 +275,16 @@ public:
         const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
         gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
         output_factors.push_back(factor);
+
+        if (enable_orientation_prior && gnss.has_orientation) {
+          const Eigen::Matrix3d R_world_gnss = T_world_utm.linear() * gnss.orientation.toRotationMatrix();
+          const auto rotation_model = gtsam::noiseModel::Diagonal::Precisions(orientation_prior_inf_scale);
+          gtsam::NonlinearFactor::shared_ptr rotation_factor(new gtsam::PoseRotationPrior<gtsam::Pose3>(X(submap->id), gtsam::Rot3(R_world_gnss), rotation_model));
+          output_factors.push_back(rotation_factor);
+        } else if (enable_orientation_prior && !warned_missing_orientation) {
+          logger->warn("orientation prior enabled but GNSS messages contain invalid quaternions; skipping orientation priors");
+          warned_missing_orientation = true;
+        }
       }
     }
   }
@@ -264,29 +319,71 @@ private:
     logger->info("saved T_world_utm (4x4 SE(3)) to: {}", filename);
   }
 
-  void push_gnss_data(double stamp, double x, double y, double z) {
-    Eigen::Vector4d gnss_data;
-    gnss_data << stamp, x, y, z;
+  void push_gnss_data(double stamp, double x, double y, double z, double qx, double qy, double qz, double qw) {
+    GNSSData gnss_data;
+    gnss_data.stamp = stamp;
+    gnss_data.position << x, y, z;
+
+    Eigen::Quaterniond orientation(qw, qx, qy, qz);
+    if (orientation.coeffs().allFinite() && orientation.norm() > 1e-6) {
+      orientation.normalize();
+      gnss_data.orientation = orientation;
+      gnss_data.has_orientation = true;
+    }
+
+    // Lever-arm compensation: convert reported antenna position to IMU-origin position in UTM.
+    // p_imu_utm = p_antenna_utm - R_imu_utm * t_imu_gnss, where t_imu_gnss is in IMU body frame
+    // and gnss_data.orientation is assumed to be the IMU body orientation in UTM (same assumption
+    // used by the orientation prior).
+    if (t_imu_gnss.squaredNorm() > 0.0) {
+      if (gnss_data.has_orientation) {
+        gnss_data.position -= gnss_data.orientation * t_imu_gnss;
+      } else if (!warned_missing_orientation_for_lever_arm) {
+        logger->warn("t_imu_gnss is non-zero but GNSS messages have no orientation; lever arm cannot be compensated");
+        warned_missing_orientation_for_lever_arm = true;
+      }
+    }
+
     input_gnss_queue.push_back(gnss_data);
+  }
+
+  GNSSData interpolate_gnss_data(const GNSSData& left, const GNSSData& right, double stamp) const {
+    const double p = (stamp - left.stamp) / (right.stamp - left.stamp);
+
+    GNSSData interpolated;
+    interpolated.stamp = stamp;
+    interpolated.position = (1.0 - p) * left.position + p * right.position;
+    interpolated.has_orientation = left.has_orientation && right.has_orientation;
+    if (interpolated.has_orientation) {
+      interpolated.orientation = left.orientation.slerp(p, right.orientation).normalized();
+    }
+
+    return interpolated;
   }
 
   std::atomic_bool kill_switch;
   std::thread thread;
 
-  ConcurrentVector<Eigen::Vector4d> input_gnss_queue;
+  ConcurrentVector<GNSSData, Eigen::aligned_allocator<GNSSData>> input_gnss_queue;
   ConcurrentVector<SubMap::ConstPtr> input_submap_queue;
   ConcurrentVector<gtsam::NonlinearFactor::shared_ptr> output_factors;
 
   std::vector<SubMap::ConstPtr> submaps;
-  std::vector<Eigen::Vector4d> submap_coords;
+  std::vector<GNSSData, Eigen::aligned_allocator<GNSSData>> submap_coords;
 
   std::string gnss_topic;
   std::string gnss_msg_type;
   Eigen::Vector3d prior_inf_scale;
+  bool enable_orientation_prior;
+  Eigen::Vector3d orientation_prior_inf_scale;
   double min_baseline;
+
+  Eigen::Vector3d t_imu_gnss;
+  bool warned_missing_orientation_for_lever_arm;
 
   bool transformation_initialized;
   Eigen::Isometry3d T_world_utm;
+  bool warned_missing_orientation;
 
   // Logging
   std::shared_ptr<spdlog::logger> logger;
