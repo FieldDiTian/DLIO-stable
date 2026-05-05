@@ -38,7 +38,7 @@
 
     # Logging verbosity. true = current behavior (INFO + raw stderr debug prints).
     # false = silence INFO/DEBUG; WARN/ERROR still pass through.
-    localization/verbose: true
+    localization/verbose: false
 
     # Use odometry for pose initialization
     # If true, waits for first odometry message to initialize
