@@ -43,7 +43,7 @@
     # Use odometry for pose initialization
     # If true, waits for first odometry message to initialize
     # If false, waits for initial pose from RViz or topic
-    localization/use_odom_init: false
+    localization/use_odom_init: true
 
     # Ground-truth odom cross-check. When enabled, the node subscribes to the
     # `gt_odom` remap (default /localization/global/odom in launch) and reports
@@ -70,7 +70,7 @@
     # tracks the base_link pose in world. Set `frame: "lidar"` and the node
     # will post-multiply inv(T_base_lidar) automatically; set "base_link" if
     # you already computed T_world_baselink yourself.
-    localization/initial_pose/use: true
+    localization/initial_pose/use: false
     localization/initial_pose/frame: "lidar"   # "lidar" (GLIM traj_lidar.txt) or "base_link"
     localization/initial_pose/x: 12.602963     # meters
     localization/initial_pose/y: -9.739742      # meters

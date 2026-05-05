@@ -2315,6 +2315,23 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
 
+  // Odom init: on the first GT odom message, set the initial pose from GT so the
+  // node starts at the correct location even when the bag begins mid-run.
+  // Overrides any param-based initial pose. Sets first_opt_done so odom starts
+  // publishing immediately without waiting for the first accepted GICP scan.
+  if (this->use_odom_init_ && !this->use_odom_init_applied_) {
+    this->use_odom_init_applied_ = true;
+    const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
+    this->applyInitialPose(s.p, s.q, stamp_ros, "gt_odom");
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      this->geo.first_opt_done = true;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "Odom init: pose set from GT odom at t=%.3f pos=[%.2f,%.2f,%.2f]",
+                s.stamp, s.p.x(), s.p.y(), s.p.z());
+  }
+
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
   // can compose poses; callback keeps appending samples even while TF is missing.

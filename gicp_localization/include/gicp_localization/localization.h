@@ -318,6 +318,7 @@ private:
   bool publish_tf_;
   bool imu_only_mode_;
   bool use_odom_init_;
+  bool use_odom_init_applied_{false};
   bool use_param_initial_pose_;
   std::string initial_pose_frame_;  // "lidar" or "base_link"
   bool pending_initial_pose_;  // true when initial pose needs conversion via baselink2lidar_T
