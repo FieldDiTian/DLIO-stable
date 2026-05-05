@@ -1,11 +1,11 @@
 /**:
   ros__parameters:
 
-    use_sim_time: true
+    use_sim_time: false
 
     # Localization Parameters
     # Path to pre-built PCD map file
-    localization/map_path: "/media/art-mini/8d2fac78-a15f-43b1-8d0d-8655d972668b/may_4/run_1/ins_map.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
+    localization/map_path: "dlio_maps/may_4_putnam.pcd"  # REQUIRED: Set this to your map file path (e.g., "/path/to/map.pcd")
 
     # UTM output: path to GLIM's T_world_utm.txt for the map being used.
     # Leave empty to disable UTM-frame publishing.
@@ -124,7 +124,7 @@
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
-    localization/debug/enable_pub: false
+    localization/debug/enable_pub: true
     localization/debug/enable_jump_log: true
     localization/debug/verbose_scan_log: true
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays

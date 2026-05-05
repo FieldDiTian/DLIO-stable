@@ -205,7 +205,9 @@ Each directory contains:
     "gnss_topic": "/gps_nav/odom",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 1.0,              // Minimum travel for alignment (meters)
-    "prior_inf_scale": [1e4, 1e4, 1e4]  // X, Y, Z information values
+    "prior_inf_scale": [1e4, 1e4, 1e4],  // X, Y, Z information values
+    "enable_orientation_prior": true,
+    "orientation_prior_inf_scale": [1e2, 1e2, 1e2]  // Roll, pitch, yaw information values
   }
 }
 ```

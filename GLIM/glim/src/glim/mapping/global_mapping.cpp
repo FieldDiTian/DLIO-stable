@@ -804,9 +804,9 @@ bool GlobalMapping::load(const std::string& path) {
       rekey_mapping[V(i * 2 + 1)] = V((i + start_from_frame_id) * 2 + 1);
     }
 
-    logger->info("removing translation prior factors");
+    logger->info("removing GNSS prior factors");
     auto remove_loc = std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) {
-      return dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get()) != nullptr;
+      return dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get()) != nullptr || dynamic_cast<gtsam::PoseRotationPrior<gtsam::Pose3>*>(factor.get()) != nullptr;
     });
     logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
