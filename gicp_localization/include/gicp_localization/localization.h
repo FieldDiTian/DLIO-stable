@@ -230,6 +230,7 @@ private:
   Eigen::Matrix4f last_gicp_pose_;
   rclcpp::Time last_gicp_stamp_;
   bool last_gicp_valid_;
+  double last_fitness_score_{-1.0};  // -1 = no scan yet
 
   // Trajectory
   nav_msgs::msg::Path path_msg;

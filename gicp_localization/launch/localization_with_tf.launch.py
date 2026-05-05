@@ -25,7 +25,7 @@ def generate_launch_description():
 
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
-    imu_topic = LaunchConfiguration('imu_topic', default='/gps_bot/imu')
+    imu_topic = LaunchConfiguration('imu_topic', default='/gps_na/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/localization/global/odom')
     imu_only = LaunchConfiguration('imu_only', default='false')

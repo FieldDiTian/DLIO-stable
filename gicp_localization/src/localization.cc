@@ -458,59 +458,66 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   odom_qos.durability(rclcpp::DurabilityPolicy::Volatile);
   this->localized_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("localized_odom", odom_qos);
 
-  this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
-  this->utm_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/pose_utm", 10);
-  this->utm_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("gicp/localization/odom_utm", odom_qos);
-  this->utm_path_pub = this->create_publisher<nav_msgs::msg::Path>("gicp/localization/path_utm", 10);
-  this->aligned_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_cloud", 10);
-  this->dbg_initial_guess_pose_pub =
-      this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
-  this->dbg_final_pose_pub =
-      this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/final_pose", 10);
-  this->dbg_input_cloud_base_pub =
-      this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/input_cloud_base", 10);
-  this->dbg_initial_guess_cloud_pub =
-      this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/initial_guess_cloud", 10);
-  this->dbg_pose_markers_pub =
-      this->create_publisher<visualization_msgs::msg::MarkerArray>("gicp/localization/debug/pose_markers", 10);
+  if (this->utm_enabled_) {
+    this->utm_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/pose_utm", 10);
+    this->utm_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("gicp/localization/odom_utm", odom_qos);
+    this->utm_path_pub = this->create_publisher<nav_msgs::msg::Path>("gicp/localization/path_utm", 10);
+  }
 
-  // Debug publishers (small scalar topics for plotting)
-  this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
-  this->dbg_gicp_elapsed_ms_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gicp_elapsed_ms", 10);
-  this->dbg_corr_norm_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/corr_norm", 10);
-  this->dbg_scan_dt_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_dt", 10);
-  this->dbg_imu_age_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_age", 10);
-  this->dbg_num_correspondences_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/num_correspondences", 10);
-  this->dbg_correspondence_ratio_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/correspondence_ratio", 10);
-  this->dbg_final_error_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/final_error", 10);
-  this->dbg_guess_to_solution_trans_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_trans_m", 10);
-  this->dbg_guess_to_solution_rot_deg_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_rot_deg", 10);
-  this->dbg_guess_from_last_trans_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_m", 10);
-  this->dbg_guess_from_last_rot_deg_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_deg", 10);
-  this->dbg_raw_points_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/raw_points", 10);
-  this->dbg_preprocessed_points_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/preprocessed_points", 10);
-  this->dbg_imu_buffer_span_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_buffer_span_s", 10);
-  this->dbg_scan_to_latest_imu_lag_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_to_latest_imu_lag_s", 10);
-  this->dbg_hessian_condition_pub =
-      this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/hessian_condition_proxy", 10);
-  this->dbg_jump_trans_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_trans", 10);
-  this->dbg_jump_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_rot_deg", 10);
-  this->dbg_converged_pub = this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/converged", 10);
-  this->dbg_gt_pos_err_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
-  this->dbg_gt_rot_deg_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
-  this->gt_snap_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/gt_snap", 10);
+  if (this->debug_pub_enabled_) {
+    this->path_pub = this->create_publisher<nav_msgs::msg::Path>("localized_path", 10);
+    this->aligned_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("aligned_cloud", 10);
+    this->gt_snap_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/gt_snap", 10);
+    this->dbg_initial_guess_pose_pub =
+        this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/initial_guess_pose", 10);
+    this->dbg_final_pose_pub =
+        this->create_publisher<geometry_msgs::msg::PoseStamped>("gicp/localization/debug/final_pose", 10);
+    this->dbg_input_cloud_base_pub =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/input_cloud_base", 10);
+    this->dbg_initial_guess_cloud_pub =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>("gicp/localization/debug/initial_guess_cloud", 10);
+    this->dbg_pose_markers_pub =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>("gicp/localization/debug/pose_markers", 10);
+    this->dbg_fitness_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/fitness", 10);
+    this->dbg_gicp_elapsed_ms_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gicp_elapsed_ms", 10);
+    this->dbg_corr_norm_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/corr_norm", 10);
+    this->dbg_scan_dt_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_dt", 10);
+    this->dbg_imu_age_pub = this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_age", 10);
+    this->dbg_num_correspondences_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/num_correspondences", 10);
+    this->dbg_correspondence_ratio_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/correspondence_ratio", 10);
+    this->dbg_final_error_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/final_error", 10);
+    this->dbg_guess_to_solution_trans_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_trans_m", 10);
+    this->dbg_guess_to_solution_rot_deg_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_to_solution_rot_deg", 10);
+    this->dbg_guess_from_last_trans_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_m", 10);
+    this->dbg_guess_from_last_rot_deg_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/guess_from_last_deg", 10);
+    this->dbg_raw_points_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/raw_points", 10);
+    this->dbg_preprocessed_points_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/preprocessed_points", 10);
+    this->dbg_imu_buffer_span_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/imu_buffer_span_s", 10);
+    this->dbg_scan_to_latest_imu_lag_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/scan_to_latest_imu_lag_s", 10);
+    this->dbg_hessian_condition_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/hessian_condition_proxy", 10);
+    this->dbg_jump_trans_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_trans", 10);
+    this->dbg_jump_rot_deg_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/jump_rot_deg", 10);
+    this->dbg_converged_pub = this->create_publisher<std_msgs::msg::Bool>("gicp/localization/debug/converged", 10);
+    this->dbg_gt_pos_err_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_pos_err_m", 10);
+    this->dbg_gt_rot_deg_pub =
+        this->create_publisher<std_msgs::msg::Float64>("gicp/localization/debug/gt_rot_err_deg", 10);
+  }
 
   if (this->visualize_map_) {
     this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map", 1);
@@ -927,7 +934,7 @@ void gicp_localization::LocalizationNode::start() {
   // arrive. We deliberately do NOT publish a map->base_link TF here because
   // under use_sim_time, this->now() returns 0 until /clock is active, and
   // a TF stamped at time 0 poisons the TF buffer with OLD_DATA warnings.
-  if (this->initialized) {
+  if (this->initialized && this->debug_pub_enabled_) {
     auto initial_pose_cb = [this]() {
       if (this->last_gicp_valid_) {
         this->initial_pose_pub_timer_->cancel();
@@ -1812,6 +1819,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
   double elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
   double fitness_score = this->gicp.getFitnessScore();
+  this->last_fitness_score_ = fitness_score;
   double final_error = this->gicp.getFinalError();
   bool converged = this->gicp.hasConverged();
   const int num_correspondences = this->gicp.num_correspondences;
@@ -1984,7 +1992,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
     }
   }
 
-  if (this->aligned_cloud_pub->get_subscription_count() > 0) {
+  if (this->aligned_cloud_pub && this->aligned_cloud_pub->get_subscription_count() > 0) {
     sensor_msgs::msg::PointCloud2 aligned_msg;
     pcl::toROSMsg(*aligned, aligned_msg);
     aligned_msg.header.stamp = this->scan_stamp;
@@ -2258,7 +2266,7 @@ void gicp_localization::LocalizationNode::publishPose() {
     this->path_msg.poses.erase(this->path_msg.poses.begin());
   }
   this->path_msg.poses.push_back(pose_msg);
-  this->path_pub->publish(this->path_msg);
+  if (this->path_pub) this->path_pub->publish(this->path_msg);
 
   // Publish UTM-frame pose/path
   if (this->utm_enabled_) {
@@ -2561,7 +2569,7 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     snap_msg.pose.orientation.x = q_new.x();
     snap_msg.pose.orientation.y = q_new.y();
     snap_msg.pose.orientation.z = q_new.z();
-    this->gt_snap_pub->publish(snap_msg);
+    if (this->gt_snap_pub) this->gt_snap_pub->publish(snap_msg);
   }
 
   this->consecutive_failures_ = 0;
@@ -3124,6 +3132,38 @@ void gicp_localization::LocalizationNode::propagateState() {
   odom_msg.twist.twist.angular.y = new_v_ang_w.y();
   odom_msg.twist.twist.angular.z = new_v_ang_w.z();
 
+  // Pose covariance: diagonal only.
+  // When GICP is accepted use sqrt(fitness) as a positional sigma (metres).
+  // When dead-reckoning (consecutive GICP failures) inflate linearly per scan.
+  {
+    const double kBaseSigmaXY  = 0.05;   // m   — floor for accepted scans
+    const double kBaseSigmaZ   = 0.10;   // m   — z less constrained by LiDAR
+    const double kBaseSigmaRot = 0.01;   // rad — roll/pitch/yaw floor
+    const double kFitnessScale = 1.0;    // sigma_xy = max(base, scale * sqrt(fitness))
+    const double kDeadReckon   = 0.10;   // m per missed scan added to sigma
+
+    double s_xy, s_z, s_rot;
+    if (this->last_gicp_valid_ && this->last_fitness_score_ >= 0.0) {
+      double f_sigma = kFitnessScale * std::sqrt(this->last_fitness_score_);
+      s_xy  = std::max(kBaseSigmaXY,  f_sigma);
+      s_z   = std::max(kBaseSigmaZ,   2.0 * f_sigma);
+      s_rot = std::max(kBaseSigmaRot, 0.1 * f_sigma);
+    } else {
+      double drift = kDeadReckon * static_cast<double>(this->consecutive_failures_);
+      s_xy  = kBaseSigmaXY  + drift;
+      s_z   = kBaseSigmaZ   + 2.0 * drift;
+      s_rot = kBaseSigmaRot + 0.05 * drift;
+    }
+    auto& c = odom_msg.pose.covariance;
+    c.fill(0.0);
+    c[0]  = s_xy  * s_xy;   // x
+    c[7]  = s_xy  * s_xy;   // y
+    c[14] = s_z   * s_z;    // z
+    c[21] = s_rot * s_rot;  // roll
+    c[28] = s_rot * s_rot;  // pitch
+    c[35] = s_rot * s_rot;  // yaw
+  }
+
   this->localized_odom_pub->publish(odom_msg);
 
   // Publish UTM-frame odometry
@@ -3181,7 +3221,7 @@ void gicp_localization::LocalizationNode::propagateState() {
         this->path_msg.poses.erase(this->path_msg.poses.begin());
       }
       this->path_msg.poses.push_back(pose_msg);
-      this->path_pub->publish(this->path_msg);
+      if (this->path_pub) this->path_pub->publish(this->path_msg);
     }
 
     if (this->publish_tf_) {
