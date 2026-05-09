@@ -1448,25 +1448,42 @@ gicp_localization::LocalizationNode::mergeAuxClouds(
 
     // Append aux bytes directly into merged->data, then transform xyz + shift
     // timestamps in place over the just-appended region. No intermediate copy.
+    // If validation fails after the append, roll back the resize so a malformed
+    // aux scan can't leak into the merged cloud in its own (un-transformed) frame.
     const size_t old_size = merged->data.size();
     merged->data.insert(merged->data.end(), match->data.begin(), match->data.end());
     uint8_t* appended = merged->data.data() + old_size;
     const size_t aux_pts = match->data.size() / point_step;
 
     int ax, ay, az;
-    if (findXYZOffsets(*match, ax, ay, az)) {
-      transformCloudData(appended, aux_pts, point_step, ax, ay, az, aux.T_primary_aux);
+    if (!findXYZOffsets(*match, ax, ay, az)) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "lidar_concat: skipping '%s' — no x/y/z fields in PointCloud2",
+                           aux.topic.c_str());
+      merged->data.resize(old_size);
+      continue;
     }
+    transformCloudData(appended, aux_pts, point_step, ax, ay, az, aux.T_primary_aux);
 
     int time_off;
     uint8_t time_dt_type;
     int time_count;
-    if (findTimeField(*match, time_off, time_dt_type, time_count)) {
+    const bool has_time_field = findTimeField(*match, time_off, time_dt_type, time_count);
+    if (has_time_field) {
       // dt = aux header - primary header. Adding dt rebases aux per-point times
       // onto the primary clock so deskewing sees one coherent sweep.
       const double dt = rclcpp::Time(match->header.stamp).seconds() - t_primary;
       const bool luminar_u64 = (this->sensor == dlio::SensorType::LUMINAR);
       shiftCloudTimestamps(appended, aux_pts, point_step, time_off, time_dt_type, time_count, dt, luminar_u64);
+    } else if (this->deskew_) {
+      // Without per-point timestamps the aux rays would deskew against the
+      // primary scan's IMU integration with a stale (aux-header) reference,
+      // smearing them. Drop the aux when deskew is enabled and times are absent.
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "lidar_concat: skipping '%s' — deskew enabled but no time field found",
+                           aux.topic.c_str());
+      merged->data.resize(old_size);
+      continue;
     }
 
     total_points += static_cast<size_t>(match->width) * match->height;
