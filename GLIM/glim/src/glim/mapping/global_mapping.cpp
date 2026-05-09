@@ -808,19 +808,19 @@ bool GlobalMapping::load(const std::string& path) {
     auto remove_loc = std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) {
       return dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get()) != nullptr || dynamic_cast<gtsam::PoseRotationPrior<gtsam::Pose3>*>(factor.get()) != nullptr;
     });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
+    logger->info("removed {} GNSS prior factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
 
     logger->info("removing damping factors");
     remove_loc =
       std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) { return dynamic_cast<gtsam_points::LinearDampingFactor*>(factor.get()) != nullptr; });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
+    logger->info("removed {} damping factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
 
-    logger->info("removing prior factors");
+    logger->info("removing generic pose prior factors");
     remove_loc =
       std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) { return dynamic_cast<gtsam::PriorFactor<gtsam::Pose3>*>(factor.get()) != nullptr; });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
+    logger->info("removed {} generic pose prior factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
 
     // rekey graph

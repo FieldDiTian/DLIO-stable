@@ -291,7 +291,7 @@ public:
 
         const auto& submap = submaps.back();
         // note: should use a more accurate information matrix
-        const auto model = gtsam::noiseModel::Isotropic::Information(prior_inf_scale.asDiagonal());
+        const auto model = gtsam::noiseModel::Diagonal::Precisions(prior_inf_scale);
         gtsam::NonlinearFactor::shared_ptr factor(new gtsam::PoseTranslationPrior<gtsam::Pose3>(X(submap->id), xyz, model));
         output_factors.push_back(factor);
 

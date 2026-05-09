@@ -1,7 +1,7 @@
 /**:
   ros__parameters:
 
-    use_sim_time: false
+    use_sim_time: true
 
     # Localization Parameters
     # Path to pre-built PCD map file
@@ -124,7 +124,7 @@
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
-    localization/debug/enable_pub: true
+    localization/debug/enable_pub: false
     localization/debug/enable_jump_log: false
     localization/debug/verbose_scan_log: false
     localization/debug/nano_gicp_lm_debug: false   # Enable only for short controlled replays
