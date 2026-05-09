@@ -106,6 +106,25 @@ public:
         const Eigen::Isometry3d T_imu_gnss = glim::compute_transform(urdf_transforms, urdf_imu_frame, urdf_gnss_frame);
         t_imu_gnss = T_imu_gnss.translation();
         logger->info("URDF lever arm t_imu_gnss ({} -> {}): [{:.4f}, {:.4f}, {:.4f}]", urdf_imu_frame, urdf_gnss_frame, t_imu_gnss.x(), t_imu_gnss.y(), t_imu_gnss.z());
+
+        // The lever-arm correction below assumes the GNSS message's orientation
+        // is the IMU body's rotation in world. That's true when the antenna
+        // frame is axis-aligned with the IMU frame (URDF rotation = identity)
+        // OR when the publisher fuses GNSS+IMU and reports IMU-body orientation
+        // directly (typical INS like Novatel SPAN, Septentrio AsteRx-i). When
+        // the URDF rotation is non-identity AND the publisher reports
+        // antenna-frame orientation, the lever arm is applied in the wrong
+        // frame. Warn so a future URDF tweak doesn't silently produce a bias.
+        const Eigen::Matrix3d R_imu_gnss = T_imu_gnss.linear();
+        if (!R_imu_gnss.isApprox(Eigen::Matrix3d::Identity(), 1e-3)) {
+          const double off_deg = Eigen::AngleAxisd(R_imu_gnss).angle() * 180.0 / M_PI;
+          logger->warn(
+            "URDF rotation between {} and {} is {:.2f} deg off identity; lever-arm "
+            "correction is correct only if the GNSS publisher reports IMU-body "
+            "orientation in world (e.g., an INS). Antenna-frame orientation will "
+            "be biased.",
+            urdf_imu_frame, urdf_gnss_frame, off_deg);
+        }
       } else {
         logger->info("URDF lever arm not configured (urdf_path/urdf_imu_frame/urdf_gnss_frame); GNSS positions used as-is");
       }
@@ -332,9 +351,13 @@ private:
     }
 
     // Lever-arm compensation: convert reported antenna position to IMU-origin position in UTM.
-    // p_imu_utm = p_antenna_utm - R_imu_utm * t_imu_gnss, where t_imu_gnss is in IMU body frame
-    // and gnss_data.orientation is assumed to be the IMU body orientation in UTM (same assumption
-    // used by the orientation prior).
+    //   p_imu_utm = p_antenna_utm - R_world_imu * t_imu_gnss
+    // where t_imu_gnss is the URDF translation (antenna origin in IMU body coords).
+    // ASSUMPTION: gnss_data.orientation == R_world_imu, i.e., the publisher reports
+    // the IMU body's rotation in world (true for INS-fused outputs like Novatel SPAN
+    // and Septentrio AsteRx-i, OR when the antenna is axis-aligned with the IMU per
+    // the URDF — see the rotation check at startup). If neither holds, the rotated
+    // lever arm is wrong and the prior pulls toward a biased position.
     if (t_imu_gnss.squaredNorm() > 0.0) {
       if (gnss_data.has_orientation) {
         gnss_data.position -= gnss_data.orientation * t_imu_gnss;
