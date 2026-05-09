@@ -4,17 +4,14 @@ ROS2 workspace for **GLIM** (Graph-based LiDAR-Inertial Mapping) maintained as a
 
 ## Overview
 
-This repository contains a monorepo-style workspace with:
+This directory is the GLIM workspace inside the [`augcog/DLIO_plusplus`](https://github.com/augcog/DLIO_plusplus) monorepo and contains:
 - `glim` for the core SLAM framework
 - `glim_ext` for extension modules
 - `glim_ros2` for ROS2 integration
 
-The current workspace state is primarily synced from the local `glim_ws` copy and then committed into this monorepo.
-
 ## Differences From Upstream GLIM
 
-- This fork keeps `glim`, `glim_ext`, and `glim_ros2` together in one repository instead of separate sibling repositories.
-- The monorepo contents are currently aligned to the versions in the local `glim_ws` workspace rather than the previous `ros2_ws` state.
+- This fork keeps `glim`, `glim_ext`, and `glim_ros2` together inside the parent `DLIO_plusplus` monorepo instead of as separate sibling repositories.
 - `glim` includes optional `flip_points_y` preprocessing support for mirrored LiDAR clouds.
 - `glim` includes packed LiDAR per-point timestamp parsing support for `UINT8[8]` timestamp fields.
 - `glim_ext` includes the GNSS-related modules and configs from the synced `glim_ws` copy.
@@ -106,13 +103,14 @@ sudo make install
 
 ### Clone and Build
 ```bash
-# Clone this repository
+# Clone the parent monorepo
 cd ~/ros2_ws/src
-git clone https://github.com/airacingtech/GLIM.git .
+git clone https://github.com/augcog/DLIO_plusplus.git
 
-# Build with colcon
+# Build the GLIM packages (use --packages-up-to to limit scope, or omit to build everything)
 cd ~/ros2_ws
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    --packages-up-to glim_ros
 
 # Source the workspace
 source install/setup.bash

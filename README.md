@@ -17,7 +17,7 @@ The configs target an AV-24 Cybertruck with:
 
 - 3× Luminar Iris LiDAR (`luminar_front` primary; `luminar_left`, `luminar_right` concatenated via URDF transforms)
 - Novatel INS publishing IMU on `/gps_na/imu` and odometry on `/localization/global/odom` (`novatel_a` URDF link is both `base_frame` and `imu_frame` in the localization config)
-- RTK GPS publishing `nav_msgs/msg/Odometry` on `/gps_nav/odom` (used by GLIM for the world-to-UTM transform)
+- RTK GPS publishing `nav_msgs/msg/Odometry` on `/gps_na/odom` (used by GLIM for the world-to-UTM transform)
 - Optional camera (used only by extension modules)
 
 Sensor extrinsics are derived from [`av24.urdf`](av24.urdf) at runtime; see `GLIM/glim/config/config_sensors.json` for the URDF frame names that drive the lookup.
@@ -74,8 +74,10 @@ If `ros2 pkg prefix glim` does not point inside this workspace's `install/`, you
 DLIO_plusplus/
 ├── GLIM/                # SLAM workspace (glim, glim_ext, glim_ros2)
 ├── gicp_localization/   # Map-based localization package
+├── dlio/                # Convenience metapackage that pulls all of the above
 ├── av24.urdf            # Vehicle URDF used for sensor extrinsics
 ├── CLAUDE.md            # Developer-facing project summary
+├── AGENTS.md            # Notes for AI reviewers (false positives, watch-conditions)
 └── README.md
 ```
 

@@ -22,7 +22,8 @@ GICP scan-to-map localization with IMU dead-reckoning and optional ground-truth-
 
 - ROS 2 Humble
 - PCL, Eigen3, OpenMP, nlohmann::json
-- `direct_lidar_inertial_odometry` (PointType + nano_gicp)
+- `PointType` and a vendored copy of `nano_gicp` ship inside this package; no
+  separate `direct_lidar_inertial_odometry` dependency is required.
 - For development: matplotlib (debug-script plots)
 
 ## Building
@@ -55,7 +56,7 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 |---|---|---|
 | `rviz` | `false` | Launch RViz with the bundled config. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
-| `imu_topic` | `/gps_bot/imu` | IMU topic. **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
+| `imu_topic` | `/gps_na/imu` | IMU topic. **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
 | `gt_odom_topic` | `/localization/global/odom` | Ground-truth odom (only used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`). |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
@@ -113,8 +114,8 @@ localization/gt_odom/enable:        true
 localization/gt_odom/buffer_size:   200      # ~2 s of history at 100 Hz
 localization/gt_odom/max_dt:        0.1      # max scan-to-GT lookup gap
 
-localization/gt_recovery/enable:                   false   # opt in; production-safe default
-localization/gt_recovery/min_consecutive_failures: 3       # snap after N consecutive non-accepts
+localization/gt_recovery/enable:                   true    # snap to GT after sustained GICP failure
+localization/gt_recovery/min_consecutive_failures: 1       # snap after N consecutive non-accepts
 ```
 
 When `gt_recovery/enable=true`, the node caches the `base_frame ← child_frame_id` TF on the first GT message and uses it to compose snap poses into `base_frame` (so the snap lands at the same reference point GICP normally tracks).
@@ -220,7 +221,7 @@ For UTM output, point `localization/utm_transform_path` at GLIM's `T_world_utm.t
 
 Symptoms: `imu_buffer_span=-1.000s` in SCAN DEBUG, `guess_from_last=0`, no "First IMU message received" log.
 
-Almost always a topic-mismatch problem. The launch arg is `imu_topic` (underscore). Passing `imu-topic:=/X` silently does nothing — the launch falls back to default `/gps_bot/imu` and your IMU subscription stays empty. Verify with:
+Almost always a topic-mismatch problem. The launch arg is `imu_topic` (underscore). Passing `imu-topic:=/X` silently does nothing — the launch falls back to default `/gps_na/imu` and your IMU subscription stays empty. Verify with:
 
 ```bash
 ros2 topic list | grep -i imu
