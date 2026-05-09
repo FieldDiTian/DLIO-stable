@@ -114,13 +114,19 @@ public:
 
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
 
-  // Override PCL's default getFitnessScore to reuse the squared distances cached
-  // by the last update_correspondences() call (inside align()). The default impl
-  // re-transforms the entire source cloud and runs a single-threaded kd-tree pass
-  // over the target — for a 9.7M-point map this costs ~10-30 ms/scan of pure
-  // duplicated work. The cached values are at the pose one LM step before
-  // convergence, so the fitness differs from the final pose by at most O(eps^2),
-  // which is well below typical fitness thresholds.
+  // Faster getFitnessScore that reuses sq_distances_ cached by the last
+  // update_correspondences() call (fired from linearize() inside align()).
+  // Avoids re-transforming the source and re-querying the target kd-tree —
+  // ~10-30 ms/scan against a 9.7M-point map. Returns max double when no
+  // fresh cache is available for the current input.
+  //
+  // Caveats:
+  // - Name-shadows pcl::Registration::getFitnessScore (which is non-virtual);
+  //   calls through a pcl::Registration<>* still hit the slow base impl.
+  // - The cached distances reflect the linearization-point pose used in the
+  //   last linearize() call, not the final post-update pose. For converged
+  //   scans the delta is sub-mm/sub-mrad and the score is effectively the
+  //   final-pose value; in non-converging cases it can lag by one LM step.
   double getFitnessScore(double max_range = std::numeric_limits<double>::max());
 
 protected:

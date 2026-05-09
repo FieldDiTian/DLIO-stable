@@ -208,6 +208,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(PointCloudSource&
     calculateTargetCovariances();
   }
 
+  // Invalidate the previous scan's cached distances so getFitnessScore() can't
+  // return stale data if the LM loop bails out before update_correspondences().
+  sq_distances_.clear();
+
   LsqRegistration<PointSource, PointTarget>::computeTransformation(output, guess);
 }
 
