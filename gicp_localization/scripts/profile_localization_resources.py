@@ -820,6 +820,8 @@ if rclpy is not None:
                 if args.stop_after_laps > 0
                 else "and runs until interrupted"
             )
+            if args.stop_after_seconds > 0.0:
+                stop_text += f", or after {args.stop_after_seconds:.1f}s"
             if args.stop_when_rosbag_ends:
                 stop_text += f", or {args.rosbag_end_grace_s:.1f}s after rosbag playback exits"
             self.get_logger().info(
@@ -952,6 +954,12 @@ def parse_args() -> argparse.Namespace:
         help="Stop after this many returns near the start pose. Use 0 to disable automatic lap stop.",
     )
     parser.add_argument(
+        "--stop-after-seconds",
+        type=float,
+        default=0.0,
+        help="Stop after this many wall-clock seconds. Use 0 to disable duration-based stopping.",
+    )
+    parser.add_argument(
         "--lap-radius-m",
         type=float,
         default=10.0,
@@ -1066,6 +1074,9 @@ def run_no_ros(args, start_wall_time: float, csv_bundle: CsvBundle, summary: Sum
     while not stop["requested"]:
         wall_time = time.time()
         roles_present = sampler.sample(wall_time, start_wall_time, None, csv_bundle, summary)
+        if args.stop_after_seconds > 0.0 and wall_time - start_wall_time >= args.stop_after_seconds:
+            print(f"Reached stop-after-seconds={args.stop_after_seconds:.1f}; stopping profiler.", flush=True)
+            break
         should_stop, message = update_rosbag_end_state(args, roles_present, wall_time, rosbag_state)
         if message:
             print(message, flush=True)
@@ -1108,6 +1119,12 @@ def run_ros(args, start_wall_time: float, csv_bundle: CsvBundle, summary: Summar
             if now_monotonic >= next_sample:
                 wall_time = time.time()
                 roles_present = sampler.sample(wall_time, start_wall_time, node.latest_clock_s, csv_bundle, summary)
+                if args.stop_after_seconds > 0.0 and wall_time - start_wall_time >= args.stop_after_seconds:
+                    node.get_logger().info(
+                        f"Reached stop-after-seconds={args.stop_after_seconds:.1f}; stopping profiler."
+                    )
+                    node.stop_requested = True
+                    break
                 should_stop, message = update_rosbag_end_state(args, roles_present, wall_time, rosbag_state)
                 if message:
                     node.get_logger().info(message)
@@ -1133,6 +1150,9 @@ def main() -> int:
         return 2
     if args.stop_after_laps < 0:
         print("--stop-after-laps must be >= 0", file=sys.stderr)
+        return 2
+    if args.stop_after_seconds < 0.0:
+        print("--stop-after-seconds must be >= 0", file=sys.stderr)
         return 2
     if args.lap_radius_m <= 0.0:
         print("--lap-radius-m must be > 0", file=sys.stderr)
