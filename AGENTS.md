@@ -116,7 +116,66 @@ correction will become biased. A startup warning was added in commit
 
 ---
 
-### 6. Things agent reviewers have hallucinated
+### 6. GNSS lever-arm double-compensation is not a live risk in the current config
+
+**Files**:
+- `GLIM/glim/config/config_ros.json` (`extension_modules` list)
+- `GLIM/glim/config/config_odometry_ins.json` (`urdf_ins_frame`)
+- `GLIM/glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp:361-368`
+
+**What it looks like**: the GNSS extension subtracts `R_world_imu * t_imu_gnss`
+from the reported GNSS position. If the Novatel receiver is also configured
+with `LEVERARMCONFIG`, both firmware and software would compensate, biasing
+the GNSS prior by ~0.6 m horizontal on AV-24 (the `novatel_a` →
+`gps_antenna_right` offset).
+
+**Why it's actually fine on AV-24 today**:
+- `libgnss_global.so` is **commented out** in `config_ros.json`'s
+  `extension_modules` block. The only site that applies the subtract is
+  never loaded, so mapping does not double-compensate.
+- The INS-driven odometry frontend (`libodometry_estimation_ins.so`) computes
+  its own `T_imu_ins` from URDF but resolves to identity in the current
+  config: `urdf_imu_frame: "novatel_a"` and `urdf_ins_frame: "novatel_a"`.
+- The localization node (`gicp_localization`) does not apply a GNSS
+  lever-arm correction at all; it consumes `/localization/global/odom`
+  as-is. The lever arm there is handled upstream by the INS voter / firmware.
+
+**Watch condition**: if `libgnss_global.so` is uncommented, or
+`urdf_ins_frame` is changed to a different link than `urdf_imu_frame`,
+verify the Novatel `LEVERARMCONFIG` state before merging — software
+compensation must only be on when the firmware is off, and vice versa.
+Setting `urdf_gnss_frame: ""` in `config_gnss_global.json` hard-disables
+the software side even if the extension is re-enabled.
+
+---
+
+### 7. The GT-recovery RTK gating lives upstream, not in our code
+
+**File**: `gicp_localization/src/localization.cc:2289-2370` (`callbackGtOdom`).
+
+**What it looks like**: `callbackGtOdom` ingests every odometry message it
+receives and pushes it into the buffer with no RTK / fix-status check.
+A reviewer might flag this as a missing guard — snap-back could fire from
+a degraded GNSS fix.
+
+**Why it's actually fine on AV-24**: `/localization/global/odom` is the
+voted output of three INS units and **stops publishing entirely when RTK
+is not fixed**. Gating is enforced at the source, so downstream code can
+trust whatever arrives. The 0.1 s `gt_odom/max_dt` window means a stalled
+upstream publisher cleanly defers snap-back (logged as
+`deferring snap — no GT sample within max_dt…`) rather than firing on
+stale data.
+
+**Watch condition**: if the upstream voter ever changes to keep publishing
+during RTK float or RTK-unavailable, a status-field check needs to be added
+to `callbackGtOdom` before pushing into the buffer. The joint failure mode
+to keep in mind is a low-feature LiDAR stretch coinciding with an RTK
+outage: GICP can't recover geometrically and the INS can't pull it back
+either, leaving the node on pure IMU dead-reckoning.
+
+---
+
+### 8. Things agent reviewers have hallucinated
 
 These were flagged by previous agent runs but **do not exist in the code**.
 If you find yourself about to flag one of these, double-check first.

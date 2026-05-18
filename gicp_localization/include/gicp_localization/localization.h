@@ -83,6 +83,11 @@ private:
   bool maybeSnapPoseToGT(const char* reason);
   void applyInitialPose(const Eigen::Vector3f& p, const Eigen::Quaternionf& q,
                         const rclcpp::Time& stamp, const std::string& source);
+  // RTK-driven calibration: accumulate one residual sample if a time-matched GT
+  // exists at `stamp`. Returns true if the calibration window has filled and
+  // biases were applied (caller should mark imu_calibrated_).
+  bool tryRtkCalibrationStep(double stamp, const Eigen::Vector3f& measured_gyro,
+                             const Eigen::Vector3f& measured_accel);
 
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
   void deskewPointcloud();
@@ -249,6 +254,27 @@ private:
   Eigen::Vector3f imu_calib_gyro_sum_;
   Eigen::Vector3f imu_calib_accel_sum_;
 
+  // RTK-driven IMU calibration (uses GT odom as truth source; allows calibrating
+  // while moving). Falls back to the stationary path above if no GT sample
+  // arrives within rtk_fallback_timeout_sec_ of the first IMU message.
+  enum class InitPhase { WAITING, RTK_CALIBRATING, STATIONARY_CALIBRATING, DONE };
+  std::atomic<InitPhase> init_phase_{InitPhase::WAITING};
+  bool rtk_init_enabled_;
+  double rtk_calib_window_sec_;
+  double rtk_fallback_timeout_sec_;
+  double first_imu_stamp_;                  // stamp of the first IMU msg (set on receipt)
+  double rtk_calib_start_stamp_;            // stamp of the first IMU sample paired with GT
+  int rtk_calib_count_;
+  Eigen::Vector3f rtk_gyro_bias_sum_;
+  Eigen::Vector3f rtk_accel_bias_sum_;
+  Eigen::Vector3f rtk_gyro_bias_sq_sum_;    // for residual stddev sanity check
+  Eigen::Vector3f rtk_accel_bias_sq_sum_;
+  bool has_prev_gt_for_accel_;
+  double prev_gt_stamp_;
+  Eigen::Vector3f prev_v_world_;
+  GtSample latest_rtk_seed_;                // latest GT sample, used to seed state at finalize
+  bool has_latest_rtk_seed_;
+
   // Pose tracking
   struct Pose {
     Eigen::Vector3f p;
@@ -394,6 +420,7 @@ private:
   bool visualize_map_;
   double map_voxel_size_vis_;
   rclcpp::TimerBase::SharedPtr map_pub_timer_;
+  rclcpp::TimerBase::SharedPtr input_health_timer_;
 
   // Pre-localization initial pose republisher (publishes initial guess + TF
   // until GICP produces a real result, so RViz has something to show).

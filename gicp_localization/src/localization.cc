@@ -297,6 +297,20 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->imu_calib_gyro_sum_ = Eigen::Vector3f::Zero();
   this->imu_calib_accel_sum_ = Eigen::Vector3f::Zero();
 
+  // Initialize RTK-driven calibration state
+  this->init_phase_ = InitPhase::WAITING;
+  this->first_imu_stamp_ = -1.0;
+  this->rtk_calib_start_stamp_ = -1.0;
+  this->rtk_calib_count_ = 0;
+  this->rtk_gyro_bias_sum_ = Eigen::Vector3f::Zero();
+  this->rtk_accel_bias_sum_ = Eigen::Vector3f::Zero();
+  this->rtk_gyro_bias_sq_sum_ = Eigen::Vector3f::Zero();
+  this->rtk_accel_bias_sq_sum_ = Eigen::Vector3f::Zero();
+  this->has_prev_gt_for_accel_ = false;
+  this->prev_gt_stamp_ = 0.0;
+  this->prev_v_world_ = Eigen::Vector3f::Zero();
+  this->has_latest_rtk_seed_ = false;
+
   // Initialize previous scan stamp
   this->prev_scan_stamp = 0.0;
   this->observer_dt_ = 0.0;
@@ -428,6 +442,35 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       "imu", imu_qos,
       std::bind(&gicp_localization::LocalizationNode::callbackImu, this, std::placeholders::_1),
       imu_sub_opt);
+
+  // IMU input health check. The most common silent failure is launching with an
+  // `imu_topic:=` arg that doesn't match any publisher — the subscription is
+  // created but callbacks never fire and there's nothing in the log to tell
+  // the user why. Fire a periodic timer that warns when no IMU has been
+  // received AND no publisher exists on the resolved topic name. The timer
+  // cancels itself once the first IMU arrives.
+  this->input_health_timer_ = this->create_wall_timer(
+      std::chrono::seconds(3),
+      [this]() {
+        if (this->first_imu_received.load()) {
+          this->input_health_timer_->cancel();
+          return;
+        }
+        const std::string imu_topic = this->imu_sub->get_topic_name();
+        const size_t pub_count = this->count_publishers(imu_topic);
+        if (pub_count == 0) {
+          RCLCPP_WARN(this->get_logger(),
+                      "No IMU received on '%s' (0 publishers). Check the imu_topic launch arg — "
+                      "common typos: '/gps_na/imu' vs '/gps_nav/imu'. Run "
+                      "`ros2 topic list | grep -i imu` to see available IMU topics.",
+                      imu_topic.c_str());
+        } else {
+          RCLCPP_WARN(this->get_logger(),
+                      "No IMU received on '%s' yet, but %zu publisher(s) exist. "
+                      "QoS mismatch or sim-time/clock issue is possible.",
+                      imu_topic.c_str(), pub_count);
+        }
+      });
 
   // Optional ground-truth odom subscriber for divergence cross-check.
   // Topic is remappable as "gt_odom"; default points to /localization/global/odom in launch.
@@ -768,6 +811,21 @@ void gicp_localization::LocalizationNode::getParams() {
   // IMU calibration time (seconds of stationary data to average for bias/gravity)
   this->declare_parameter<double>("dlio/imu/calibTime", 3.0);
   this->get_parameter("dlio/imu/calibTime", this->imu_calib_time_);
+
+  // RTK-driven IMU calibration. When enabled, the first message on the GT odom
+  // topic triggers a calibration window in which IMU residuals are computed
+  // against the GT pose/twist (no stationary assumption). Falls back to
+  // stationary calibration if no GT arrives within fallback_timeout seconds.
+  this->declare_parameter<bool>("localization/rtk_init/enable", true);
+  this->declare_parameter<double>("localization/rtk_init/calib_window", 2.0);
+  this->declare_parameter<double>("localization/rtk_init/fallback_timeout", 5.0);
+  this->get_parameter("localization/rtk_init/enable", this->rtk_init_enabled_);
+  this->get_parameter("localization/rtk_init/calib_window", this->rtk_calib_window_sec_);
+  this->get_parameter("localization/rtk_init/fallback_timeout", this->rtk_fallback_timeout_sec_);
+  RCLCPP_INFO(this->get_logger(),
+              "RTK-driven IMU calibration: %s (window=%.1fs, fallback_timeout=%.1fs)",
+              this->rtk_init_enabled_ ? "ENABLED" : "disabled",
+              this->rtk_calib_window_sec_, this->rtk_fallback_timeout_sec_);
 
   // Sensor type for per-point timestamp handling during deskewing
   this->declare_parameter<std::string>("localization/sensor_type", "ouster");
@@ -2418,6 +2476,136 @@ bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& ou
   return true;
 }
 
+// RTK-driven IMU bias calibration. Pairs each IMU sample with a time-matched GT
+// pose/twist and accumulates the bias residual. Linear acceleration in world
+// frame is estimated by finite-differencing v_world between successive paired
+// samples. On window fill, biases are averaged, the state is seeded from the
+// latest GT, imu_calibrated_ is flipped, and the function returns true.
+bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
+    double stamp, const Eigen::Vector3f& measured_gyro,
+    const Eigen::Vector3f& measured_accel) {
+  GtSample gt;
+  if (!this->getGtPoseAt(stamp, gt)) {
+    // GT not yet available at this IMU stamp (e.g., IMU briefly ahead of buffer).
+    // Don't error — just skip this sample.
+    return false;
+  }
+  this->latest_rtk_seed_ = gt;
+  this->has_latest_rtk_seed_ = true;
+
+  // Body acceleration in world frame, from finite-differencing v_world across
+  // consecutive paired samples. Skip the first sample (no derivative possible).
+  const Eigen::Matrix3f R = gt.q.toRotationMatrix();
+  const Eigen::Vector3f v_world = R * gt.v_lin_body;
+
+  if (!this->has_prev_gt_for_accel_) {
+    this->has_prev_gt_for_accel_ = true;
+    this->prev_gt_stamp_ = stamp;
+    this->prev_v_world_ = v_world;
+    return false;
+  }
+
+  const double dt = stamp - this->prev_gt_stamp_;
+  if (dt <= 1e-4) {
+    // Sample too close in time — derivative would explode. Skip.
+    return false;
+  }
+  const Eigen::Vector3f a_world = (v_world - this->prev_v_world_) / static_cast<float>(dt);
+  this->prev_gt_stamp_ = stamp;
+  this->prev_v_world_ = v_world;
+
+  // Specific-force convention: at rest body-upright, the IMU reads ~(0,0,+g) in body
+  // (confirmed by stationary-calibration gravity_dir output on this rig). Generalized
+  // to moving: expected_accel_body = R^T * (a_world + (0,0,+g)). Sign of g is +,
+  // not −, because the accelerometer measures proper acceleration (= inertial − g_world
+  // = inertial + (0,0,+g) when world Z points up).
+  const Eigen::Vector3f g_world(0.0f, 0.0f, +static_cast<float>(this->gravity_));
+  const Eigen::Vector3f expected_accel_body = R.transpose() * (a_world + g_world);
+  const Eigen::Vector3f expected_gyro_body = gt.v_ang_body;
+
+  const Eigen::Vector3f gyro_res = measured_gyro - expected_gyro_body;
+  const Eigen::Vector3f accel_res = measured_accel - expected_accel_body;
+
+  this->rtk_gyro_bias_sum_ += gyro_res;
+  this->rtk_accel_bias_sum_ += accel_res;
+  this->rtk_gyro_bias_sq_sum_ += gyro_res.cwiseProduct(gyro_res);
+  this->rtk_accel_bias_sq_sum_ += accel_res.cwiseProduct(accel_res);
+  this->rtk_calib_count_++;
+
+  const double elapsed = stamp - this->rtk_calib_start_stamp_;
+  if (elapsed < this->rtk_calib_window_sec_) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                         "IMU calibrating (RTK-driven)... %.1f/%.1fs (%d samples)",
+                         elapsed, this->rtk_calib_window_sec_, this->rtk_calib_count_);
+    return false;
+  }
+  if (this->rtk_calib_count_ < 2) {
+    // Window expired but we got essentially no useful pairings (e.g., GT buffer
+    // empty most of the window). Give up on RTK init and let the caller
+    // decide — return false but signal via a warn.
+    RCLCPP_WARN(this->get_logger(),
+                "RTK init: window expired with only %d residual samples; cannot calibrate. "
+                "Falling back to stationary path.", this->rtk_calib_count_);
+    this->init_phase_ = InitPhase::STATIONARY_CALIBRATING;
+    this->imu_calib_start_stamp_ = stamp;
+    return false;
+  }
+
+  const float n = static_cast<float>(this->rtk_calib_count_);
+  const Eigen::Vector3f gyro_bias = this->rtk_gyro_bias_sum_ / n;
+  const Eigen::Vector3f accel_bias = this->rtk_accel_bias_sum_ / n;
+
+  // Sanity check on the averaged bias magnitudes. Noise variance is not a useful
+  // signal here — finite-differencing GT velocity at IMU rate amplifies cm-level
+  // GPS noise into ~10 m/s² of accel-residual stddev even on a stationary vehicle.
+  // The mean averages that out cleanly, so we only reject if the averaged bias
+  // itself is implausible. Typical biases on real IMUs: gyro <0.05 rad/s,
+  // accel <0.3 m/s². Generous thresholds here so a moderately drifted IMU is
+  // still accepted.
+  if (gyro_bias.norm() > 1.0f || accel_bias.norm() > 5.0f) {
+    RCLCPP_WARN(this->get_logger(),
+                "RTK init: averaged bias magnitudes implausible (|gyro|=%.3f rad/s, "
+                "|accel|=%.3f m/s^2); falling back to stationary calibration",
+                gyro_bias.norm(), accel_bias.norm());
+    this->init_phase_ = InitPhase::STATIONARY_CALIBRATING;
+    this->imu_calib_start_stamp_ = stamp;
+    this->rtk_calib_count_ = 0;
+    this->rtk_gyro_bias_sum_.setZero();
+    this->rtk_accel_bias_sum_.setZero();
+    this->rtk_gyro_bias_sq_sum_.setZero();
+    this->rtk_accel_bias_sq_sum_.setZero();
+    return false;
+  }
+
+  // Apply biases + seed state from the latest GT sample.
+  this->state.b.gyro = gyro_bias;
+  this->state.b.accel = accel_bias;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    this->state.p = this->latest_rtk_seed_.p;
+    this->state.q = this->latest_rtk_seed_.q;
+    this->state.v.lin.b = this->latest_rtk_seed_.v_lin_body;
+    this->state.v.lin.w = this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_lin_body;
+    this->state.v.ang.b = this->latest_rtk_seed_.v_ang_body;
+    this->state.v.ang.w = this->latest_rtk_seed_.q * this->latest_rtk_seed_.v_ang_body;
+    this->geo.prev_p = this->latest_rtk_seed_.p;
+    this->geo.prev_q = this->latest_rtk_seed_.q;
+    this->geo.prev_vel = this->state.v.lin.w;
+  }
+
+  this->imu_calibrated_ = true;
+  RCLCPP_INFO(this->get_logger(),
+              "IMU calibrated (RTK-driven, %d samples, %.1fs): "
+              "gyro_bias=[%.4f,%.4f,%.4f] accel_bias=[%.3f,%.3f,%.3f] "
+              "seed_pos=[%.2f,%.2f,%.2f] seed_v=[%.2f,%.2f,%.2f]m/s",
+              this->rtk_calib_count_, elapsed,
+              gyro_bias.x(), gyro_bias.y(), gyro_bias.z(),
+              accel_bias.x(), accel_bias.y(), accel_bias.z(),
+              this->latest_rtk_seed_.p.x(), this->latest_rtk_seed_.p.y(), this->latest_rtk_seed_.p.z(),
+              this->state.v.lin.w.x(), this->state.v.lin.w.y(), this->state.v.lin.w.z());
+  return true;
+}
+
 bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) {
   // DIAGNOSTIC: prove helper is being called. Remove once snap behavior verified.
   RCLCPP_INFO(this->get_logger(),
@@ -2625,62 +2813,102 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
 
   if (!this->first_imu_received) {
     this->first_imu_received = true;
+    this->first_imu_stamp_ = stamp;
     RCLCPP_INFO(this->get_logger(), "First IMU message received");
+
+    // If RTK init is off entirely, go straight to the stationary path.
+    if (!this->rtk_init_enabled_ && this->init_phase_.load() == InitPhase::WAITING) {
+      this->init_phase_ = InitPhase::STATIONARY_CALIBRATING;
+    }
   }
 
-  // IMU calibration: accumulate gyro/accel over calibration period to estimate biases
-  // and gravity direction. Must happen after frame transform above.
+  // Calibration phase machine. We may be:
+  //   WAITING                 — RTK init enabled but no GT received yet
+  //   RTK_CALIBRATING         — first GT arrived; accumulating IMU residuals against GT truth
+  //   STATIONARY_CALIBRATING  — fallback (no GT in time, or RTK init disabled)
+  //   DONE                    — biases applied; propagate normally
   if (!this->imu_calibrated_) {
-    if (this->imu_calib_start_stamp_ < 0.0) {
-      this->imu_calib_start_stamp_ = stamp;
+    InitPhase phase = this->init_phase_.load();
+
+    if (phase == InitPhase::WAITING) {
+      if (this->gt_odom_received_.load()) {
+        // First GT sample has arrived — start RTK-driven calibration on the next IMU.
+        this->init_phase_ = InitPhase::RTK_CALIBRATING;
+        this->rtk_calib_start_stamp_ = stamp;
+        RCLCPP_INFO(this->get_logger(),
+                    "RTK init: GT odom received; starting RTK-driven IMU calibration "
+                    "(window=%.1fs)", this->rtk_calib_window_sec_);
+        phase = InitPhase::RTK_CALIBRATING;
+      } else if (stamp - this->first_imu_stamp_ > this->rtk_fallback_timeout_sec_) {
+        // No GT in time — fall back to stationary calibration.
+        RCLCPP_WARN(this->get_logger(),
+                    "RTK init: no GT odom within %.1fs of first IMU; falling back to "
+                    "stationary IMU calibration", this->rtk_fallback_timeout_sec_);
+        this->init_phase_ = InitPhase::STATIONARY_CALIBRATING;
+        this->imu_calib_start_stamp_ = stamp;  // reset so the existing window starts now
+        phase = InitPhase::STATIONARY_CALIBRATING;
+      } else {
+        // Keep waiting. Don't propagate.
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "RTK init: waiting for first GT odom (elapsed=%.1f/%.1fs)",
+                             stamp - this->first_imu_stamp_, this->rtk_fallback_timeout_sec_);
+        return;
+      }
     }
 
-    this->imu_calib_gyro_sum_ += ang_vel;
-    this->imu_calib_accel_sum_ += lin_accel;
-    this->imu_calib_count_++;
-
-    double elapsed = stamp - this->imu_calib_start_stamp_;
-    if (elapsed >= this->imu_calib_time_ && this->imu_calib_count_ > 0) {
-      // Compute average
-      Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
-      Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
-
-      // Gyro bias = average angular velocity at rest
-      this->state.b.gyro = gyro_avg;
-
-      // Gravity alignment: compute initial orientation from measured gravity direction.
-      // At rest, the accelerometer measures -gravity in body frame.
-      // We want to find a quaternion that rotates [0,0,-g] (world gravity) to accel_avg.
-      Eigen::Vector3f grav_world(0.f, 0.f, -1.f);
-      Eigen::Vector3f grav_body = accel_avg.normalized();
-      Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(grav_body, grav_world);
-
-      // Accel bias = measured - expected gravity in body frame
-      Eigen::Vector3f expected_grav_body = q_init.conjugate()._transformVector(
-          Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
-      this->state.b.accel = accel_avg - expected_grav_body;
-
-      // If initial pose was already set from params, keep that orientation.
-      // Otherwise use gravity-aligned orientation.
-      if (!this->use_param_initial_pose_) {
-        std::lock_guard<std::mutex> lock(this->geo.mtx);
-        this->state.q = q_init;
-        this->geo.prev_q = q_init;
+    if (phase == InitPhase::RTK_CALIBRATING) {
+      if (this->tryRtkCalibrationStep(stamp, ang_vel, lin_accel)) {
+        // tryRtkCalibrationStep applied biases + seeded state and set imu_calibrated_.
+        this->init_phase_ = InitPhase::DONE;
+      } else if (!this->imu_calibrated_) {
+        return;  // still accumulating — don't propagate
+      }
+    } else if (phase == InitPhase::STATIONARY_CALIBRATING) {
+      // Original stationary path: assume omega=0 and accel direction = gravity.
+      if (this->imu_calib_start_stamp_ < 0.0) {
+        this->imu_calib_start_stamp_ = stamp;
       }
 
-      this->imu_calibrated_ = true;
-      RCLCPP_INFO(this->get_logger(),
-                  "IMU calibrated (%d samples, %.1fs): gyro_bias=[%.4f,%.4f,%.4f] "
-                  "accel_bias=[%.3f,%.3f,%.3f] gravity_dir=[%.3f,%.3f,%.3f]",
-                  this->imu_calib_count_, elapsed,
-                  gyro_avg.x(), gyro_avg.y(), gyro_avg.z(),
-                  this->state.b.accel.x(), this->state.b.accel.y(), this->state.b.accel.z(),
-                  grav_body.x(), grav_body.y(), grav_body.z());
-    } else {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                           "IMU calibrating... %.1f/%.1fs (%d samples)",
-                           elapsed, this->imu_calib_time_, this->imu_calib_count_);
-      return;  // Don't propagate during calibration
+      this->imu_calib_gyro_sum_ += ang_vel;
+      this->imu_calib_accel_sum_ += lin_accel;
+      this->imu_calib_count_++;
+
+      double elapsed = stamp - this->imu_calib_start_stamp_;
+      if (elapsed >= this->imu_calib_time_ && this->imu_calib_count_ > 0) {
+        Eigen::Vector3f gyro_avg = this->imu_calib_gyro_sum_ / static_cast<float>(this->imu_calib_count_);
+        Eigen::Vector3f accel_avg = this->imu_calib_accel_sum_ / static_cast<float>(this->imu_calib_count_);
+
+        this->state.b.gyro = gyro_avg;
+
+        Eigen::Vector3f grav_world(0.f, 0.f, -1.f);
+        Eigen::Vector3f grav_body = accel_avg.normalized();
+        Eigen::Quaternionf q_init = Eigen::Quaternionf::FromTwoVectors(grav_body, grav_world);
+
+        Eigen::Vector3f expected_grav_body = q_init.conjugate()._transformVector(
+            Eigen::Vector3f(0.f, 0.f, -static_cast<float>(this->gravity_)));
+        this->state.b.accel = accel_avg - expected_grav_body;
+
+        if (!this->use_param_initial_pose_) {
+          std::lock_guard<std::mutex> lock(this->geo.mtx);
+          this->state.q = q_init;
+          this->geo.prev_q = q_init;
+        }
+
+        this->imu_calibrated_ = true;
+        this->init_phase_ = InitPhase::DONE;
+        RCLCPP_INFO(this->get_logger(),
+                    "IMU calibrated (stationary, %d samples, %.1fs): gyro_bias=[%.4f,%.4f,%.4f] "
+                    "accel_bias=[%.3f,%.3f,%.3f] gravity_dir=[%.3f,%.3f,%.3f]",
+                    this->imu_calib_count_, elapsed,
+                    gyro_avg.x(), gyro_avg.y(), gyro_avg.z(),
+                    this->state.b.accel.x(), this->state.b.accel.y(), this->state.b.accel.z(),
+                    grav_body.x(), grav_body.y(), grav_body.z());
+      } else {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "IMU calibrating (stationary)... %.1f/%.1fs (%d samples)",
+                             elapsed, this->imu_calib_time_, this->imu_calib_count_);
+        return;
+      }
     }
   }
 
