@@ -95,13 +95,24 @@ public:
     // urdf_gnss_frame is gnss_global-specific (e.g., "gps_antenna_top").
     t_imu_gnss.setZero();
     warned_missing_orientation_for_lever_arm = false;
+
+    // Explicit master switch. Tightly-coupled INS receivers (Novatel SPAN,
+    // Septentrio AsteRx-i, Atlas Duo, ...) compensate the antenna->IMU lever
+    // arm in firmware via LEVERARMCONFIG; doing it here as well would
+    // double-compensate. Default true to preserve upstream raw-GNSS behavior,
+    // but the shipped config sets it false for this vehicle.
+    const bool enable_lever_arm = config.param<bool>("gnss", "enable_lever_arm", true);
+    if (!enable_lever_arm) {
+      logger->info("lever-arm compensation explicitly disabled via gnss.enable_lever_arm=false; t_imu_gnss=0");
+    }
+
     try {
       glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
       const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
       const std::string urdf_imu_frame = config_sensors.param<std::string>("sensors", "urdf_imu_frame", "");
       const std::string urdf_gnss_frame = config.param<std::string>("gnss", "urdf_gnss_frame", "");
 
-      if (!urdf_path.empty() && !urdf_imu_frame.empty() && !urdf_gnss_frame.empty()) {
+      if (enable_lever_arm && !urdf_path.empty() && !urdf_imu_frame.empty() && !urdf_gnss_frame.empty()) {
         const auto urdf_transforms = glim::parse_urdf_transforms(urdf_path);
         const Eigen::Isometry3d T_imu_gnss = glim::compute_transform(urdf_transforms, urdf_imu_frame, urdf_gnss_frame);
         t_imu_gnss = T_imu_gnss.translation();
@@ -125,7 +136,7 @@ public:
             "be biased.",
             urdf_imu_frame, urdf_gnss_frame, off_deg);
         }
-      } else {
+      } else if (enable_lever_arm) {
         logger->info("URDF lever arm not configured (urdf_path/urdf_imu_frame/urdf_gnss_frame); GNSS positions used as-is");
       }
     } catch (const std::exception& e) {

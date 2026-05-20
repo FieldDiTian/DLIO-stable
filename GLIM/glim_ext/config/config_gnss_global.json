@@ -16,11 +16,24 @@
       1e-6,
       1e2
     ],
-    // Name of the GNSS antenna link in the URDF. The IMU->antenna transform is read at startup
-    // from urdf_path/urdf_imu_frame in config_sensors.json, and only the translation (lever arm)
-    // is used to correct the reported antenna position to the IMU origin in UTM.
-    // Requires the GNSS message to publish orientation; otherwise compensation is skipped.
-    // Leave empty to disable lever-arm compensation. Examples: "gps_antenna_top", "gps_antenna_front".
-    "urdf_gnss_frame": "gps_antenna_right"
+    // Software antenna -> IMU lever-arm compensation.
+    //
+    // Set to FALSE for tightly-coupled INS receivers (Novatel SPAN, Septentrio
+    // AsteRx-i, Atlas Duo, etc.) where the firmware already resolves antenna
+    // observations to the IMU origin internally via LEVERARMCONFIG. Applying
+    // the correction here as well would double-compensate.
+    //
+    // Set to TRUE only for raw-GNSS publishers that report antenna-frame
+    // position. The lever arm is then read from the URDF using urdf_gnss_frame
+    // below.
+    //
+    // Current vehicle (AV-24 Cybertruck, Novatel INS): firmware compensates,
+    // so this stays false. Leaving the urdf_gnss_frame populated would still
+    // be ignored, but we also blank it for belt-and-suspenders clarity.
+    "enable_lever_arm": false,
+    // URDF link name of the GNSS antenna. Only consulted when
+    // enable_lever_arm is true. Empty string means "no lever arm".
+    // Examples: "gps_antenna_top", "gps_antenna_front".
+    "urdf_gnss_frame": ""
   }
 }

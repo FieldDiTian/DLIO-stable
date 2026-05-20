@@ -25,7 +25,20 @@ All sensor extrinsics are resolved at runtime from [`av24.urdf`](av24.urdf); the
 
 ### GNSS lever-arm policy
 
-The Novatel firmware compensates the antenna-to-IMU lever arm internally (when `LEVERARMCONFIG` is set on the receiver), so the software side stays **off** to avoid double-compensation. With the current INS-based mapping configuration this is enforced by construction: the GLIM GNSS extension that would apply the subtract is not loaded, and the INS odometry frontend uses identity URDF frames. If the GNSS extension is ever turned back on, verify the receiver's compensation state first — only one side should be doing the correction.
+The Novatel firmware compensates the antenna-to-IMU lever arm internally (when `LEVERARMCONFIG` is set on the receiver), so the software side stays **off** to avoid double-compensation. The disable is explicit in three independent places — any one is sufficient:
+
+1. **Config flag** — `GLIM/glim_ext/config/config_gnss_global.json` sets `"enable_lever_arm": false`. This is the grep-able single source of truth.
+2. **Empty antenna frame** — same file sets `"urdf_gnss_frame": ""`. With this empty, the URDF lookup is skipped and `t_imu_gnss` stays zero even if the flag check were bypassed.
+3. **Module not loaded** — `GLIM/glim/config/config_ros.json` keeps `libgnss_global.so` commented out of `extension_modules`, so the code path does not execute in the current INS-based mapping pipeline.
+
+To verify the disable in one command:
+
+```bash
+grep enable_lever_arm GLIM/glim_ext/config/config_gnss_global.json
+# expected: "enable_lever_arm": false,
+```
+
+If the module ever loads with this config, it logs `lever-arm compensation explicitly disabled via gnss.enable_lever_arm=false; t_imu_gnss=0` at startup. If the GNSS extension is ever turned back on, verify the receiver's `LEVERARMCONFIG` state first and flip the flag accordingly — only one side should be doing the correction.
 
 ### Recovery during GICP failures
 
@@ -52,8 +65,18 @@ When the `imu_topic:=` launch arg points at a non-existent topic, the subscripti
    ros2 run glim_ros glim_rosbag <bag_path> --ros-args -p dump_path:=/tmp/dump
    ```
    Outputs `graph.bin`, `traj_lidar.txt`, `odom_lidar.txt`, numbered submap point clouds, and `T_world_utm.txt` (GNSS-to-map SE(3)) into `dump_path`.
-3. **Convert** submaps into a single PCD map (use `glim_ros offline_viewer` or a custom merger).
+3. **Convert** submaps into a single PCD map by opening the dump in `glim_ros offline_viewer` and exporting to PLY (then to PCD via `gicp_localization/scripts/convert_ply_to_pcd.py`). The GUI step is **intentional, not a gap** — see "Why the offline_viewer step is manual" below.
 4. **Localize** online against that PCD map with `gicp_localization`. Point the launch file at the PCD and (optionally) the matching `T_world_utm.txt`.
+
+### Why the offline_viewer step is manual
+
+A reviewer reasonably asks: why not auto-merge the per-submap directories into a single PCD with a script? Because the viewer pass is the QA stage for the mapping output, and skipping it would silently push bad maps into the localizer:
+
+- **Visual inspection** of the assembled map before it's frozen as the localization reference catches drift, ghosting, and bad submaps that would otherwise propagate into GICP at runtime.
+- **Post-hoc global optimization** — the viewer prompts "Do optimization?" on load (see `offline_viewer.cpp:191`) and re-runs the iSAM2 backend over the full graph, which can improve the dump beyond what the online pass produced.
+- **Manual loop closure** — `manual_loop_close_modal` lets the operator add constraints when the automatic detector misses a loop (common on long highway runs with weak geometry).
+
+A blind `merge_glim_submaps.py` would skip all three and bake any unresolved drift into the PCD. Adding such a script as a dev-only "quick-look" mode is reasonable, but it must not become the default mapping→localization handoff.
 
 ## Build
 
