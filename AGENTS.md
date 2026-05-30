@@ -261,3 +261,7 @@ When reviewing this codebase:
 3. If you confirm a previously-documented non-issue has become a real
    issue (e.g., URDF rpy added per #5 watch-condition), update this file
    in the same commit as the fix.
+
+## Imported Claude Cowork project instructions
+
+Improve the GICP localization algorithm by integrating with a race car platform and two integrated GNSS systems, one for NovAtel, one for vectorNav

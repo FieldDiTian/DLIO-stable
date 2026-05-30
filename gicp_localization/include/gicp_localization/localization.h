@@ -299,6 +299,9 @@ private:
   boost::circular_buffer<ImuMeas> imu_buffer;
   std::mutex mtx_imu;
   std::atomic<bool> first_imu_received;
+  bool imu_require_topic_allowlist_{true};
+  std::vector<std::string> imu_topic_allowlist_;
+  bool imu_require_frame_match_{true};
   // One-shot guard for the defensive IMU header.frame_id consistency check
   // in callbackImu. Single-source NA design assumes every IMU message comes
   // from /gps_na/imu and is referenced at imu_frame (= "novatel_a" in yaml).

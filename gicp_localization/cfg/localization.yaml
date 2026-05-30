@@ -149,6 +149,12 @@
     dlio/deskew: false  # Disabled: Luminar per-point timestamps are collapsed, so deskewing has no effect
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
+    # Hard guard on IMU topic remap. When true, node startup fails unless the
+    # resolved imu topic is in topic_allowlist (default: /gps_na/imu).
+    localization/imu/require_topic_allowlist: true
+    localization/imu/topic_allowlist: ["/gps_na/imu"]
+    # Reject IMU samples whose message frame_id does not match imu_frame.
+    localization/imu/require_frame_match: true
     dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable)
 
     # RTK-driven IMU calibration: use the GT odom topic (the voted INS / RTK output)

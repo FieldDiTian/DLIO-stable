@@ -587,6 +587,29 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       "imu", imu_qos,
       std::bind(&gicp_localization::LocalizationNode::callbackImu, this, std::placeholders::_1),
       imu_sub_opt);
+  const std::string resolved_imu_topic = this->imu_sub->get_topic_name();
+  if (this->imu_require_topic_allowlist_) {
+    const bool allowed = std::find(this->imu_topic_allowlist_.begin(),
+                                   this->imu_topic_allowlist_.end(),
+                                   resolved_imu_topic) != this->imu_topic_allowlist_.end();
+    if (!allowed) {
+      std::ostringstream oss;
+      for (size_t i = 0; i < this->imu_topic_allowlist_.size(); ++i) {
+        if (i) oss << ", ";
+        oss << this->imu_topic_allowlist_[i];
+      }
+      RCLCPP_FATAL(this->get_logger(),
+                   "IMU topic hard guard triggered: resolved topic '%s' is not in allowlist [%s]. "
+                   "Expected fused NovAtel IMU path.",
+                   resolved_imu_topic.c_str(), oss.str().c_str());
+      throw std::runtime_error("IMU topic hard guard mismatch");
+    }
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "IMU input topic: %s (expect NovAtel INS IMU, frame='%s', strict_frame_match=%s)",
+              resolved_imu_topic.c_str(),
+              this->imu_frame.c_str(),
+              this->imu_require_frame_match_ ? "true" : "false");
 
   // IMU input health check. The most common silent failure is launching with an
   // `imu_topic:=` arg that doesn't match any publisher — the subscription is
@@ -1011,6 +1034,20 @@ void gicp_localization::LocalizationNode::getParams() {
   // IMU calibration time (seconds of stationary data to average for bias/gravity)
   this->declare_parameter<double>("dlio/imu/calibTime", 3.0);
   this->get_parameter("dlio/imu/calibTime", this->imu_calib_time_);
+  // Hard guard for single-source NA deployments: by default the localizer only
+  // accepts an IMU subscription resolved to /gps_na/imu.
+  this->declare_parameter<bool>("localization/imu/require_topic_allowlist", true);
+  this->declare_parameter<std::vector<std::string>>(
+      "localization/imu/topic_allowlist", std::vector<std::string>{"/gps_na/imu"});
+  this->get_parameter("localization/imu/require_topic_allowlist", this->imu_require_topic_allowlist_);
+  this->get_parameter("localization/imu/topic_allowlist", this->imu_topic_allowlist_);
+  if (this->imu_topic_allowlist_.empty()) {
+    this->imu_topic_allowlist_.push_back("/gps_na/imu");
+  }
+  // Safety guard: reject IMU samples whose header.frame_id does not match
+  // localization/imu_frame. Keep enabled by default for NovAtel-only operation.
+  this->declare_parameter<bool>("localization/imu/require_frame_match", true);
+  this->get_parameter("localization/imu/require_frame_match", this->imu_require_frame_match_);
 
   // RTK-driven IMU calibration. When enabled, the first message on the GT odom
   // topic triggers a calibration window in which IMU residuals are computed
@@ -3175,9 +3212,11 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   // identity in our yaml. Atomic exchange ensures the warning fires exactly
   // once even under the Reentrant callback group. Empty frame_id is tolerated
   // (some drivers leave it unset); only an explicit mismatch trips the warn.
+  const bool imu_frame_mismatch =
+      !imu->header.frame_id.empty() &&
+      imu->header.frame_id != this->imu_frame;
   if (!this->imu_frame_id_checked_.exchange(true)) {
-    if (!imu->header.frame_id.empty() &&
-        imu->header.frame_id != this->imu_frame) {
+    if (imu_frame_mismatch) {
       RCLCPP_WARN(this->get_logger(),
                   "IMU header.frame_id='%s' does not match configured "
                   "localization/imu_frame='%s'. Treating the IMU axes and "
@@ -3190,6 +3229,12 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
                   this->imu_frame.c_str(),
                   this->imu_frame.c_str());
     }
+  }
+  if (imu_frame_mismatch && this->imu_require_frame_match_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "Rejecting IMU sample: header.frame_id='%s' != localization/imu_frame='%s'",
+                         imu->header.frame_id.c_str(), this->imu_frame.c_str());
+    return;
   }
 
   // Cache IMU-to-baselink transform from TF (once)
