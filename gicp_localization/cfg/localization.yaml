@@ -157,13 +157,16 @@
     localization/imu/require_frame_match: true
     dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable)
 
-    # RTK-driven IMU calibration: use the GT odom topic (the voted INS / RTK output)
-    # as the truth source for bias estimation. Lets the vehicle calibrate while
-    # moving and seeds pose+velocity from the first RTK-fixed sample rather than
-    # assuming stationary. Presence of a message on the GT topic is taken to mean
-    # "RTK is fixed" — the upstream voter is expected to stop publishing when not
-    # fixed. If no GT message arrives within rtk_init/fallback_timeout seconds of
-    # the first IMU sample, the node falls back to the stationary path above.
+    # RTK-driven IMU calibration: use the post-gate GT odom buffer as the truth
+    # source for bias estimation. Lets the vehicle calibrate while moving and
+    # seeds pose+velocity from the first RTK-fixed sample rather than assuming
+    # stationary. With localization/rtk_gate/enable=true, gt_odom samples are
+    # accepted only after BESTGNSSPOS reports a fresh RTK-fixed status, so
+    # gt_odom_received_ means "a gated RTK-fixed sample arrived." If the gate is
+    # disabled for bag-replay diagnostics, this guarantee is removed and RTK init
+    # may seed from whatever the gt_odom topic publishes. If no accepted GT
+    # message arrives within rtk_init/fallback_timeout seconds of the first IMU
+    # sample, the node falls back to the stationary path above.
     localization/rtk_init/enable: true
     localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
     localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback

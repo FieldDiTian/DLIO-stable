@@ -265,3 +265,18 @@ When reviewing this codebase:
 ## Imported Claude Cowork project instructions
 
 Improve the GICP localization algorithm by integrating with a race car platform and two integrated GNSS systems, one for NovAtel, one for vectorNav
+
+### Current scope clarification: single-source NovAtel is intentional
+
+The imported objective above mentions two integrated GNSS systems
+(NovAtel + VectorNav), but the current `art-jazzy` implementation deliberately
+narrowed the localization runtime to the NovAtel (`/gps_na/*`) path. This is
+not an accidental omission: the safe race-day design keeps IMU, GT odom, RTK
+status, `base_frame`, and `imu_frame` aligned at `novatel_a`, then gates
+`/gps_na/filtered_odom` with NovAtel `BESTGNSSPOS` before using it for init,
+cross-check, calibration, or snap recovery.
+
+Do not review the absence of VectorNav fusion as a bug in the current branch.
+Treat VectorNav integration as future scope requiring an explicit design for
+source selection/voting, frame targets, RTK/fix-status semantics, and failure
+fallbacks before it is enabled in `gicp_localization`.

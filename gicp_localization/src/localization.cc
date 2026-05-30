@@ -1049,10 +1049,12 @@ void gicp_localization::LocalizationNode::getParams() {
   this->declare_parameter<bool>("localization/imu/require_frame_match", true);
   this->get_parameter("localization/imu/require_frame_match", this->imu_require_frame_match_);
 
-  // RTK-driven IMU calibration. When enabled, the first message on the GT odom
-  // topic triggers a calibration window in which IMU residuals are computed
-  // against the GT pose/twist (no stationary assumption). Falls back to
-  // stationary calibration if no GT arrives within fallback_timeout seconds.
+  // RTK-driven IMU calibration. When enabled, the first accepted GT odom
+  // sample triggers a calibration window in which IMU residuals are computed
+  // against the GT pose/twist (no stationary assumption). With the RTK gate
+  // enabled, "accepted" means BESTGNSSPOS reported a fresh RTK-fixed status;
+  // disabling the gate for bag replay removes that guarantee. Falls back to
+  // stationary calibration if no accepted GT arrives within fallback_timeout.
   this->declare_parameter<bool>("localization/rtk_init/enable", true);
   this->declare_parameter<double>("localization/rtk_init/calib_window", 2.0);
   this->declare_parameter<double>("localization/rtk_init/fallback_timeout", 5.0);
@@ -3277,11 +3279,10 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   Eigen::Vector3f ang_vel_bl = R * ang_vel;
   Eigen::Vector3f lin_accel_bl = R * lin_accel;
 
-  // Lever-arm compensation: account for centripetal and tangential acceleration
-  // at the IMU location offset from baselink origin
-  // a_baselink = a_imu + omega x (omega x t) + alpha x t
-  // We approximate alpha ~ 0 (angular acceleration term is small at 100Hz)
-  lin_accel_bl += ang_vel_bl.cross(ang_vel_bl.cross(t));
+  // Lever-arm compensation: t is base->IMU, so r_IMU->base = -t.
+  // a_base = a_imu - omega x (omega x t) - alpha x t; alpha is approximated
+  // as zero because the angular-acceleration term is small at 100 Hz.
+  lin_accel_bl -= ang_vel_bl.cross(ang_vel_bl.cross(t));
 
   ang_vel = ang_vel_bl;
   lin_accel = lin_accel_bl;

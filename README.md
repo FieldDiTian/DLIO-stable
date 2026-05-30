@@ -17,11 +17,17 @@ Each subpackage has its own README (`GLIM/README.md`, `gicp_localization/README.
 The configs target an AV-24 Cybertruck instrumented with:
 
 - **3× Luminar Iris LiDAR** — `luminar_front` is the primary sensor; `luminar_left` and `luminar_right` are concatenated into the primary cloud via URDF transforms.
-- **Novatel INS** publishing IMU on `/gps_na/imu` and odometry on `/localization/global/odom`. The URDF link `novatel_a` is used as both `base_frame` and `imu_frame` in the localization config. The INS odom topic is the voted output of three INS units and **stops publishing when RTK is not fixed** — downstream gating relies on this contract rather than checking a status field.
+- **Novatel INS** publishing IMU on `/gps_na/imu` and odometry on `/gps_na/filtered_odom`. The URDF link `novatel_a` is used as both `base_frame` and `imu_frame` in the localization config. The localization node gates this odometry with NovAtel `BESTGNSSPOS` status before using it for initialization, diagnostics, or recovery.
 - **RTK GPS** publishing `nav_msgs/msg/Odometry` on `/gps_na/odom`, consumed by GLIM's GNSS extension to recover the world-to-UTM transform.
 - Optional camera (used only by extension modules).
 
 All sensor extrinsics are resolved at runtime from [`av24.urdf`](av24.urdf); the `*_frame` strings in the configs are URDF link names, not free-form labels.
+
+Current localization scope is intentionally single-source NovAtel. Earlier
+project notes mention both NovAtel and VectorNav GNSS integration, but
+`gicp_localization` does not currently fuse or vote across VectorNav. Adding
+VectorNav back is future work and needs a fresh source-selection and
+fix-status design rather than a topic remap.
 
 ### GNSS lever-arm policy
 
@@ -42,15 +48,14 @@ If the module ever loads with this config, it logs `lever-arm compensation expli
 
 ### Recovery during GICP failures
 
-In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting, the node snaps pose and velocity to the latest voted-INS sample so a trustworthy external estimate can pull GICP back to a known-good state. Because the INS topic stops publishing on RTK loss, a coincident RTK outage and low-feature stretch leaves the node on pure IMU dead-reckoning until either condition clears.
+In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting, the node snaps pose and velocity to the latest NovAtel INS sample that passed the RTK fix-status gate. If RTK status is missing, stale, or not fixed, GT samples are rejected and the node stays on IMU dead-reckoning until either LiDAR geometry or RTK quality recovers.
 
 ### Initialization: RTK-driven IMU calibration
 
-By default the localizer uses the voted-INS GT odom topic to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first RTK-fixed sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no GT odom is received within a configurable timeout. Presence of a message on the GT topic is taken to mean "RTK is fixed" — gating is enforced upstream by the voter, not by an explicit status check here. Knobs live under `localization/rtk_init/*` in the localization yaml.
+By default the localizer uses the post-gate NovAtel GT odom stream to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first RTK-fixed sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no gated GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the localizer enforces RTK-fixed status itself using `BESTGNSSPOS`; disabling the gate for bag replay removes that guarantee. Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
 
-### Safeguards still currently OFF
+### Remaining tuning work
 
-- **Explicit RTK fix-status gate.** GNSS samples flow into both GLIM and the localizer's recovery path with no in-code check that the fix is RTK-fixed. The implicit gate is that `/localization/global/odom` stops publishing when RTK isn't fixed; a future voter change could silently let degraded samples through. A consumer-side check is on the TODO list.
 - **LiDAR-specific hyperparameter tuning.** Motion-model tuning is in place for race-car dynamics, but the lidar density/range parameters (preprocessing downsample target, voxel-resolution fade horizons) are still close to GLIM's defaults, which were chosen for a lower-density rotary lidar at indoor-to-short-outdoor ranges. Retuning these for Luminar is on the TODO list; current values are workable but not optimal.
 
 ### Diagnostic: silent IMU subscription failures
