@@ -104,6 +104,10 @@ private:
   // composition is a no-op (gt_p_in_base == gt.p, gt_q_in_base == gt.q).
   bool composeGtPoseInBase(const GtSample& gt, Eigen::Vector3f& p_out,
                            Eigen::Quaternionf& q_out) const;
+  // Compose GT twist from gt_body into base_frame using the cached
+  // T_base_gtbody_ extrinsic. Returns false when gt extrinsics are unavailable.
+  bool composeGtTwistInBase(const GtSample& gt, Eigen::Vector3f& v_lin_body_out,
+                            Eigen::Vector3f& v_ang_body_out) const;
   // GT-driven pose recovery. Returns true when the snap fired (guards passed and
   // a time-matched GT sample with finite extrinsic was applied to the state).
   bool maybeSnapPoseToGT(const char* reason);
@@ -259,7 +263,6 @@ private:
   pcl::PointCloud<PointType>::Ptr map_cloud;
   pcl::PointCloud<PointType>::Ptr map_cloud_ds; // downsampled for visualization
   std::shared_ptr<const nano_gicp::CovarianceList> map_normals;
-  std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> map_kdtree;
 
   // Current scan
   pcl::PointCloud<PointType>::Ptr current_scan;
@@ -339,7 +342,8 @@ private:
     Eigen::Vector3f p;
     Eigen::Quaternionf q;
   };
-  Pose lidarPose;
+  // Tracked base-frame pose in map.
+  Pose basePose;
   Eigen::Vector3f prev_vel;
 
   // Geometric Observer State
@@ -440,7 +444,6 @@ private:
   double gravity_;
   int imu_buffer_size_;
   bool flip_y_;
-  bool is_luminar_;  // Luminar LiDAR: timestamp field is uint64 hardware ns, not Unix epoch
 
   // Geometric observer parameters
   double geo_Kp_;

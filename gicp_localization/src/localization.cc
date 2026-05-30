@@ -180,6 +180,151 @@ bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
   return false;
 }
 
+// Luminar stores hardware-clock ns in the timestamp union slot (8 raw bytes, not IEEE double).
+inline uint64_t luminarPointTimestampNs(const PointType& pt) {
+  uint64_t ts = 0;
+  std::memcpy(&ts, &pt.timestamp, sizeof(uint64_t));
+  return ts;
+}
+
+inline void clearPointTimeUnion(PointType& pt) {
+  const uint64_t zero = 0;
+  std::memcpy(&pt.timestamp, &zero, sizeof(uint64_t));
+}
+
+// Copy per-point time from PointCloud2 into the dlio::Point union for the configured sensor.
+void copyPointTimeFromCloud(const uint8_t* src, int time_off, uint8_t time_datatype, int time_count,
+                           dlio::SensorType sensor, PointType& dst) {
+  if (time_off < 0) {
+    return;
+  }
+  const uint8_t* tp = src + time_off;
+
+  switch (sensor) {
+    case dlio::SensorType::LUMINAR: {
+      uint64_t ts_raw = 0;
+      if (time_datatype == sensor_msgs::msg::PointField::FLOAT64 ||
+          (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8)) {
+        std::memcpy(&ts_raw, tp, sizeof(uint64_t));
+      } else if (time_datatype == sensor_msgs::msg::PointField::UINT32) {
+        uint32_t ts_ns32 = 0;
+        std::memcpy(&ts_ns32, tp, sizeof(uint32_t));
+        ts_raw = static_cast<uint64_t>(ts_ns32);
+      } else {
+        return;
+      }
+      std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
+      return;
+    }
+    case dlio::SensorType::OUSTER: {
+      uint32_t t_ns = 0;
+      switch (time_datatype) {
+        case sensor_msgs::msg::PointField::UINT32:
+          std::memcpy(&t_ns, tp, sizeof(uint32_t));
+          break;
+        case sensor_msgs::msg::PointField::FLOAT32: {
+          float t_s = 0.f;
+          std::memcpy(&t_s, tp, sizeof(float));
+          t_ns = static_cast<uint32_t>(t_s * 1e9f);
+          break;
+        }
+        case sensor_msgs::msg::PointField::FLOAT64: {
+          double t_s = 0.;
+          std::memcpy(&t_s, tp, sizeof(double));
+          t_ns = static_cast<uint32_t>(t_s * 1e9);
+          break;
+        }
+        default:
+          break;
+      }
+      dst.t = t_ns;
+      return;
+    }
+    case dlio::SensorType::VELODYNE: {
+      float t_s = 0.f;
+      switch (time_datatype) {
+        case sensor_msgs::msg::PointField::FLOAT32:
+          std::memcpy(&t_s, tp, sizeof(float));
+          break;
+        case sensor_msgs::msg::PointField::UINT32: {
+          uint32_t t_ns = 0;
+          std::memcpy(&t_ns, tp, sizeof(uint32_t));
+          t_s = static_cast<float>(t_ns * 1e-9);
+          break;
+        }
+        default:
+          break;
+      }
+      dst.time = t_s;
+      return;
+    }
+    case dlio::SensorType::HESAI: {
+      double t_s = 0.;
+      switch (time_datatype) {
+        case sensor_msgs::msg::PointField::FLOAT64:
+          std::memcpy(&t_s, tp, sizeof(double));
+          break;
+        case sensor_msgs::msg::PointField::FLOAT32: {
+          float t_f = 0.f;
+          std::memcpy(&t_f, tp, sizeof(float));
+          t_s = static_cast<double>(t_f);
+          break;
+        }
+        default:
+          break;
+      }
+      dst.timestamp = t_s;
+      return;
+    }
+    case dlio::SensorType::LIVOX: {
+      if (time_datatype == sensor_msgs::msg::PointField::UINT8 && time_count == 8) {
+        uint64_t t_ns = 0;
+        std::memcpy(&t_ns, tp, sizeof(uint64_t));
+        dst.timestamp = static_cast<double>(t_ns);
+      } else if (time_datatype == sensor_msgs::msg::PointField::UINT32) {
+        uint32_t t_ns = 0;
+        std::memcpy(&t_ns, tp, sizeof(uint32_t));
+        dst.timestamp = static_cast<double>(t_ns);
+      } else if (time_datatype == sensor_msgs::msg::PointField::FLOAT64) {
+        std::memcpy(&dst.timestamp, tp, sizeof(double));
+      } else if (time_datatype == sensor_msgs::msg::PointField::FLOAT32) {
+        float t_f = 0.f;
+        std::memcpy(&t_f, tp, sizeof(float));
+        dst.timestamp = static_cast<double>(t_f);
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType>& cloud,
+                              size_t unique_ros_times) {
+  if (cloud.points.empty()) {
+    return;
+  }
+  uint64_t tmin = std::numeric_limits<uint64_t>::max();
+  uint64_t tmax = 0;
+  for (const auto& pt : cloud.points) {
+    const uint64_t ts = luminarPointTimestampNs(pt);
+    tmin = std::min(tmin, ts);
+    tmax = std::max(tmax, ts);
+  }
+  const size_t mid = cloud.points.size() / 2;
+  const uint64_t ts0 = luminarPointTimestampNs(cloud.points.front());
+  const uint64_t ts_mid = luminarPointTimestampNs(cloud.points[mid]);
+  const uint64_t tsN = luminarPointTimestampNs(cloud.points.back());
+  std::fprintf(stderr,
+               "[LUMINAR_DBG] %zu pts, %zu unique_ros_times, ts0=%lu tsMid=%lu tsN=%lu "
+               "span_ns=%ld (minmax_span=%ld)\n",
+               num_points, unique_ros_times, static_cast<unsigned long>(ts0),
+               static_cast<unsigned long>(ts_mid), static_cast<unsigned long>(tsN),
+               static_cast<long>(static_cast<int64_t>(tsN) - static_cast<int64_t>(ts0)),
+               static_cast<long>(static_cast<int64_t>(tmax) - static_cast<int64_t>(tmin)));
+  std::fflush(stderr);
+}
+
 // Shift per-point timestamps by `dt` seconds. When `luminar_uint64` is set the
 // 8 bytes at the time field are reinterpreted as uint64 hardware nanoseconds
 // regardless of the declared field type — Luminar publishes the raw uint64 bits
@@ -319,8 +464,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
   this->last_preprocessed_point_count_ = 0;
 
   // Initialize lidar pose
-  this->lidarPose.p = Eigen::Vector3f::Zero();
-  this->lidarPose.q = Eigen::Quaternionf::Identity();
+  this->basePose.p = Eigen::Vector3f::Zero();
+  this->basePose.q = Eigen::Quaternionf::Identity();
 
   // Initialize previous velocity
   this->prev_vel = Eigen::Vector3f::Zero();
@@ -894,8 +1039,14 @@ void gicp_localization::LocalizationNode::getParams() {
     this->sensor = dlio::SensorType::HESAI;
   } else if (sensor_type_str == "livox") {
     this->sensor = dlio::SensorType::LIVOX;
-  } else {
+  } else if (sensor_type_str == "ouster") {
     this->sensor = dlio::SensorType::OUSTER;
+  } else {
+    this->sensor = dlio::SensorType::UNKNOWN;
+    RCLCPP_WARN(this->get_logger(),
+                "Unknown localization/sensor_type '%s'; per-point deskew needs ouster, velodyne, "
+                "hesai, livox, or luminar",
+                sensor_type_str.c_str());
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
@@ -1141,8 +1292,8 @@ void gicp_localization::LocalizationNode::applyInitialPoseFromParams() {
       this->geo.first_opt_done = true;
     }
   }
-  this->lidarPose.p = position;
-  this->lidarPose.q = orientation;
+  this->basePose.p = position;
+  this->basePose.q = orientation;
 
   this->path_msg.poses.clear();
   this->path_msg.header.frame_id = this->map_frame;
@@ -1195,8 +1346,8 @@ void gicp_localization::LocalizationNode::applyInitialPose(const Eigen::Vector3f
       this->geo.first_opt_done = true;
     }
   }
-  this->lidarPose.p = p;
-  this->lidarPose.q = q;
+  this->basePose.p = p;
+  this->basePose.q = q;
 
   // Clear trajectory path on reinitialization
   this->path_msg.poses.clear();
@@ -1300,11 +1451,9 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   }
 
   // Single-pass conversion: resolve field offsets once, then walk pc->data
-  // exactly once doing xyz + intensity + (Luminar) timestamp + flip_y in the
-  // same iteration. Replaces the old triple-pass design (5 PointCloud2ConstIterators
-  // for the first pass, then a separate Luminar-timestamp loop, then a flip_y
-  // loop), which was O(3N) over the same memory.
-  int x_off = -1, y_off = -1, z_off = -1, i_off = -1, ts_off = -1;
+  // exactly once doing xyz + intensity + per-point time + flip_y in the same
+  // iteration.
+  int x_off = -1, y_off = -1, z_off = -1, i_off = -1;
   uint8_t i_type = 0;
   for (const auto& field : pc->fields) {
     if (field.name == "x") x_off = static_cast<int>(field.offset);
@@ -1313,14 +1462,27 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
     else if (field.name == "intensity") {
       i_off = static_cast<int>(field.offset);
       i_type = field.datatype;
-    } else if (field.name == "timestamp") {
-      ts_off = static_cast<int>(field.offset);
     }
   }
+
+  int time_off = -1;
+  uint8_t time_datatype = 0;
+  int time_count = 0;
+  const bool has_time_field = findTimeField(*pc, time_off, time_datatype, time_count);
 
   if (x_off < 0 || y_off < 0 || z_off < 0) {
     RCLCPP_ERROR(this->get_logger(), "Point cloud missing x/y/z fields");
     return;
+  }
+
+  if (this->deskew_ && !has_time_field) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "dlio/deskew enabled but point cloud has no per-point time field "
+                         "(t/time/timestamp)");
+  } else if (this->sensor != dlio::SensorType::UNKNOWN && !has_time_field) {
+    RCLCPP_WARN_ONCE(this->get_logger(),
+                     "No per-point time field (t/time/timestamp) in cloud; deskew will not "
+                     "work until one is present");
   }
 
   raw_scan->points.resize(num_points);
@@ -1329,11 +1491,6 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   raw_scan->is_dense = pc->is_dense;
 
   const bool flip_y = this->flip_y_;
-  const bool luminar_ts = (this->sensor == dlio::SensorType::LUMINAR) && ts_off >= 0;
-  if (this->sensor == dlio::SensorType::LUMINAR && ts_off < 0) {
-    RCLCPP_WARN_ONCE(this->get_logger(),
-                     "Luminar sensor type set but 'timestamp' field not found in point cloud!");
-  }
   const uint32_t point_step = pc->point_step;
   const uint8_t* base = pc->data.data();
 
@@ -1352,15 +1509,9 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
       dst.y = flip_y ? -y : y;
       dst.z = z;
       dst.intensity = read_intensity(src);
-      dst.time = 0.0f;
-
-      if (luminar_ts) {
-        // Luminar publishes raw uint64 ns even when the field datatype is
-        // FLOAT64; copy the 8 bytes verbatim into the timestamp union slot
-        // (deskew reinterprets them as uint64).
-        uint64_t ts_raw;
-        std::memcpy(&ts_raw, src + ts_off, sizeof(uint64_t));
-        std::memcpy(&dst.timestamp, &ts_raw, sizeof(uint64_t));
+      clearPointTimeUnion(dst);
+      if (has_time_field) {
+        copyPointTimeFromCloud(src, time_off, time_datatype, time_count, this->sensor, dst);
       }
     }
   };
@@ -1410,6 +1561,11 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   }
 
   this->last_raw_point_count_ = raw_scan->points.size();
+
+  if (this->sensor == dlio::SensorType::LUMINAR && has_time_field && this->verbose_ &&
+      !raw_scan->points.empty()) {
+    logLuminarTimestampStats(raw_scan->points.size(), *raw_scan, 0);
+  }
 
   // Store as original scan for deskewing
   this->original_scan = raw_scan;
@@ -1634,8 +1790,8 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
         if (latest_imu > 0.0 && single_ts[0] > latest_imu)
           single_ts[0] = latest_imu;
       }
-      auto frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q,
-                                        this->lidarPose.p, this->prev_vel, single_ts);
+      auto frames = this->integrateImu(this->prev_scan_stamp, this->basePose.q,
+                                        this->basePose.p, this->prev_vel, single_ts);
       if (frames.size() == 1 && matrixFinite(frames[0])) {
         this->T_prior = frames[0];
       } else {
@@ -1658,43 +1814,54 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   // Sort points by timestamp and build list of timestamps
   std::function<bool(const PointType&, const PointType&)> point_time_cmp;
   std::function<double(const PointType&)> extract_point_time_from_point;
+  bool deskew_time_ready = false;
 
   if (this->sensor == dlio::SensorType::OUSTER) {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.t < p2.t; };
-    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) { return sweep_ref_time + pt.t * 1e-9f; };
+    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) {
+      return sweep_ref_time + static_cast<double>(pt.t) * 1e-9;
+    };
+    deskew_time_ready = true;
   } else if (this->sensor == dlio::SensorType::VELODYNE) {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.time < p2.time; };
-    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) { return sweep_ref_time + pt.time; };
+    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) {
+      return sweep_ref_time + static_cast<double>(pt.time);
+    };
+    deskew_time_ready = true;
   } else if (this->sensor == dlio::SensorType::HESAI) {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
-    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) { return pt.timestamp; };
+    extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp; };
+    deskew_time_ready = true;
   } else if (this->sensor == dlio::SensorType::LIVOX) {
     point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
-    extract_point_time_from_point = [&sweep_ref_time](const PointType& pt) { return pt.timestamp * 1e-9f; };
+    extract_point_time_from_point = [](const PointType& pt) { return pt.timestamp * 1e-9; };
+    deskew_time_ready = true;
   } else if (this->sensor == dlio::SensorType::LUMINAR) {
-    // Luminar publishes timestamp as uint64 nanoseconds in hardware clock domain (not Unix epoch).
-    // PCL copies the 8 raw bytes into pt.timestamp (double), so we reinterpret as uint64.
-    // Use relative offset from the earliest point in the scan, anchored to scan header time.
-    uint64_t min_ts = UINT64_MAX;
+    // Hardware-clock ns; use relative offset within the scan anchored at header stamp.
+    uint64_t min_ts = std::numeric_limits<uint64_t>::max();
     for (const auto& pt : this->original_scan->points) {
-      uint64_t ts;
-      memcpy(&ts, &pt.timestamp, sizeof(uint64_t));
-      if (ts < min_ts) min_ts = ts;
+      min_ts = std::min(min_ts, luminarPointTimestampNs(pt));
     }
     const uint64_t min_ts_captured = min_ts;
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                          "Luminar scan: min_ts=%lu ns, sweep_ref=%.3f s", min_ts_captured, sweep_ref_time);
     point_time_cmp = [](const PointType& p1, const PointType& p2) {
-      uint64_t t1, t2;
-      memcpy(&t1, &p1.timestamp, sizeof(uint64_t));
-      memcpy(&t2, &p2.timestamp, sizeof(uint64_t));
-      return t1 < t2;
+      return luminarPointTimestampNs(p1) < luminarPointTimestampNs(p2);
     };
     extract_point_time_from_point = [&sweep_ref_time, min_ts_captured](const PointType& pt) {
-      uint64_t ts;
-      memcpy(&ts, &pt.timestamp, sizeof(uint64_t));
+      const uint64_t ts = luminarPointTimestampNs(pt);
       return sweep_ref_time + static_cast<double>(ts - min_ts_captured) * 1e-9;
     };
+    deskew_time_ready = true;
+  }
+
+  if (!deskew_time_ready) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Unsupported localization/sensor_type for deskew; using scan without motion "
+                         "compensation");
+    this->current_scan = this->original_scan;
+    this->prev_scan_stamp = this->scan_stamp.seconds();
+    return;
   }
 
   // Copy points into deskewed_scan_ in order of timestamp
@@ -1716,21 +1883,8 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   }
   unique_time_indices.push_back(deskewed_scan_->points.size());
 
-  // TEMP DIAGNOSTIC: Luminar timestamp collapse investigation
-  if (this->sensor == dlio::SensorType::LUMINAR && !deskewed_scan_->points.empty()) {
-    uint64_t ts0 = 0, tsN = 0, ts_mid = 0;
-    const size_t mid = deskewed_scan_->points.size() / 2;
-    memcpy(&ts0, &deskewed_scan_->points.front().timestamp, sizeof(uint64_t));
-    memcpy(&tsN, &deskewed_scan_->points.back().timestamp, sizeof(uint64_t));
-    memcpy(&ts_mid, &deskewed_scan_->points[mid].timestamp, sizeof(uint64_t));
-    if (this->verbose_) {
-      std::fprintf(stderr,
-                   "[LUMINAR_DBG] %zu pts, %zu unique, ts0=%lu tsMid=%lu tsN=%lu span_ns=%ld\n",
-                   deskewed_scan_->points.size(), timestamps.size(),
-                   (unsigned long)ts0, (unsigned long)ts_mid, (unsigned long)tsN,
-                   (long)((long long)tsN - (long long)ts0));
-      std::fflush(stderr);
-    }
+  if (this->sensor == dlio::SensorType::LUMINAR && this->verbose_ && !deskewed_scan_->points.empty()) {
+    logLuminarTimestampStats(deskewed_scan_->points.size(), *deskewed_scan_, timestamps.size());
   }
 
   if (timestamps.empty()) {
@@ -1781,7 +1935,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   RCLCPP_DEBUG(this->get_logger(),
                "Integrating IMU: prev_stamp=%.3f, pos=[%.2f,%.2f,%.2f], vel=[%.2f,%.2f,%.2f]",
                this->prev_scan_stamp,
-               this->lidarPose.p.x(), this->lidarPose.p.y(), this->lidarPose.p.z(),
+               this->basePose.p.x(), this->basePose.p.y(), this->basePose.p.z(),
                this->prev_vel.x(), this->prev_vel.y(), this->prev_vel.z());
 
   // Clamp timestamps to IMU buffer extent: when per-point timestamps are collapsed
@@ -1801,7 +1955,7 @@ void gicp_localization::LocalizationNode::deskewPointcloud() {
   }
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-  frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
+  frames = this->integrateImu(this->prev_scan_stamp, this->basePose.q, this->basePose.p,
                               this->prev_vel, timestamps);
 
   // If there are no frames between the start and end of the sweep, use previous transform
@@ -1908,9 +2062,13 @@ void gicp_localization::LocalizationNode::performLocalization() {
 
   // When deskewing is enabled, points are already in world frame at T_prior,
   // so GICP initial guess is Identity and final pose = T_corr * T_prior.
-  // When deskewing is disabled, points are in sensor frame and T_prior is the
-  // IMU-predicted map-frame pose, used directly as GICP's starting point.
-  Eigen::Matrix4f initial_guess = this->deskew_ ? Eigen::Matrix4f::Identity() : this->T_prior;
+  // When deskewing is disabled, points are still in lidar frame, so seed/solve
+  // in map<-lidar, then convert the optimizer output back to map<-base.
+  const Eigen::Matrix4f T_base_lidar = this->extrinsics.baselink2lidar_T;
+  const Eigen::Matrix4f T_lidar_base = T_base_lidar.inverse();
+  Eigen::Matrix4f initial_guess = this->deskew_
+      ? Eigen::Matrix4f::Identity()
+      : (this->T_prior * T_base_lidar);
   Eigen::Matrix4f guess_pose_map = this->T_prior;
 
   double guess_from_last_trans = 0.0;
@@ -1941,7 +2099,9 @@ void gicp_localization::LocalizationNode::performLocalization() {
   const double hessian_condition = hessianConditionProxy(final_hessian);
 
   const Eigen::Matrix4f optimizer_solution = this->gicp.getFinalTransformation();
-  const Eigen::Matrix4f candidate_pose = this->deskew_ ? optimizer_solution * this->T_prior : optimizer_solution;
+  const Eigen::Matrix4f candidate_pose = this->deskew_
+      ? (optimizer_solution * this->T_prior)
+      : (optimizer_solution * T_lidar_base);
   const bool candidate_pose_valid = matrixFinite(candidate_pose);
 
   double guess_to_solution_trans = -1.0;
@@ -2222,8 +2382,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
     Eigen::Quaternionf q(rotSO3);
     q.normalize();
 
-    this->lidarPose.p = new_p;
-    this->lidarPose.q = q;
+    this->basePose.p = new_p;
+    this->basePose.q = q;
 
     // Validate GICP result before using it
     bool gicp_valid = std::isfinite(new_p.x()) && std::isfinite(new_p.y()) && std::isfinite(new_p.z()) &&
@@ -2297,7 +2457,7 @@ void gicp_localization::LocalizationNode::performLocalization() {
                 converged ? "CONVERGED" : "ACCEPTED(fitness-ok)",
                 fitness_score, elapsed_ms,
                 t_corr.x(), t_corr.y(), t_corr.z(),
-                this->lidarPose.p.x(), this->lidarPose.p.y(), this->lidarPose.p.z());
+                this->basePose.p.x(), this->basePose.p.y(), this->basePose.p.z());
   } else {
     // Any non-accepted scan (failed_to_converge, rejected_fitness, rejected_jump, invalid_solution)
     // falls back to the IMU-integrated prior. Freezing at last_gicp_pose_ causes cascade
@@ -2314,8 +2474,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
       const Eigen::Vector3f new_p = this->T_prior.block<3, 1>(0, 3);
       Eigen::Quaternionf q(this->T_prior.block<3, 3>(0, 0));
       q.normalize();
-      this->lidarPose.p = new_p;
-      this->lidarPose.q = q;
+      this->basePose.p = new_p;
+      this->basePose.q = q;
       {
         std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
         this->prev_vel = this->geo.prev_vel;
@@ -2698,6 +2858,22 @@ bool gicp_localization::LocalizationNode::composeGtPoseInBase(
   return true;
 }
 
+bool gicp_localization::LocalizationNode::composeGtTwistInBase(
+    const GtSample& gt, Eigen::Vector3f& v_lin_body_out,
+    Eigen::Vector3f& v_ang_body_out) const {
+  if (!this->gt_extrinsics_cached_) {
+    return false;
+  }
+  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
+  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
+  const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
+  const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
+
+  v_ang_body_out = R_gtbody_base * gt.v_ang_body;
+  v_lin_body_out = R_gtbody_base * (gt.v_lin_body + gt.v_ang_body.cross(t_gtbody_base));
+  return true;
+}
+
 // RTK-driven IMU bias calibration. Pairs each IMU sample with a time-matched GT
 // pose/twist and accumulates the bias residual. Linear acceleration in world
 // frame is estimated by finite-differencing v_world between successive paired
@@ -2712,13 +2888,27 @@ bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
     // Don't error — just skip this sample.
     return false;
   }
-  this->latest_rtk_seed_ = gt;
+  Eigen::Vector3f gt_p_in_base;
+  Eigen::Quaternionf gt_q_in_base;
+  Eigen::Vector3f gt_v_lin_base_body;
+  Eigen::Vector3f gt_v_ang_base_body;
+  if (!this->composeGtPoseInBase(gt, gt_p_in_base, gt_q_in_base) ||
+      !this->composeGtTwistInBase(gt, gt_v_lin_base_body, gt_v_ang_base_body)) {
+    // GT sample exists, but base<-gt_body TF is not cached yet.
+    return false;
+  }
+  GtSample seed = gt;
+  seed.p = gt_p_in_base;
+  seed.q = gt_q_in_base;
+  seed.v_lin_body = gt_v_lin_base_body;
+  seed.v_ang_body = gt_v_ang_base_body;
+  this->latest_rtk_seed_ = seed;
   this->has_latest_rtk_seed_ = true;
 
   // Body acceleration in world frame, from finite-differencing v_world across
   // consecutive paired samples. Skip the first sample (no derivative possible).
-  const Eigen::Matrix3f R = gt.q.toRotationMatrix();
-  const Eigen::Vector3f v_world = R * gt.v_lin_body;
+  const Eigen::Matrix3f R = seed.q.toRotationMatrix();
+  const Eigen::Vector3f v_world = R * seed.v_lin_body;
 
   if (!this->has_prev_gt_for_accel_) {
     this->has_prev_gt_for_accel_ = true;
@@ -2743,7 +2933,7 @@ bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
   // = inertial + (0,0,+g) when world Z points up).
   const Eigen::Vector3f g_world(0.0f, 0.0f, +static_cast<float>(this->gravity_));
   const Eigen::Vector3f expected_accel_body = R.transpose() * (a_world + g_world);
-  const Eigen::Vector3f expected_gyro_body = gt.v_ang_body;
+  const Eigen::Vector3f expected_gyro_body = seed.v_ang_body;
 
   const Eigen::Vector3f gyro_res = measured_gyro - expected_gyro_body;
   const Eigen::Vector3f accel_res = measured_accel - expected_accel_body;
@@ -2937,8 +3127,8 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     this->geo.prev_vel = v_base_world;
     ++this->geo.update_seq;  // discard any in-flight propagateState computations
   }
-  this->lidarPose.p = p_new;
-  this->lidarPose.q = q_new;
+  this->basePose.p = p_new;
+  this->basePose.q = q_new;
   this->prev_vel = v_base_world;
 
   RCLCPP_WARN(this->get_logger(),
@@ -3024,28 +3214,32 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
                   t_bi.x(), t_bi.y(), t_bi.z());
     } catch (const tf2::TransformException & ex) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "Cannot cache baselink->imu TF: %s (using identity)", ex.what());
+                           "Cannot cache baselink->imu TF: %s", ex.what());
     }
   }
 
-  // Transform IMU measurements from IMU frame to baselink frame
-  if (this->imu_extrinsics_cached_) {
-    const Eigen::Matrix3f& R = this->extrinsics.baselink2imu.R;
-    const Eigen::Vector3f& t = this->extrinsics.baselink2imu.t;
-
-    // Rotate angular velocity and linear acceleration to baselink frame
-    Eigen::Vector3f ang_vel_bl = R * ang_vel;
-    Eigen::Vector3f lin_accel_bl = R * lin_accel;
-
-    // Lever-arm compensation: account for centripetal and tangential acceleration
-    // at the IMU location offset from baselink origin
-    // a_baselink = a_imu + omega x (omega x t) + alpha x t
-    // We approximate alpha ~ 0 (angular acceleration term is small at 100Hz)
-    lin_accel_bl += ang_vel_bl.cross(ang_vel_bl.cross(t));
-
-    ang_vel = ang_vel_bl;
-    lin_accel = lin_accel_bl;
+  if (!this->imu_extrinsics_cached_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                         "Skipping IMU sample until baselink->imu TF is cached");
+    return;
   }
+
+  // Transform IMU measurements from IMU frame to baselink frame.
+  const Eigen::Matrix3f& R = this->extrinsics.baselink2imu.R;
+  const Eigen::Vector3f& t = this->extrinsics.baselink2imu.t;
+
+  // Rotate angular velocity and linear acceleration to baselink frame
+  Eigen::Vector3f ang_vel_bl = R * ang_vel;
+  Eigen::Vector3f lin_accel_bl = R * lin_accel;
+
+  // Lever-arm compensation: account for centripetal and tangential acceleration
+  // at the IMU location offset from baselink origin
+  // a_baselink = a_imu + omega x (omega x t) + alpha x t
+  // We approximate alpha ~ 0 (angular acceleration term is small at 100Hz)
+  lin_accel_bl += ang_vel_bl.cross(ang_vel_bl.cross(t));
+
+  ang_vel = ang_vel_bl;
+  lin_accel = lin_accel_bl;
 
   ImuMeas imu_meas_temp;
   imu_meas_temp.stamp = stamp;
@@ -3750,8 +3944,8 @@ void gicp_localization::LocalizationNode::updateState() {
   // Lock thread to prevent state from being accessed by propagateState
   std::lock_guard<std::mutex> lock(this->geo.mtx);
 
-  Eigen::Vector3f pin = this->lidarPose.p;
-  Eigen::Quaternionf qin = this->lidarPose.q;
+  Eigen::Vector3f pin = this->basePose.p;
+  Eigen::Quaternionf qin = this->basePose.q;
   double dt = this->observer_dt_;
 
   // On very first update after initialization, dt might be large
