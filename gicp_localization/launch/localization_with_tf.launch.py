@@ -25,9 +25,22 @@ def generate_launch_description():
 
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
+    # Single-source NA design: GICP consumes IMU and GT odom directly from the
+    # NovAtel (NA) INS pre-VKS, both naturally referenced at the NA_IMU_Frame
+    # (URDF link novatel_a). This matches localization/base_frame = "novatel_a"
+    # in the yaml, so every comparison the node performs (state.p vs gt.p, IMU
+    # propagation, GT-recovery snap, initial pose from odom) lives at the same
+    # body reference -- no TF lever-arm correction needed anywhere, and no
+    # dependency on race_common's VKS / robot_localization fusion or its cg
+    # frame target.
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_na/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
-    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/localization/global/odom')
+    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_na/filtered_odom')
+    # NovAtel BESTGNSSPOS topic for the RTK fix-status gate. Drives the
+    # decision to accept or drop each gt_odom sample. See
+    # localization/rtk_gate/* in the yaml.
+    rtk_status_topic = LaunchConfiguration(
+        'rtk_status_topic', default='/novatel_a/bestgnsspos')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
@@ -40,12 +53,26 @@ def generate_launch_description():
     declare_pointcloud_topic_arg = DeclareLaunchArgument(
         'pointcloud_topic', default_value=pointcloud_topic, description='Pointcloud topic name')
     declare_imu_topic_arg = DeclareLaunchArgument(
-        'imu_topic', default_value=imu_topic, description='IMU topic name (for deskewing)')
+        'imu_topic', default_value=imu_topic,
+        description='IMU topic name. Default /gps_na/imu (NovAtel INS at NA_IMU_Frame, '
+                    'matches base_frame=novatel_a in localization.yaml).')
     declare_odom_topic_arg = DeclareLaunchArgument(
         'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(
         'gt_odom_topic', default_value=gt_odom_topic,
-        description='Ground-truth odometry topic for divergence cross-check (only used when localization/gt_odom/enable=true)')
+        description='Ground-truth odometry topic for init / divergence cross-check / GT-recovery snap. '
+                    'Default /gps_na/filtered_odom -- NA pre-VKS, at NA_IMU_Frame, matches base_frame. '
+                    'Do NOT point this at /localization/global/odom (cg frame) without also changing '
+                    'localization/base_frame to cg, or the cross-check baseline will be biased by '
+                    '~0.39 m and applyInitialPose will seed the state offset by the same amount.')
+    declare_rtk_status_topic_arg = DeclareLaunchArgument(
+        'rtk_status_topic', default_value=rtk_status_topic,
+        description='NovAtel BESTGNSSPOS topic for the RTK fix-status gate on gt_odom. '
+                    'Default /novatel_a/bestgnsspos. When localization/rtk_gate/enable=true '
+                    'the node subscribes here and rejects gt_odom samples while NovAtel is '
+                    'not RTK-fixed (NARROW_INT=50 / INS_RTKFIXED=56). If this topic does not '
+                    'publish, ALL gt_odom samples are dropped -- the node falls back to pure '
+                    'IMU dead-reckoning. Set localization/rtk_gate/enable=false to disable.')
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
@@ -117,6 +144,7 @@ def generate_launch_description():
                 ('imu', imu_topic),
                 ('odom', odom_topic),
                 ('gt_odom', gt_odom_topic),
+                ('rtk_status', rtk_status_topic),
                 ('localized_pose', 'gicp/localization/pose'),
                 ('localized_odom', 'gicp/localization/odom'),
                 ('localized_path', 'gicp/localization/path'),
@@ -161,6 +189,7 @@ def generate_launch_description():
         declare_imu_topic_arg,
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
+        declare_rtk_status_topic_arg,
         declare_imu_only_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,

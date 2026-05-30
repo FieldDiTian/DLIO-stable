@@ -27,6 +27,12 @@
   <depend>pcl_ros</depend>
   <depend>pcl_conversions</depend>
 
+  <!-- NovAtel BESTGNSSPOS for the RTK fix-status gate on incoming gt_odom.
+       Required: gt_odom samples are rejected when RTK is not in the
+       FIXED state (NARROW_INT / INS_RTKFIXED). See localization/rtk_gate
+       in localization.yaml. -->
+  <depend>novatel_oem7_msgs</depend>
+
   <exec_depend>robot_state_publisher</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>

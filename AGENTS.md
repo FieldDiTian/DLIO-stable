@@ -137,8 +137,14 @@ the GNSS prior by ~0.6 m horizontal on AV-24 (the `novatel_a` →
   its own `T_imu_ins` from URDF but resolves to identity in the current
   config: `urdf_imu_frame: "novatel_a"` and `urdf_ins_frame: "novatel_a"`.
 - The localization node (`gicp_localization`) does not apply a GNSS
-  lever-arm correction at all; it consumes `/localization/global/odom`
-  as-is. The lever arm there is handled upstream by the INS voter / firmware.
+  lever-arm correction at all. As of the single-source NA design, it
+  consumes `/gps_na/filtered_odom` (NA INS pre-VKS, naturally at
+  NA_IMU_Frame) as-is. The lever arm is handled inside the NovAtel
+  firmware. `base_frame`, `imu_frame`, and the gt_odom source are all
+  at `novatel_a`, so the in-code TF lookups (`baselink2imu_T`,
+  `T_base_gtbody_`) resolve to identity. See
+  `gicp_localization/docs/GICP_GNSS_IMU_bug_report.pdf` for the
+  architectural alternatives that were considered.
 
 **Watch condition**: if `libgnss_global.so` is uncommented, or
 `urdf_ins_frame` is changed to a different link than `urdf_imu_frame`,
@@ -158,20 +164,36 @@ receives and pushes it into the buffer with no RTK / fix-status check.
 A reviewer might flag this as a missing guard — snap-back could fire from
 a degraded GNSS fix.
 
-**Why it's actually fine on AV-24**: `/localization/global/odom` is the
-voted output of three INS units and **stops publishing entirely when RTK
-is not fixed**. Gating is enforced at the source, so downstream code can
-trust whatever arrives. The 0.1 s `gt_odom/max_dt` window means a stalled
-upstream publisher cleanly defers snap-back (logged as
+**Why it's mostly fine on AV-24** (under the single-source NA design):
+`/gps_na/filtered_odom` is published by race_common's `novatel_interface`
+node, which applies its own quality gates (`sensors.position_rms`,
+`sensors.heading_stdev_max`, `sensors.activation_speed`, and the
+`bypass_checks` flag in `novatel_interface.param.yaml`). Combined with
+the 0.1 s `gt_odom/max_dt` window, a stalled or rejected upstream
+publisher cleanly defers snap-back (logged as
 `deferring snap — no GT sample within max_dt…`) rather than firing on
 stale data.
 
-**Watch condition**: if the upstream voter ever changes to keep publishing
-during RTK float or RTK-unavailable, a status-field check needs to be added
-to `callbackGtOdom` before pushing into the buffer. The joint failure mode
-to keep in mind is a low-feature LiDAR stretch coinciding with an RTK
-outage: GICP can't recover geometrically and the INS can't pull it back
-either, leaving the node on pure IMU dead-reckoning.
+**RTK-contract gate now enforced in code**: the previous design relied
+on `/localization/global/odom` (voted INS output) stopping publication
+entirely when RTK is not fixed. The new single-source NA design
+subscribes to `/gps_na/filtered_odom` directly, which can keep publishing
+through RTK degradations. The localization node now subscribes to the
+NovAtel `BESTGNSSPOS` topic (default `/novatel_a/bestgnsspos`,
+remappable as `rtk_status`) and rejects every `gt_odom` sample whose
+cached `pos_type` is not in the RTK-fixed set (`NARROW_INT=50` or
+`INS_RTKFIXED=56`; plus `NARROW_FLOAT=34` / `INS_RTKFLOAT=55` when
+`localization/rtk_gate/allow_float=true`). Stale status (older than
+`localization/rtk_gate/max_status_age`, default 2 s) is treated as
+not-fixed. See `callbackRtkStatus` and the RTK-gate block at the top of
+`callbackGtOdom`. Reviewers should not flag the missing fix-status guard
+in the legacy code path — it now exists explicitly.
+
+**Watch condition**: if the RTK gate is disabled (`rtk_gate/enable=false`)
+or the `rtk_status` topic is misrouted, the joint failure mode to keep
+in mind is a low-feature LiDAR stretch coinciding with an RTK
+degradation: GICP can't recover geometrically and the snap pulls toward
+a degraded GNSS fix.
 
 ---
 

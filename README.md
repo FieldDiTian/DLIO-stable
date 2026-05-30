@@ -110,10 +110,11 @@ ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path
 ros2 run glim_ros offline_viewer
 
 # GICP localization against a pre-built PCD map
+# (single-source NA design: IMU and GT odom both from NovAtel pre-VKS, at NA_IMU_Frame)
 ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_na/imu \
-    gt_odom_topic:=/localization/global/odom
+    gt_odom_topic:=/gps_na/filtered_odom
 ```
 
 ---

@@ -47,7 +47,7 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
     rviz:=true \
     pointcloud_topic:=/luminar_front/points \
     imu_topic:=/gps_na/imu \
-    gt_odom_topic:=/localization/global/odom
+    gt_odom_topic:=/gps_na/filtered_odom
 ```
 
 ### Launch arguments
@@ -56,13 +56,48 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 |---|---|---|
 | `rviz` | `false` | Launch RViz with the bundled config. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
-| `imu_topic` | `/gps_na/imu` | IMU topic. **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
+| `imu_topic` | `/gps_na/imu` | NovAtel IMU topic (matches `base_frame=novatel_a`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
-| `gt_odom_topic` | `/localization/global/odom` | Ground-truth odom (only used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`). |
+| `gt_odom_topic` | `/gps_na/filtered_odom` | NovAtel pre-VKS INS odometry, at NA_IMU_Frame. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Matches `base_frame` so no TF correction is needed. |
+| `rtk_status_topic` | `/novatel_a/bestgnsspos` | NovAtel BESTGNSSPOS for the RTK fix-status gate. While not RTK-fixed, gt_odom samples are dropped. Set `localization/rtk_gate/enable=false` to disable the gate. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
 | `urdf_path` | (auto-found) | Path to the URDF that publishes sensor TFs. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | Used by the bundled static-TF helper. |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
+
+### Frame conventions (single-source NA design)
+
+Every comparison the node performs lives at `NA_IMU_Frame` (URDF link `novatel_a`):
+
+- `localization/base_frame: novatel_a` — GICP's state is reported at this frame.
+- `localization/imu_frame: novatel_a` — IMU subscription from `/gps_na/imu` is at this frame.
+- `gt_odom_topic` → `/gps_na/filtered_odom` — NA INS pre-VKS, naturally at this frame.
+
+Because base_frame, imu_frame, and the gt_odom source all align, the in-code TF lookups in `callbackImu` (`baselink2imu_T`) and `callbackGtOdom` (`T_base_gtbody_`) degenerate to identity. No lever-arm work happens anywhere; the cross-check `gt_pos_err_m` is exact (no constant baseline bias); `applyInitialPose` correctly seeds the state; the snap helper composes a no-op identity TF.
+
+This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is no GNSS-source-quality fallback (NA only) and the localized pose lives at NA_IMU_Frame rather than the controller-expected `cg` (downstream consumers need an extra `novatel_a → cg` TF lookup, which `robot_state_publisher` already provides). See `docs/GICP_GNSS_IMU_bug_report.pdf` for the architectural alternatives and their trade-offs.
+
+### RTK fix-status gate
+
+GICP enforces in-code that every gt_odom sample is RTK-fixed before it enters the buffer. With the legacy `/localization/global/odom` topic, race_common's voted INS stopped publishing during RTK loss; with `/gps_na/filtered_odom` the upstream may keep publishing through brief RTK degradations, so the gate is now done explicitly here.
+
+```yaml
+localization/rtk_gate/enable:         true   # require RTK-fixed status
+localization/rtk_gate/allow_float:    false  # require NARROW_INT / INS_RTKFIXED, not just FLOAT
+localization/rtk_gate/max_status_age: 2.0    # seconds; older status = treat as not fixed
+```
+
+Mechanism: the node subscribes to `rtk_status` (default `/novatel_a/bestgnsspos`). Each NovAtel `BESTGNSSPOS` message updates a cached `pos_type` + stamp. On every gt_odom message, the cache is checked and the sample is rejected unless `pos_type ∈ {NARROW_INT=50, INS_RTKFIXED=56}` (plus `{NARROW_FLOAT=34, INS_RTKFLOAT=55}` when `allow_float=true`) and the status is fresher than `max_status_age`.
+
+When the gate rejects, GICP runs on IMU dead-reckoning until RTK recovers. Operator-facing log lines (throttled to 5 s):
+
+- `RTK gate: dropping gt_odom -- no BESTGNSSPOS received yet (rejected total=N)` — gate is on but `rtk_status` topic isn't publishing.
+- `RTK gate: dropping gt_odom -- BESTGNSSPOS is X.XX s stale (max 2.00 s). Last pos_type=N` — BESTGNSSPOS stopped or slowed.
+- `RTK gate: dropping gt_odom -- pos_type=N not RTK-fixed (need NARROW_INT=50 or INS_RTKFIXED=56)` — RTK lost or never acquired.
+
+Edge-triggered transitions are also logged: `RTK fix transition: NOT-FIXED -> FIXED (pos_type=50)` when GICP starts accepting samples again.
+
+Set `rtk_gate/enable: false` only for bag-replay diagnostics where the BESTGNSSPOS topic isn't available — disabling the gate lets snap and init seed state from non-RTK-fixed positions.
 
 ### Setting an initial pose
 

@@ -13,9 +13,18 @@
     localization/utm_frame: "utm"
 
     # Frame IDs
+    # Single-source NA design: every comparison the node performs lives at
+    # NA_IMU_Frame (URDF link novatel_a). base_frame, imu_frame, and the
+    # gt_odom source (/gps_na/filtered_odom, set in the launch file) are all
+    # at novatel_a, so the in-code TF lookups (callbackImu's
+    # baselink2imu_T, the snap helper's T_base_gtbody_) degenerate to
+    # identity -- no lever-arm work happens anywhere. This bypasses the
+    # cg-frame intermediate the rest of the race_common stack uses and
+    # avoids the cross-check baseline / phantom-snap bugs documented in
+    # docs/GICP_GNSS_IMU_bug_report.pdf.
     localization/map_frame: "map"
     localization/base_frame: "novatel_a"
-    localization/imu_frame: "novatel_a"  # Must match a URDF link (IMU is mounted at GPS bottom)
+    localization/imu_frame: "novatel_a"
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
     # Map downsampling for GICP (smaller = more accurate but slower)
@@ -46,13 +55,42 @@
     localization/use_odom_init: true
 
     # Ground-truth odom cross-check. When enabled, the node subscribes to the
-    # `gt_odom` remap (default /localization/global/odom in launch) and reports
-    # gt_err=[trans,rot,dt] in every SCAN DEBUG line + publishes the deltas on
-    # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg. Diagnostic only —
+    # `gt_odom` remap (default /gps_na/filtered_odom in launch -- NA INS pre-VKS,
+    # naturally at NA_IMU_Frame) and reports gt_err=[trans,rot,dt] in every
+    # SCAN DEBUG line + publishes the deltas on
+    # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg. Diagnostic only --
     # never feeds back into accept/reject decisions.
+    #
+    # Frame note: because gt_odom is at the same frame as base_frame (both
+    # novatel_a), the cross-check ||cand_p - gt.p|| is exact (no lever-arm
+    # bias), and the snap helper's T_base_gtbody_ resolves to identity. Do
+    # NOT change the remap to /localization/global/odom (race_common VKS at
+    # cg) without also setting localization/base_frame: cg -- otherwise the
+    # cross-check carries a constant ~0.39 m baseline and applyInitialPose
+    # seeds the state at the wrong reference. See docs/GICP_GNSS_IMU_bug_report.pdf.
     localization/gt_odom/enable: true
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
+
+    # RTK fix-status gate on the gt_odom buffer. Drops every incoming gt_odom
+    # sample that arrives while the NovAtel BESTGNSSPOS solution is NOT
+    # RTK-fixed (NARROW_INT=50 or INS_RTKFIXED=56; plus NARROW_FLOAT=34 /
+    # INS_RTKFLOAT=55 when allow_float=true). The gate is in-code enforcement
+    # of the assumption that race_common's voted INS used to provide
+    # implicitly (stop publishing during RTK loss); /gps_na/filtered_odom
+    # may keep publishing through brief RTK degradations.
+    #
+    # When enable=true, the node subscribes to the `rtk_status` remap
+    # (default /novatel_a/bestgnsspos in launch). If that topic doesn't
+    # publish, NO gt_odom samples are accepted -- the node falls back to
+    # pure IMU dead-reckoning. This is the conservative default.
+    # Set enable=false to disable the gate (samples will be accepted
+    # regardless of RTK status -- snap and init may seed state from a
+    # degraded fix). Disabling is intended only for bag-replay diagnostics
+    # where the BESTGNSSPOS topic is unavailable.
+    localization/rtk_gate/enable: true
+    localization/rtk_gate/allow_float: false   # require RTK FIXED, not just FLOAT
+    localization/rtk_gate/max_status_age: 2.0  # seconds; stale -> treat as not fixed
 
     # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
     # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the

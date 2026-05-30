@@ -473,7 +473,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       });
 
   // Optional ground-truth odom subscriber for divergence cross-check.
-  // Topic is remappable as "gt_odom"; default points to /localization/global/odom in launch.
+  // Topic is remappable as "gt_odom"; default points to /gps_na/filtered_odom
+  // in launch (NA INS pre-VKS, at NA_IMU_Frame, matches base_frame=novatel_a).
   if (this->gt_odom_enabled_) {
     this->gt_odom_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     auto gt_sub_opt = rclcpp::SubscriptionOptions();
@@ -488,6 +489,42 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
     RCLCPP_INFO(this->get_logger(),
                 "Ground-truth odom cross-check ENABLED (topic remap 'gt_odom', buffer=%zu, max_dt=%.3fs)",
                 this->gt_odom_buffer_size_, this->gt_odom_max_dt_);
+  }
+
+  // Optional RTK fix-status subscriber for the gt_odom gate. When enabled,
+  // BESTGNSSPOS messages update the cached pos_type; callbackGtOdom checks
+  // that cache before pushing each sample into the buffer, rejecting any
+  // GT odom that arrives while NovAtel is not RTK-fixed. Topic is
+  // remappable as "rtk_status"; default points to /novatel_a/bestgnsspos
+  // in launch.
+  if (this->gt_odom_enabled_ && this->rtk_gate_enabled_) {
+    this->rtk_status_cb_group_ = this->create_callback_group(
+        rclcpp::CallbackGroupType::Reentrant);
+    auto rtk_sub_opt = rclcpp::SubscriptionOptions();
+    rtk_sub_opt.callback_group = this->rtk_status_cb_group_;
+    auto rtk_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+    rtk_qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+    rtk_qos.durability(rclcpp::DurabilityPolicy::Volatile);
+    this->rtk_status_sub_ = this->create_subscription<
+        novatel_oem7_msgs::msg::BESTGNSSPOS>(
+        "rtk_status", rtk_qos,
+        std::bind(&gicp_localization::LocalizationNode::callbackRtkStatus,
+                  this, std::placeholders::_1),
+        rtk_sub_opt);
+    RCLCPP_INFO(this->get_logger(),
+                "RTK fix-status gate ENABLED (topic remap 'rtk_status', "
+                "allow_float=%s, max_status_age=%.1fs). Samples with "
+                "non-RTK-fixed status will be DROPPED from the gt_odom "
+                "buffer (no init / no snap / no cross-check from those).",
+                this->rtk_gate_allow_float_ ? "true" : "false",
+                this->rtk_gate_max_status_age_sec_);
+  } else if (this->gt_odom_enabled_) {
+    RCLCPP_WARN(this->get_logger(),
+                "RTK fix-status gate DISABLED. gt_odom samples will be "
+                "accepted regardless of NovAtel pos_type -- snap and "
+                "init may seed state from non-RTK-fixed (cm-level) or "
+                "worse positions. Enable localization/rtk_gate/enable to "
+                "reject degraded GNSS.");
   }
 
   // Setup publishers
@@ -674,6 +711,24 @@ void gicp_localization::LocalizationNode::getParams() {
   this->gt_odom_enabled_ = gt_enable;
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
+
+  // RTK fix-status gate for the gt_odom buffer. When enabled, samples are
+  // only pushed when NovAtel BESTGNSSPOS reports an RTK-fixed solution
+  // (NARROW_INT or INS_RTKFIXED -- or one of the float variants when
+  // allow_float=true). Conservative defaults: gate ON, float NOT allowed,
+  // max_status_age 2 s (BESTGNSSPOS is published at 20 Hz typical; 2 s
+  // means up to 40 missed messages still treats the cache as fresh).
+  this->declare_parameter<bool>("localization/rtk_gate/enable", true);
+  this->declare_parameter<bool>("localization/rtk_gate/allow_float", false);
+  this->declare_parameter<double>("localization/rtk_gate/max_status_age", 2.0);
+  this->get_parameter("localization/rtk_gate/enable",
+                      this->rtk_gate_enabled_);
+  this->get_parameter("localization/rtk_gate/allow_float",
+                      this->rtk_gate_allow_float_);
+  this->get_parameter("localization/rtk_gate/max_status_age",
+                      this->rtk_gate_max_status_age_sec_);
+  this->rtk_latest_pos_type_ = 0;  // NONE
+  this->rtk_latest_status_stamp_ = -1.0;
 
   // GT-driven pose recovery (optional). Independent of gt_odom/enable; recovery
   // requires the same subscriber to be active, so it implies gt_odom/enable.
@@ -1936,8 +1991,25 @@ void gicp_localization::LocalizationNode::performLocalization() {
     if (this->getGtPoseAt(this->scan_stamp.seconds(), gt)) {
       const Eigen::Vector3f cand_p = candidate_pose.block<3, 1>(0, 3);
       const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
-      gt_pos_err = (cand_p - gt.p).norm();
-      Eigen::Quaternionf dq = cand_q.normalized() * gt.q.normalized().conjugate();
+      // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
+      // using the same TF composition the snap helper uses. For the AV-24
+      // single-source NA config this is a no-op (identity TF, gt_body ==
+      // base_frame == novatel_a), but applying the composition explicitly
+      // keeps the cross-check correct under any future gt_odom source change
+      // (e.g. re-pointing the remap back at /localization/global/odom at cg).
+      // Without this composition, the cross-check carries a constant baseline
+      // bias equal to the gt_body -> base_frame lever arm.
+      Eigen::Vector3f gt_p_in_base;
+      Eigen::Quaternionf gt_q_in_base;
+      if (!this->composeGtPoseInBase(gt, gt_p_in_base, gt_q_in_base)) {
+        // Extrinsic not cached yet -- fall back to gt.p/gt.q directly.
+        // Acceptable for early-startup diagnostic noise; the cache fills on
+        // the first successfully-received GT message.
+        gt_p_in_base = gt.p;
+        gt_q_in_base = gt.q;
+      }
+      gt_pos_err = (cand_p - gt_p_in_base).norm();
+      Eigen::Quaternionf dq = cand_q.normalized() * gt_q_in_base.normalized().conjugate();
       const double w = std::clamp(static_cast<double>(std::abs(dq.w())), 0.0, 1.0);
       gt_rot_err_deg = 2.0 * std::acos(w) * 180.0 / M_PI;
       gt_dt = this->scan_stamp.seconds() - gt.stamp;
@@ -2358,26 +2430,77 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
 
-  // Odom init: on the first GT odom message, set the initial pose from GT so the
-  // node starts at the correct location even when the bag begins mid-run.
-  // Overrides any param-based initial pose. Sets first_opt_done so odom starts
-  // publishing immediately without waiting for the first accepted GICP scan.
-  if (this->use_odom_init_ && !this->use_odom_init_applied_) {
-    this->use_odom_init_applied_ = true;
-    const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
-    this->applyInitialPose(s.p, s.q, stamp_ros, "gt_odom");
+  // RTK fix-status gate (in-code enforcement of "NovAtel must be RTK-fixed
+  // before GICP adopts any GPS-derived pose"). Drops the entire sample --
+  // no buffer push, no initial-pose seed, no snap, no cross-check. The gate
+  // runs BEFORE TF caching so a degraded GNSS sample can't even seed the
+  // cache state. Disabled gate is a pass-through.
+  if (this->rtk_gate_enabled_) {
+    uint32_t pos_type = 0;
+    double status_stamp = -1.0;
     {
-      std::lock_guard<std::mutex> lock(this->geo.mtx);
-      this->geo.first_opt_done = true;
+      std::lock_guard<std::mutex> lock(this->rtk_status_mtx_);
+      pos_type = this->rtk_latest_pos_type_;
+      status_stamp = this->rtk_latest_status_stamp_;
     }
-    RCLCPP_INFO(this->get_logger(),
-                "Odom init: pose set from GT odom at t=%.3f pos=[%.2f,%.2f,%.2f]",
-                s.stamp, s.p.x(), s.p.y(), s.p.z());
+
+    // (a) No status received yet -> reject. We cannot prove RTK is fixed
+    // until at least one BESTGNSSPOS message lands.
+    if (!this->rtk_status_received_.load()) {
+      this->rtk_rejected_no_status_++;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "RTK gate: dropping gt_odom -- no BESTGNSSPOS "
+                           "received yet (rejected total=%lu). Check the "
+                           "rtk_status topic remap.",
+                           this->rtk_rejected_no_status_.load());
+      return;
+    }
+
+    // (b) Status too stale -> reject. NovAtel publishes BESTGNSSPOS at
+    // ~20 Hz; if the last status is older than max_status_age we have no
+    // current evidence of an RTK lock.
+    const double age = s.stamp - status_stamp;
+    if (age > this->rtk_gate_max_status_age_sec_) {
+      this->rtk_rejected_stale_status_++;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "RTK gate: dropping gt_odom -- BESTGNSSPOS is "
+                           "%.2f s stale (max %.2f s). Last pos_type=%u. "
+                           "Rejected total=%lu.",
+                           age, this->rtk_gate_max_status_age_sec_,
+                           pos_type,
+                           this->rtk_rejected_stale_status_.load());
+      return;
+    }
+
+    // (c) Status fresh but not RTK-fixed -> reject. NovAtel pos_type
+    // semantics: NARROW_INT=50 and INS_RTKFIXED=56 are the cm-level
+    // fixed-integer solutions; NARROW_FLOAT=34 and INS_RTKFLOAT=55 are
+    // the carrier-phase float pre-fix states (decimeter-level). Only
+    // accept FLOAT when allow_float is on.
+    const bool is_fixed = (pos_type == 50u || pos_type == 56u);
+    const bool is_float = (pos_type == 34u || pos_type == 55u);
+    const bool pass = is_fixed || (this->rtk_gate_allow_float_ && is_float);
+    if (!pass) {
+      this->rtk_rejected_not_fixed_++;
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "RTK gate: dropping gt_odom -- pos_type=%u not "
+                           "RTK-fixed (need NARROW_INT=50 or "
+                           "INS_RTKFIXED=56%s). Rejected total=%lu.",
+                           pos_type,
+                           this->rtk_gate_allow_float_
+                               ? ", or NARROW_FLOAT=34 / INS_RTKFLOAT=55"
+                               : "",
+                           this->rtk_rejected_not_fixed_.load());
+      return;
+    }
   }
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
-  // can compose poses; callback keeps appending samples even while TF is missing.
+  // and the diagnostic cross-check can compose poses; callback keeps appending
+  // samples even while TF is missing.  Runs BEFORE the odom-init block below
+  // so composeGtPoseInBase has the extrinsic ready to bring the first GT
+  // sample into base_frame coordinates before applyInitialPose seeds the state.
   if (!this->gt_extrinsics_cached_) {
     if (this->gt_body_frame_.empty()) {
       this->gt_body_frame_ = msg->child_frame_id;
@@ -2420,6 +2543,41 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
     }
   }
 
+  // Odom init: on the first GT odom message (after the TF cache above is
+  // populated), seed state from GT so the node starts at the correct location
+  // even when the bag begins mid-run.  Composes through T_base_gtbody_ so the
+  // seeded state.p lands at base_frame, not at gt_body_frame -- otherwise an
+  // off-base gt_odom source would seed the state with a constant lever-arm
+  // offset (the same defect that previously biased the cross-check). For the
+  // AV-24 single-source NA config the composition is identity since gt_body
+  // == base_frame == novatel_a. If the extrinsic hasn't cached yet (TF lookup
+  // deferred), skip this message and try again on the next one rather than
+  // seeding from a frame we can't compose.
+  // Overrides any param-based initial pose. Sets first_opt_done so odom starts
+  // publishing immediately without waiting for the first accepted GICP scan.
+  if (this->use_odom_init_ && !this->use_odom_init_applied_) {
+    Eigen::Vector3f init_p;
+    Eigen::Quaternionf init_q;
+    if (this->composeGtPoseInBase(s, init_p, init_q)) {
+      this->use_odom_init_applied_ = true;
+      const rclcpp::Time stamp_ros(msg->header.stamp.sec, msg->header.stamp.nanosec);
+      this->applyInitialPose(init_p, init_q, stamp_ros, "gt_odom");
+      {
+        std::lock_guard<std::mutex> lock(this->geo.mtx);
+        this->geo.first_opt_done = true;
+      }
+      RCLCPP_INFO(this->get_logger(),
+                  "Odom init: pose set from GT odom at t=%.3f gt_pos=[%.2f,%.2f,%.2f] "
+                  "-> base_pos=[%.2f,%.2f,%.2f] (gt_body='%s')",
+                  s.stamp, s.p.x(), s.p.y(), s.p.z(),
+                  init_p.x(), init_p.y(), init_p.z(),
+                  this->gt_body_frame_.c_str());
+    } else {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Odom init: deferring -- gt_body -> base extrinsic not cached yet");
+    }
+  }
+
   std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
   if (!this->gt_odom_buffer_.empty() && s.stamp <= this->gt_odom_buffer_.back().stamp) {
     // Out-of-order or duplicate timestamp; drop to keep buffer monotone.
@@ -2434,6 +2592,47 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
                 "First ground-truth odom received at stamp=%.3f frame=%s child_frame=%s",
                 s.stamp, msg->header.frame_id.c_str(),
                 msg->child_frame_id.empty() ? "(empty)" : msg->child_frame_id.c_str());
+  }
+}
+
+void gicp_localization::LocalizationNode::callbackRtkStatus(
+    const novatel_oem7_msgs::msg::BESTGNSSPOS::ConstSharedPtr msg) {
+  // Latch the latest pos_type + stamp under the cache mutex. We deliberately
+  // do not validate the position fields here -- the gate cares only about
+  // the fix status, not the lat/lon/height. pos_type semantics per NovAtel
+  // OEM7: 50=NARROW_INT (cm-level RTK fixed), 56=INS_RTKFIXED (INS-aided
+  // fixed), 34=NARROW_FLOAT (dm-level pre-fix), 55=INS_RTKFLOAT,
+  // 16=SINGLE (m-level standalone), 0=NONE.
+  const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+  const uint32_t pos_type = static_cast<uint32_t>(msg->pos_type.type);
+  {
+    std::lock_guard<std::mutex> lock(this->rtk_status_mtx_);
+    this->rtk_latest_pos_type_ = pos_type;
+    this->rtk_latest_status_stamp_ = stamp;
+  }
+  // Log the first message and any subsequent transitions between
+  // not-fixed and fixed so an operator can see RTK lock/unlock events
+  // in the log without polling.
+  const bool is_fixed = (pos_type == 50u || pos_type == 56u);
+  if (!this->rtk_status_received_.exchange(true)) {
+    RCLCPP_INFO(this->get_logger(),
+                "First BESTGNSSPOS received at stamp=%.3f pos_type=%u "
+                "is_fixed=%s. RTK gate is now active.",
+                stamp, pos_type, is_fixed ? "true" : "false");
+  } else {
+    // Edge-triggered status log (one INFO when the fix state flips).
+    // Static guards work because this callback is serialized within its
+    // own callback group, but use atomic just to be safe under future
+    // multi-threading changes.
+    static std::atomic<bool> prev_fixed{false};
+    bool was_fixed = prev_fixed.exchange(is_fixed);
+    if (was_fixed != is_fixed) {
+      RCLCPP_INFO(this->get_logger(),
+                  "RTK fix transition: %s -> %s (pos_type=%u)",
+                  was_fixed ? "FIXED" : "NOT-FIXED",
+                  is_fixed ? "FIXED" : "NOT-FIXED",
+                  pos_type);
+    }
   }
 }
 
@@ -2473,6 +2672,29 @@ bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& ou
   out.q = a->q.slerp(u, b->q).normalized();
   out.v_lin_body = (1.0f - u) * a->v_lin_body + u * b->v_lin_body;
   out.v_ang_body = (1.0f - u) * a->v_ang_body + u * b->v_ang_body;
+  return true;
+}
+
+bool gicp_localization::LocalizationNode::composeGtPoseInBase(
+    const GtSample& gt, Eigen::Vector3f& p_out,
+    Eigen::Quaternionf& q_out) const {
+  if (!this->gt_extrinsics_cached_) {
+    // Extrinsic not cached yet (first message hasn't fully run the cache
+    // block, or TF lookup deferred).  Caller decides whether to fall back
+    // to gt.p/gt.q directly or skip this cycle.
+    return false;
+  }
+  // T_map_base = T_map_gtbody * inv(T_base_gtbody).  Decomposed:
+  //   q_out = gt.q * inv(R_base_gtbody)
+  //   p_out = gt.p - q_out * t_base_gtbody
+  // Same math as the snap helper -- factored out so the cross-check and the
+  // first-message applyInitialPose path use identical composition rather than
+  // re-deriving (or skipping) the lever-arm.
+  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
+  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
+  const Eigen::Quaternionf q_gtbody_in_base(R_base_gtbody);
+  q_out = (gt.q * q_gtbody_in_base.conjugate()).normalized();
+  p_out = gt.p - q_out * t_base_gtbody;
   return true;
 }
 
@@ -2654,17 +2876,22 @@ bool gicp_localization::LocalizationNode::maybeSnapPoseToGT(const char* reason) 
     return false;
   }
 
-  // T_map_base = T_map_gtbody * inv(T_base_gtbody).
-  // Decomposed: q_new and p_new express the base_frame pose in map.
-  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
-  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
-  const Eigen::Quaternionf q_gtbody_in_base(R_base_gtbody);
-  const Eigen::Quaternionf q_new = (gt.q * q_gtbody_in_base.conjugate()).normalized();
-  const Eigen::Vector3f p_new = gt.p - q_new * t_base_gtbody;
+  // Pose composition: bring gt sample from gt_body_frame into base_frame.
+  // Shared with the diagnostic cross-check via composeGtPoseInBase.
+  Eigen::Vector3f p_new;
+  Eigen::Quaternionf q_new;
+  if (!this->composeGtPoseInBase(gt, p_new, q_new)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "GT recovery: composeGtPoseInBase returned false "
+                         "(extrinsic not cached). Deferring snap.");
+    return false;
+  }
 
   // Twist composition: GT twist is at gt_body. Move it to base via the lever-arm
   // correction (mirrors callbackImu's centripetal-acceleration term).
   // r_gtbody_to_base in gt_body frame:
+  const Eigen::Matrix3f R_base_gtbody = this->T_base_gtbody_.block<3, 3>(0, 0);
+  const Eigen::Vector3f t_base_gtbody = this->T_base_gtbody_.block<3, 1>(0, 3);
   const Eigen::Matrix3f R_gtbody_base = R_base_gtbody.transpose();
   const Eigen::Vector3f t_gtbody_base = -R_gtbody_base * t_base_gtbody;
   Eigen::Vector3f v_base_body;
@@ -2747,6 +2974,33 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
 
   Eigen::Vector3f ang_vel(imu->angular_velocity.x, imu->angular_velocity.y, imu->angular_velocity.z);
   Eigen::Vector3f lin_accel(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
+
+  // One-shot defensive check: warn if the incoming IMU header.frame_id does
+  // not match the configured imu_frame. The single-source NA design assumes
+  // both are "novatel_a"; any other combination usually indicates the
+  // imu_topic launch arg was re-pointed at a different IMU (e.g. vectornav)
+  // without also updating localization/imu_frame. The code would otherwise
+  // silently treat the foreign IMU's axes / lever-arm as if they were at
+  // novatel_a, because the TF lookup base_frame -> imu_frame still returns
+  // identity in our yaml. Atomic exchange ensures the warning fires exactly
+  // once even under the Reentrant callback group. Empty frame_id is tolerated
+  // (some drivers leave it unset); only an explicit mismatch trips the warn.
+  if (!this->imu_frame_id_checked_.exchange(true)) {
+    if (!imu->header.frame_id.empty() &&
+        imu->header.frame_id != this->imu_frame) {
+      RCLCPP_WARN(this->get_logger(),
+                  "IMU header.frame_id='%s' does not match configured "
+                  "localization/imu_frame='%s'. Treating the IMU axes and "
+                  "lever-arm as if at '%s' regardless of the message label. "
+                  "If this is intentional (driver mislabels frame_id), "
+                  "suppress this warning by updating localization/imu_frame "
+                  "to match. If unintentional, the imu_topic remap is "
+                  "probably pointing at the wrong IMU.",
+                  imu->header.frame_id.c_str(),
+                  this->imu_frame.c_str(),
+                  this->imu_frame.c_str());
+    }
+  }
 
   // Cache IMU-to-baselink transform from TF (once)
   if (!this->imu_extrinsics_cached_) {
