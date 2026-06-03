@@ -25,6 +25,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 
 namespace {
@@ -162,6 +163,201 @@ void transformCloudData(uint8_t* data, size_t num_points, uint32_t point_step,
     std::memcpy(base + y_off, &p.y(), sizeof(float));
     std::memcpy(base + z_off, &p.z(), sizeof(float));
   }
+}
+
+const char* pointFieldDatatypeName(uint8_t datatype) {
+  switch (datatype) {
+    case sensor_msgs::msg::PointField::INT8:    return "INT8";
+    case sensor_msgs::msg::PointField::UINT8:   return "UINT8";
+    case sensor_msgs::msg::PointField::INT16:   return "INT16";
+    case sensor_msgs::msg::PointField::UINT16:  return "UINT16";
+    case sensor_msgs::msg::PointField::INT32:   return "INT32";
+    case sensor_msgs::msg::PointField::UINT32:  return "UINT32";
+    case sensor_msgs::msg::PointField::FLOAT32: return "FLOAT32";
+    case sensor_msgs::msg::PointField::FLOAT64: return "FLOAT64";
+    default:                                    return "UNKNOWN";
+  }
+}
+
+// One-shot diagnostic: print everything we can extract about the incoming
+// PointCloud2's timestamp field so a developer can decide which bit-level
+// interpretation the live driver actually uses. See
+// docs/luminar_timestamp_diagnostic_guide.pdf for how to read this output.
+//
+// Fires only on the first cloud (guarded by std::call_once at the caller),
+// always emits the lines regardless of localization/verbose so a single
+// test run produces the answer.
+//
+// Output format (per line):
+//   [LUMINAR_TS_DIAG] <key>: <value>
+// The block is bracketed by [LUMINAR_TS_DIAG] BEGIN / END markers so it's
+// easy to grep out of a noisy log.
+void logTimestampDiagnostic(const sensor_msgs::msg::PointCloud2& pc,
+                            int ts_off, uint8_t ts_datatype, int ts_count,
+                            const char* sensor_name) {
+  std::fprintf(stderr, "[LUMINAR_TS_DIAG] BEGIN\n");
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG] sensor_type=%s  point_step=%u  "
+               "num_points=%u  width=%u  height=%u  is_bigendian=%d  "
+               "header.stamp=%u.%09u  frame_id='%s'\n",
+               sensor_name, pc.point_step,
+               static_cast<unsigned>(pc.data.size() / std::max<uint32_t>(pc.point_step, 1u)),
+               pc.width, pc.height, pc.is_bigendian ? 1 : 0,
+               pc.header.stamp.sec, pc.header.stamp.nanosec,
+               pc.header.frame_id.c_str());
+  std::fprintf(stderr, "[LUMINAR_TS_DIAG] fields (offset, datatype, count, name):\n");
+  for (const auto& f : pc.fields) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]   off=%-4u  type=%-7s  count=%-3u  name='%s'\n",
+                 f.offset, pointFieldDatatypeName(f.datatype), f.count,
+                 f.name.c_str());
+  }
+  if (ts_off < 0) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG] no timestamp field detected (no field named "
+                 "t/time/time_stamp/timestamp). Deskew cannot use per-point times.\n");
+    std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
+    std::fflush(stderr);
+    return;
+  }
+  // Implied byte size per datatype, times count.
+  // (count is normally 1 except for UINT8 where count carries the length of
+  // the byte run, e.g. UINT8 count=8 = 8 raw bytes.)
+  int bytes_per_elem = 1;
+  switch (ts_datatype) {
+    case sensor_msgs::msg::PointField::INT8:
+    case sensor_msgs::msg::PointField::UINT8:    bytes_per_elem = 1; break;
+    case sensor_msgs::msg::PointField::INT16:
+    case sensor_msgs::msg::PointField::UINT16:   bytes_per_elem = 2; break;
+    case sensor_msgs::msg::PointField::INT32:
+    case sensor_msgs::msg::PointField::UINT32:
+    case sensor_msgs::msg::PointField::FLOAT32:  bytes_per_elem = 4; break;
+    case sensor_msgs::msg::PointField::FLOAT64:  bytes_per_elem = 8; break;
+    default:                                      bytes_per_elem = 0; break;
+  }
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG] timestamp_field: off=%d  type=%s  count=%d  "
+               "implied_byte_size=%d\n",
+               ts_off, pointFieldDatatypeName(ts_datatype), ts_count,
+               bytes_per_elem * ts_count);
+
+  // Walk up to 3 sample points (first, midpoint, last) and dump their 8
+  // timestamp bytes interpreted four different ways.  This lets the developer
+  // pattern-match what the driver actually emits without instrumenting the
+  // driver itself.
+  const uint32_t step = pc.point_step;
+  const size_t num_points = pc.data.size() / std::max<uint32_t>(step, 1u);
+  if (num_points == 0 || ts_off + 8 > static_cast<int>(step)) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG] (no samples to dump -- empty cloud or "
+                 "field extends past point_step)\n");
+    std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
+    std::fflush(stderr);
+    return;
+  }
+  const size_t sample_indices[3] = {
+      0u, num_points / 2u,
+      num_points > 0u ? num_points - 1u : 0u};
+  const char* sample_labels[3] = {"point[0]    ", "point[mid]  ", "point[N-1]  "};
+
+  uint64_t ts_uint64[3] = {0, 0, 0};
+  double   ts_double[3] = {0.0, 0.0, 0.0};
+
+  for (int s = 0; s < 3; ++s) {
+    const size_t idx = sample_indices[s];
+    const uint8_t* ptr = pc.data.data() + idx * step + ts_off;
+
+    // Raw 8 bytes (little-endian dump as hex).
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG] %s idx=%zu  raw=%02x %02x %02x %02x "
+                 "%02x %02x %02x %02x\n",
+                 sample_labels[s], idx, ptr[0], ptr[1], ptr[2], ptr[3],
+                 ptr[4], ptr[5], ptr[6], ptr[7]);
+
+    // Interpretation A: bytes are a uint64 (e.g. PTP ns since epoch, or ns
+    // since boot, or ns since scan start).
+    uint64_t u64 = 0;
+    std::memcpy(&u64, ptr, sizeof(uint64_t));
+    ts_uint64[s] = u64;
+
+    // Interpretation B: bytes are an IEEE-754 double encoded as seconds.
+    double d_sec = 0.0;
+    std::memcpy(&d_sec, ptr, sizeof(double));
+    ts_double[s] = d_sec;
+
+    // Interpretation C: bytes are an IEEE-754 double encoded as nanoseconds
+    // (i.e. d_sec interpreted as ns directly).
+    const double d_ns = d_sec;  // same memory, just rename for clarity.
+
+    // Interpretation D: two uint32s (PTP layout: secs in low half, ns offset
+    // in high half, or vice versa).
+    uint32_t u32_lo = 0, u32_hi = 0;
+    std::memcpy(&u32_lo, ptr, sizeof(uint32_t));
+    std::memcpy(&u32_hi, ptr + 4, sizeof(uint32_t));
+
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]              as_uint64=%-20lu  "
+                 "as_double_sec=%.9f  as_double_ns=%.3e  "
+                 "as_uint32_pair=(lo=%-10u hi=%-10u)\n",
+                 static_cast<unsigned long>(u64), d_sec, d_ns,
+                 u32_lo, u32_hi);
+  }
+
+  // Deltas between adjacent samples in each interpretation, to make collapse
+  // obvious at a glance.
+  const int64_t d_u64_01 =
+      static_cast<int64_t>(ts_uint64[1]) - static_cast<int64_t>(ts_uint64[0]);
+  const int64_t d_u64_0N =
+      static_cast<int64_t>(ts_uint64[2]) - static_cast<int64_t>(ts_uint64[0]);
+  const double  d_dbl_01 = ts_double[1] - ts_double[0];
+  const double  d_dbl_0N = ts_double[2] - ts_double[0];
+
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG] deltas (mid - first / last - first):\n");
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG]   as_uint64_ns:    mid-first=%-15ld  "
+               "last-first=%-15ld\n",
+               static_cast<long>(d_u64_01), static_cast<long>(d_u64_0N));
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG]   as_double_sec:   mid-first=%.9f  "
+               "last-first=%.9f\n",
+               d_dbl_01, d_dbl_0N);
+
+  // Heuristic verdict: order-of-magnitude check on each interpretation,
+  // with the assumption that a healthy 10 Hz LiDAR scan should span ~0.1 s.
+  // This is just a hint; the developer reads the raw lines above to confirm.
+  auto plausible_seconds = [](double x) {
+    return x > 1e-4 && x < 1.0;  // within 0.1 ms to 1 s
+  };
+  auto plausible_ns_as_uint64 = [](int64_t x) {
+    return x > 100000 && x < 1000000000;  // 0.1 ms to 1 s, in ns
+  };
+  std::fprintf(stderr,
+               "[LUMINAR_TS_DIAG] verdict (heuristic; check raw lines to confirm):\n");
+  if (plausible_ns_as_uint64(d_u64_0N) && !plausible_seconds(d_dbl_0N)) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]   uint64 ns interpretation looks plausible "
+                 "(span %ld ns ~= %.3f ms)\n",
+                 static_cast<long>(d_u64_0N), d_u64_0N * 1e-6);
+  } else if (plausible_seconds(d_dbl_0N) && !plausible_ns_as_uint64(d_u64_0N)) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]   FLOAT64 seconds interpretation looks "
+                 "plausible (span %.6f s ~= %.3f ms). Current code memcpys as "
+                 "uint64, which scrambles this.  Read as double instead.\n",
+                 d_dbl_0N, d_dbl_0N * 1000.0);
+  } else if (d_u64_0N == 0 && d_dbl_0N == 0.0) {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]   timestamps appear COLLAPSED (zero span "
+                 "in both interpretations). Driver likely fills every point "
+                 "with the same scan-level stamp.\n");
+  } else {
+    std::fprintf(stderr,
+                 "[LUMINAR_TS_DIAG]   verdict unclear -- see raw lines above. "
+                 "Possible: per-scan timestamps with random jitter, or a "
+                 "format we don't recognise.\n");
+  }
+  std::fprintf(stderr, "[LUMINAR_TS_DIAG] END\n");
+  std::fflush(stderr);
 }
 
 bool findTimeField(const sensor_msgs::msg::PointCloud2& msg, int& time_off,
@@ -1508,6 +1704,26 @@ void gicp_localization::LocalizationNode::callbackPointCloud(
   uint8_t time_datatype = 0;
   int time_count = 0;
   const bool has_time_field = findTimeField(*pc, time_off, time_datatype, time_count);
+
+  // One-shot timestamp-field diagnostic. Fires exactly once across the whole
+  // node lifetime (std::call_once) and dumps every PointField + the first few
+  // points' timestamp bytes interpreted four ways. The developer reads the
+  // [LUMINAR_TS_DIAG] block in stderr to decide which bit-level interpretation
+  // the live driver actually uses. See
+  // docs/luminar_timestamp_diagnostic_guide.pdf for how to interpret the
+  // output and the corresponding fix in copyPointTimeFromCloud.
+  static std::once_flag ts_diag_once;
+  std::call_once(ts_diag_once, [&]() {
+    const char* sensor_name =
+        this->sensor == dlio::SensorType::LUMINAR  ? "luminar"
+        : this->sensor == dlio::SensorType::OUSTER ? "ouster"
+        : this->sensor == dlio::SensorType::VELODYNE ? "velodyne"
+        : this->sensor == dlio::SensorType::HESAI   ? "hesai"
+        : this->sensor == dlio::SensorType::LIVOX   ? "livox"
+                                                    : "unknown";
+    logTimestampDiagnostic(*pc, time_off, time_datatype, time_count,
+                           sensor_name);
+  });
 
   if (x_off < 0 || y_off < 0 || z_off < 0) {
     RCLCPP_ERROR(this->get_logger(), "Point cloud missing x/y/z fields");
