@@ -29,10 +29,11 @@
     # second lever-arm work happens here (avoids double-compensating
     # what Atlas already did internally).
     #
-    # gt_odom is still /gps_na/filtered_odom at novatel_a (NovAtel RTK is
-    # the production truth source for cross-check / snap / RTK-driven init).
-    # composeGtPoseInBase resolves the static novatel_a -> gps_antenna_top
-    # offset via TF (both linked under rear_axle_middle in the URDF).
+    # gt_odom is /gps_p1/filtered_odom (Atlas FusionEngine INS solution)
+    # which publishes nav_msgs/Odometry with header.frame_id="map" and
+    # child_frame_id="gps_antenna_top" -- same body frame as base_frame
+    # and imu_frame. composeGtPoseInBase therefore also collapses to an
+    # identity TF; no cross-vendor lever-arm work happens anywhere.
     localization/map_frame: "map"
     localization/base_frame: "gps_antenna_top"
     localization/imu_frame: "gps_antenna_top"
@@ -66,42 +67,46 @@
     localization/use_odom_init: true
 
     # Ground-truth odom cross-check. When enabled, the node subscribes to the
-    # `gt_odom` remap (default /gps_na/filtered_odom in launch -- NA INS pre-VKS,
-    # naturally at NA_IMU_Frame) and reports gt_err=[trans,rot,dt] in every
-    # SCAN DEBUG line + publishes the deltas on
-    # gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg. Diagnostic only --
-    # never feeds back into accept/reject decisions.
+    # `gt_odom` remap (default /gps_p1/filtered_odom -- Atlas FusionEngine INS
+    # solution, header.frame_id="map", child_frame_id="gps_antenna_top") and
+    # reports gt_err=[trans,rot,dt] in every SCAN DEBUG line + publishes the
+    # deltas on gicp/localization/debug/gt_pos_err_m and .../gt_rot_err_deg.
+    # Diagnostic only -- never feeds back into accept/reject decisions.
     #
-    # Frame note: because gt_odom is at the same frame as base_frame (both
-    # novatel_a), the cross-check ||cand_p - gt.p|| is exact (no lever-arm
-    # bias), and the snap helper's T_base_gtbody_ resolves to identity. Do
-    # NOT change the remap to /localization/global/odom (race_common VKS at
-    # cg) without also setting localization/base_frame: cg -- otherwise the
-    # cross-check carries a constant ~0.39 m baseline and applyInitialPose
-    # seeds the state at the wrong reference. See docs/GICP_GNSS_IMU_bug_report.pdf.
+    # Frame note: gt_odom's child_frame_id is gps_antenna_top, identical to
+    # base_frame and imu_frame, so the cross-check ||cand_p - gt.p|| is exact
+    # (no lever-arm bias) and the snap helper's T_base_gtbody_ resolves to
+    # identity. The composeGtPoseInBase helper still runs and caches the TF on
+    # first GT message, but it returns identity in this configuration.
     localization/gt_odom/enable: true
     localization/gt_odom/buffer_size: 200      # ring buffer depth (~2s @ 100Hz GT)
     localization/gt_odom/max_dt: 0.1           # seconds; reject lookups farther than this from scan stamp
 
-    # RTK fix-status gate on the gt_odom buffer. Drops every incoming gt_odom
-    # sample that arrives while the NovAtel BESTGNSSPOS solution is NOT
-    # RTK-fixed (NARROW_INT=50 or INS_RTKFIXED=56; plus NARROW_FLOAT=34 /
-    # INS_RTKFLOAT=55 when allow_float=true). The gate is in-code enforcement
-    # of the assumption that race_common's voted INS used to provide
-    # implicitly (stop publishing during RTK loss); /gps_na/filtered_odom
-    # may keep publishing through brief RTK degradations.
+    # RTK quality gate on the gt_odom buffer. Drops every incoming gt_odom
+    # sample whose Atlas-reported pose covariance is worse than the configured
+    # thresholds. This is the P1-native replacement for the NovAtel BESTGNSSPOS
+    # enum gate (RAWIMUSX/INSPVAX/CORRIMUSX path is gone -- everything now
+    # comes from /gps_p1/* and the FusionEngine driver populates Odometry's
+    # covariance directly from its solution quality).
     #
-    # When enable=true, the node subscribes to the `rtk_status` remap
-    # (default /novatel_a/bestgnsspos in launch). If that topic doesn't
-    # publish, NO gt_odom samples are accepted -- the node falls back to
-    # pure IMU dead-reckoning. This is the conservative default.
-    # Set enable=false to disable the gate (samples will be accepted
-    # regardless of RTK status -- snap and init may seed state from a
-    # degraded fix). Disabling is intended only for bag-replay diagnostics
-    # where the BESTGNSSPOS topic is unavailable.
+    # The gate inspects msg->pose.covariance[0,7,14] (xx, yy, zz position
+    # variances in m^2). Reject if any horizontal variance exceeds
+    # max_pose_var_xy, OR vertical variance exceeds max_pose_var_z.
+    #
+    # Reference values from a known-RTK-fixed bag (run_2, 17 min, Atlas
+    # at AV-24): median cov_xx=2.8e-5, cov_yy=4.2e-5, cov_zz=1.0e-4. p95
+    # cov_xx=4.1e-5, cov_yy=5.7e-5, cov_zz=1.3e-4. Maxes never exceed
+    # 1.1e-4 horizontal / 2.5e-4 vertical. RTK-float typically lives in
+    # the 1e-2 -- 1e-1 m^2 band; GPS-only at 1 m^2 +. The default thresholds
+    # below admit anything down to RTK-float and reject only when Atlas
+    # has fully degraded to GPS-only.
+    #
+    # Disable (enable=false) only for replays of bags lacking covariance
+    # populating, or for diagnostic runs where you want all gt_odom samples
+    # accepted.
     localization/rtk_gate/enable: true
-    localization/rtk_gate/allow_float: false   # require RTK FIXED, not just FLOAT
-    localization/rtk_gate/max_status_age: 2.0  # seconds; stale -> treat as not fixed
+    localization/rtk_gate/max_pose_var_xy: 0.25  # m^2; ~0.5 m horizontal std
+    localization/rtk_gate/max_pose_var_z: 1.0    # m^2; ~1.0 m vertical std (GPS Z is naturally worse)
 
     # GT-driven pose recovery: when GICP fails for `min_consecutive_failures`
     # scans in a row, snap current_pose / lidarPose / state.{p,q,v} to the
@@ -173,30 +178,64 @@
 
     # RTK-driven IMU calibration: use the post-gate GT odom buffer as the truth
     # source for bias estimation. Lets the vehicle calibrate while moving and
-    # seeds pose+velocity from the first RTK-fixed sample rather than assuming
+    # seeds pose+velocity from the first RTK-quality sample rather than assuming
     # stationary. With localization/rtk_gate/enable=true, gt_odom samples are
-    # accepted only after BESTGNSSPOS reports a fresh RTK-fixed status, so
-    # gt_odom_received_ means "a gated RTK-fixed sample arrived." If the gate is
-    # disabled for bag-replay diagnostics, this guarantee is removed and RTK init
-    # may seed from whatever the gt_odom topic publishes. If no accepted GT
-    # message arrives within rtk_init/fallback_timeout seconds of the first IMU
-    # sample, the node falls back to the stationary path above.
+    # accepted only when Atlas reports pose covariance within the configured
+    # thresholds, so gt_odom_received_ means "a high-quality RTK sample
+    # arrived." If the gate is disabled for bag-replay diagnostics, this
+    # guarantee is removed and RTK init may seed from whatever the gt_odom
+    # topic publishes. If no accepted GT message arrives within
+    # rtk_init/fallback_timeout seconds of the first IMU sample, the node falls
+    # back to the stationary path above.
     localization/rtk_init/enable: true
     localization/rtk_init/calib_window: 2.0      # seconds of IMU+GT residual accumulation
     localization/rtk_init/fallback_timeout: 5.0  # seconds without GT before stationary fallback
 
-    # Geometric Observer Parameters (proportional correction gains, matching upstream DLIO)
+    # Geometric Observer Parameters
+    # Proportional gains that drive the state toward each accepted GICP
+    # scan (run at ~10 Hz Luminar). Time constants tau = 1/K:
+    #   Kp=4.5  -> tau_p  ~ 0.22 s  (position pull-in)
+    #   Kv=11.25-> tau_v  ~ 0.09 s  (velocity)
+    #   Kq=4.0  -> tau_q  ~ 0.25 s  (orientation)
+    # These are the upstream DLIO defaults. They have held up well on the
+    # AV-24 high-speed runs and are NOT tightened further here -- raising
+    # them aggravates LiDAR-noise feedthrough on Luminar at >60 m/s.
     odom/geo/Kp: 4.5      # Position correction gain
     odom/geo/Kv: 11.25    # Velocity correction gain
     odom/geo/Kq: 4.0      # Orientation correction gain
-    # Online bias adaptation from GICP residuals is disabled for the fused
-    # NovAtel INS path. RTK/stationary init can still seed state.b once; set
-    # these >0 only to restore upstream DLIO-style adaptive IMU bias tracking.
+    # Online bias adaptation from GICP residuals stays disabled for the
+    # Atlas-INS imu_calibrated path: residual bias is already small
+    # (firmware-stable) and there is no reason to let GICP residuals
+    # rewrite the bias estimate. Initial RTK / stationary calibration still
+    # seeds state.b once; set these >0 only to restore upstream DLIO-style
+    # adaptive IMU bias tracking.
     odom/geo/Kab: 0.0     # Accelerometer bias adaptation gain
     odom/geo/Kgb: 0.0     # Gyroscope bias adaptation gain
-    odom/geo/Kz_damping: 0.0  
-    odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
-    odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)
+    # Vertical-velocity damping. DISABLED by default.
+    #
+    # The propagator term is:  new_v_lin_w[2] *= (1 - dt * Kz_damping)
+    # i.e. a blind exponential pull on world-Z velocity, applied every
+    # 10 ms regardless of whether the vehicle is actually airborne or
+    # just climbing a grade. With Kz_damping=5.0, ~40% of any true
+    # vertical velocity is lost between adjacent 10 Hz GICP scans, which
+    # systematically biases position on sustained climbs (Pikes Peak,
+    # mountain rally, banked-oval entry/exit, hill stages). Flat-track
+    # use cases (IMS, Putnam) are unaffected because vel_z stays near 0.
+    #
+    # We keep this at 0 because Atlas FusionEngine provides a
+    # firmware-precise gravity reference -- the original DLIO motivation
+    # for the term (cumulative gravity sub-compensation error from raw
+    # MEMS bias x mount-tilt cross-term) does not apply here. Re-enable
+    # (try 0.5 -> tau ~ 2 s) only if you observe slow Z drift between
+    # scans AND the bag is from a near-flat track.
+    odom/geo/Kz_damping: 0.0
+    # Tightened from upstream DLIO's 5.0 / 0.5 to physically-plausible
+    # MEMS-bias bounds. With Atlas firmware calibration the residual bias
+    # is well under these. These clamps only matter if someone re-enables
+    # Kab/Kgb above; tighter values prevent the observer from soaking
+    # extrinsic-mismatch error into bias.
+    odom/geo/abias_max: 0.3    # Max accelerometer bias (m/s^2)
+    odom/geo/gbias_max: 0.05   # Max gyroscope bias (rad/s)
 
     # Debug / Visualization helpers
     localization/debug/enable_pub: false

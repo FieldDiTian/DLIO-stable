@@ -1,15 +1,46 @@
 {
   "gnss": {
-    "gnss_topic": "/gps_na/odom",
+    // RTK-FIXED-only filtered stream from
+    // gicp_localization/scripts/rtk_fixed_odom_filter.py. Each message that
+    // lands here turns into a GNSS-position factor on the corresponding
+    // pose in the global iSAM2 graph. During GNSS-denied passages the
+    // filter stops forwarding -- no factors are added -- and the LiDAR+IMU
+    // odometry alone drives the trajectory until RTK reacquires. The next
+    // arriving message anchors the post-dropout trajectory back to the
+    // global frame and iSAM2 retroactively smooths the trajectory.
+    "gnss_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "gnss_msg_type": "nav_msgs/msg/Odometry",
     "min_baseline": 5.0,
     "enable_orientation_prior": false,
-    // Diagnostic: very loose 2D translation anchor only, no orientation constraint.
-    // sigma = 1/sqrt(precision) -> 1m sigma on x,y; z effectively unconstrained.
+    // Precisions (1/variance per axis) consumed by
+    // gtsam::noiseModel::Diagonal::Precisions().  Reminder: precision is
+    // information, NOT sigma -- higher = tighter constraint.  Equivalent
+    // sigma per axis is sigma = 1 / sqrt(precision).
+    //
+    // Sized for Atlas RTK-FIXED input (pre-filtered by
+    // rtk_fixed_odom_filter.py).  Measured on AV-24 run_2:
+    //   cov_xx median 2.8e-5 m^2 (sigma ~5 mm); p95 4.1e-5 (~6 mm)
+    //   cov_yy median 4.2e-5 m^2 (sigma ~6 mm); p95 5.7e-5 (~8 mm)
+    //   cov_zz median 1.0e-4 m^2 (sigma ~1 cm); p95 1.3e-4 (~1.1 cm)
+    //
+    // Defaults below sit ~2-3x looser than Atlas's reported precision --
+    // leaves headroom for transient multipath / firmware-INS spikes that
+    // covariance doesn't capture, while still being stiff enough to
+    // anchor the LiDAR+IMU trajectory through GNSS-denied passages.
+    //
+    //   prior_inf_scale[0]=1e4  -> sigma_x ~ 1 cm
+    //   prior_inf_scale[1]=1e4  -> sigma_y ~ 1 cm
+    //   prior_inf_scale[2]=1e3  -> sigma_z ~ 3 cm  (GPS Z naturally looser)
+    //
+    // Loosen (smaller values) if you see Atlas GNSS factors pulling the
+    // trajectory away from LiDAR consistency during tracking; tighten
+    // (larger values) if loop closures show residual drift through
+    // dropouts (the GNSS anchor at dropout exit isn't being trusted
+    // enough to absorb the IMU/LiDAR drift).
     "prior_inf_scale": [
-      1e6,
-      1e6,
-      1e-6
+      1e4,
+      1e4,
+      1e3
     ],
     "orientation_prior_inf_scale": [
       1e-6,
@@ -18,18 +49,20 @@
     ],
     // Software antenna -> IMU lever-arm compensation.
     //
-    // Set to FALSE for tightly-coupled INS receivers (Novatel SPAN, Septentrio
-    // AsteRx-i, Atlas Duo, etc.) where the firmware already resolves antenna
-    // observations to the IMU origin internally via LEVERARMCONFIG. Applying
-    // the correction here as well would double-compensate.
+    // Set to FALSE for tightly-coupled INS receivers (Point One Atlas,
+    // Novatel SPAN, Septentrio AsteRx-i, etc.) where the firmware already
+    // resolves antenna observations to a common chassis reference internally.
+    // Applying the correction here as well would double-compensate.
     //
     // Set to TRUE only for raw-GNSS publishers that report antenna-frame
-    // position. The lever arm is then read from the URDF using urdf_gnss_frame
-    // below.
+    // position. The lever arm is then read from the URDF using
+    // urdf_gnss_frame below.
     //
-    // Current vehicle (AV-24 Cybertruck, Novatel INS): firmware compensates,
-    // so this stays false. Leaving the urdf_gnss_frame populated would still
-    // be ignored, but we also blank it for belt-and-suspenders clarity.
+    // Current vehicle (AV-24, Point One Atlas): Atlas FusionEngine projects
+    // both IMU and INS pose to the primary antenna phase centre internally,
+    // so the gnss_topic message's position is ALREADY at gps_antenna_top.
+    // Our LiDAR+IMU odometry runs in the same frame (urdf_imu_frame =
+    // "gps_antenna_top"), so the relative correction is zero. Leave false.
     "enable_lever_arm": false,
     // URDF link name of the GNSS antenna. Only consulted when
     // enable_lever_arm is true. Empty string means "no lever arm".

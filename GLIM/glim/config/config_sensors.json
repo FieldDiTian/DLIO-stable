@@ -50,13 +50,26 @@
       752,
       480
     ],
-    "imu_acc_noise": 0.2,
-    // imu_bias_noise: Atlas firmware applies sensor-level bias/scale
-    // calibration so the residual bias is much more stable than raw MEMS.
-    // Tightened from 1e-4 to 1e-5 to reflect that. Revert if you ever
-    // re-point GLIM at a raw IMU stream (e.g. /gps_na/imu RAWIMUSX).
+    // IMU noise densities feed gtsam::PreintegrationParams. Units:
+    //   imu_acc_noise   ~ m/s^2/sqrt(Hz)
+    //   imu_gyro_noise  ~ rad/s/sqrt(Hz)
+    //   imu_bias_noise  ~ random-walk noise of the constant-bias state
+    //   imu_int_noise   ~ integration discretisation noise
+    //
+    // Tuned for Atlas FusionEngine imu_calibrated on the AV-24 + slow-speed
+    // mapping use case. The empirical stationary noise on /gps_p1/imu at 99 Hz
+    // is sigma_a ~ 3 mm/s^2 (density ~3e-4 m/s^2/sqrt(Hz)) and sigma_w ~
+    // 7e-3 rad/s (density ~7e-4 rad/s/sqrt(Hz)). The upstream GLIM defaults
+    // (0.2 / 0.05) were sized for an uncalibrated MEMS at >100x the physical
+    // density. We tighten by ~4x for accel and ~5x for gyro -- enough headroom
+    // for vibration transients during mapping runs without letting the IMU
+    // factor over-power LiDAR. Revert to 0.2 / 0.05 if you ever re-point
+    // GLIM at a raw IMU stream (e.g. a NovAtel RAWIMUSX-derived topic).
+    "imu_acc_noise": 0.05,
+    "imu_gyro_noise": 0.01,
+    // Atlas firmware bias is firmware-stable; the GTSAM bias random walk only
+    // needs to track slow thermal drift. Tightened from 1e-4 to 1e-5.
     "imu_bias_noise": 1e-5,
-    "imu_gyro_noise": 0.05,
     "imu_int_noise": 0.001,
     "intensity_field": "reflectance",
     "intrinsics": [

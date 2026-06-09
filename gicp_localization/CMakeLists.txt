@@ -25,11 +25,6 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_sensor_msgs REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
-# Required for the RTK fix-status gate on the gt_odom buffer; the node
-# subscribes to BESTGNSSPOS and rejects samples that aren't NARROW_INT /
-# INS_RTKFIXED. See localization/rtk_gate/* in localization.yaml.
-find_package(novatel_oem7_msgs REQUIRED)
-
 find_package(PCL REQUIRED)
 find_package( Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
@@ -70,7 +65,7 @@ ament_target_dependencies(nano_gicp)
 # Localization Node
 add_executable(gicp_localization_node src/localization_node.cc src/localization.cc)
 target_link_libraries(gicp_localization_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp)
-ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs" "novatel_oem7_msgs")
+ament_target_dependencies(gicp_localization_node "tf2_ros" "tf2_geometry_msgs" "tf2_eigen" "tf2_sensor_msgs" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs" "visualization_msgs")
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)

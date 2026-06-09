@@ -21,10 +21,6 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 
-// NovAtel: BESTGNSSPOS is consumed for the RTK fix-status gate that
-// rejects gt_odom samples when the NovAtel position is not RTK-fixed.
-#include <novatel_oem7_msgs/msg/bestgnsspos.hpp>
-
 // PCL
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
@@ -80,16 +76,6 @@ private:
   void callbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr& pose);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
   void callbackGtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
-  // Updates the cached RTK fix status from a NovAtel BESTGNSSPOS message.
-  // The status is used in callbackGtOdom to gate buffer pushes -- samples
-  // that arrive while the NovAtel solution is not in the RTK fixed state
-  // (NARROW_INT / INS_RTKFIXED, plus the float variants when allow_float
-  // is true) are silently rejected. The gate is the in-code enforcement
-  // of the assumption that race_common's voted INS used to provide
-  // implicitly (stop publishing when RTK is lost); /gps_na/filtered_odom
-  // may keep publishing through brief RTK degradations.
-  void callbackRtkStatus(
-      const novatel_oem7_msgs::msg::BESTGNSSPOS::ConstSharedPtr msg);
   // Returns true if a GT sample within gt_odom_max_dt_ of `stamp` was found and interpolated into out.
   bool getGtPoseAt(double stamp, GtSample& out);
   // Compose T_map_base = T_map_gtbody * inv(T_base_gtbody) using the cached
@@ -157,12 +143,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gt_odom_sub;
-  // RTK fix-status subscriber for the gt_odom gate (BESTGNSSPOS). Optional
-  // -- only created when localization/rtk_gate/enable=true.
-  rclcpp::Subscription<novatel_oem7_msgs::msg::BESTGNSSPOS>::SharedPtr
-      rtk_status_sub_;
   rclcpp::CallbackGroup::SharedPtr pointcloud_cb_group, initial_pose_cb_group,
-      imu_cb_group, gt_odom_cb_group, rtk_status_cb_group_;
+      imu_cb_group, gt_odom_cb_group;
 
   // Ground-truth odom for divergence cross-check (optional)
   // Latest message and a small ring buffer for time-matched lookup.
@@ -173,25 +155,16 @@ private:
   std::mutex gt_odom_mtx_;
   std::atomic<bool> gt_odom_received_{false};
 
-  // RTK fix-status gate for the gt_odom buffer. Drops samples that arrive
-  // while the NovAtel BESTGNSSPOS solution is not in an RTK-fixed state
-  // (NARROW_INT=50 or INS_RTKFIXED=56, plus NARROW_FLOAT=34 / INS_RTKFLOAT=55
-  // when allow_float=true). Status is cached by the BESTGNSSPOS subscriber
-  // and read by callbackGtOdom under rtk_status_mtx_; stale status (older
-  // than max_status_age seconds) is treated as not-fixed for safety.
+  // RTK quality gate for the gt_odom buffer (P1-native). Drops samples whose
+  // Atlas-reported pose covariance (pose.covariance[0,7,14] -- xx, yy, zz)
+  // exceeds the configured thresholds. The gate inspects the gt_odom message
+  // itself; no separate status topic is involved. Replaces the old
+  // BESTGNSSPOS-enum gate (removed when the NovAtel path was retired).
   bool rtk_gate_enabled_;
-  bool rtk_gate_allow_float_;
-  double rtk_gate_max_status_age_sec_;
-  std::mutex rtk_status_mtx_;
-  uint32_t rtk_latest_pos_type_;          // last NovAtel pos_type seen
-  double rtk_latest_status_stamp_;        // header stamp of last status msg
-  std::atomic<bool> rtk_status_received_{false};
-  // Counters for rate-limited rejection logging (so the operator can see
-  // "X samples rejected because RTK not fixed in last N seconds" instead of
-  // either silence or log spam).
-  std::atomic<uint64_t> rtk_rejected_not_fixed_{0};
-  std::atomic<uint64_t> rtk_rejected_stale_status_{0};
-  std::atomic<uint64_t> rtk_rejected_no_status_{0};
+  double rtk_gate_max_pose_var_xy_;  // m^2; reject if cov[0] or cov[7] > this
+  double rtk_gate_max_pose_var_z_;   // m^2; reject if cov[14] > this
+  // Counter for rate-limited rejection logging.
+  std::atomic<uint64_t> rtk_rejected_covariance_{0};
 
   // GT-driven pose recovery (optional). Mirrors the IMU extrinsic caching pattern
   // in callbackImu: on first GT message we record child_frame_id and look up the
@@ -303,12 +276,13 @@ private:
   std::vector<std::string> imu_topic_allowlist_;
   bool imu_require_frame_match_{true};
   // One-shot guard for the defensive IMU header.frame_id consistency check
-  // in callbackImu. Single-source NA design assumes every IMU message comes
-  // from /gps_na/imu and is referenced at imu_frame (= "novatel_a" in yaml).
+  // in callbackImu. All-P1 design assumes every IMU message comes from
+  // /gps_p1/imu and is referenced at imu_frame (= "gps_antenna_top" in yaml).
   // If someone re-points imu_topic at a different IMU, the code would
-  // silently treat its axes as if they were at novatel_a (the TF lookup
-  // novatel_a -> novatel_a still returns identity). This flag arms a one-
-  // time warning so the misconfiguration surfaces at least once in the log.
+  // silently treat its axes as if they were at gps_antenna_top (the TF
+  // lookup gps_antenna_top -> gps_antenna_top still returns identity).
+  // This flag arms a one-time warning so the misconfiguration surfaces at
+  // least once in the log.
   std::atomic<bool> imu_frame_id_checked_{false};
 
   // IMU calibration state

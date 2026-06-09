@@ -61,13 +61,21 @@
     "map_frame_id": "map",
     "publish_imu2lidar": true,
     "tf_time_offset": 1e-6,
-    // Extension modules
+    // Extension modules.
+    // libgnss_global.so adds GNSS-position factors to the iSAM2 global graph
+    // whenever a usable RTK-FIXED sample arrives on the gnss topic configured
+    // in config_gnss_global.json. The primary trajectory comes from
+    // LiDAR + IMU odometry (config_odometry_gpu.json), so during GNSS-denied
+    // passages the GNSS factor stream simply goes silent and LiDAR+IMU alone
+    // drives mapping. Once RTK reacquires, the next GNSS factor pulls the
+    // post-dropout trajectory back into the global frame; iSAM2 smooths the
+    // dropout retroactively.
     "extension_modules": [
       "libmemory_monitor.so",
       "libstandard_viewer.so",
       "librviz_viewer.so",
-      "libimu_validator.so"
-      // "libgnss_global.so"
+      "libimu_validator.so",
+      "libgnss_global.so"
     ],
     // Topics
     // Atlas FusionEngine imu_calibrated: sensor-level bias/scale/misalignment
@@ -76,9 +84,12 @@
     "imu_topic": "/gps_p1/imu",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
-    // External INS / GNSS-aided odometry. Leave blank to disable.
-    // Consumed by the INS odometry estimator (libodometry_estimation_ins.so) when enabled.
-    "external_odom_topic": "/localization/global/odom",
+    // External INS / GNSS-aided odometry. Consumed ONLY by
+    // libodometry_estimation_ins.so. With the current config.json (gpu
+    // LiDAR+IMU odometry), this topic is unused -- GNSS enters the system
+    // through libgnss_global.so via config_gnss_global.json's gnss_topic.
+    // Left set for completeness / for switching back to the INS estimator.
+    "external_odom_topic": "/gps_p1/filtered_odom_rtk_fixed",
     "external_odom_qos": {
       "profile": "default",
       "depth": 100

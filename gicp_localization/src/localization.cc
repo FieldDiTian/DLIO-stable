@@ -824,9 +824,9 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
         const size_t pub_count = this->count_publishers(imu_topic);
         if (pub_count == 0) {
           RCLCPP_WARN(this->get_logger(),
-                      "No IMU received on '%s' (0 publishers). Check the imu_topic launch arg — "
-                      "common typos: '/gps_na/imu' vs '/gps_nav/imu'. Run "
-                      "`ros2 topic list | grep -i imu` to see available IMU topics.",
+                      "No IMU received on '%s' (0 publishers). Check the imu_topic launch arg. "
+                      "Run `ros2 topic list | grep -i imu` to see available IMU topics. "
+                      "Default expects /gps_p1/imu (Atlas FusionEngine imu_calibrated).",
                       imu_topic.c_str());
         } else {
           RCLCPP_WARN(this->get_logger(),
@@ -837,8 +837,8 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
       });
 
   // Optional ground-truth odom subscriber for divergence cross-check.
-  // Topic is remappable as "gt_odom"; default points to /gps_na/filtered_odom
-  // in launch (NA INS pre-VKS, at NA_IMU_Frame, matches base_frame=novatel_a).
+  // Topic is remappable as "gt_odom"; default points to /gps_p1/filtered_odom
+  // in launch (Atlas FusionEngine INS at gps_antenna_top, matching base_frame).
   if (this->gt_odom_enabled_) {
     this->gt_odom_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     auto gt_sub_opt = rclcpp::SubscriptionOptions();
@@ -855,40 +855,25 @@ gicp_localization::LocalizationNode::LocalizationNode() : Node("gicp_localizatio
                 this->gt_odom_buffer_size_, this->gt_odom_max_dt_);
   }
 
-  // Optional RTK fix-status subscriber for the gt_odom gate. When enabled,
-  // BESTGNSSPOS messages update the cached pos_type; callbackGtOdom checks
-  // that cache before pushing each sample into the buffer, rejecting any
-  // GT odom that arrives while NovAtel is not RTK-fixed. Topic is
-  // remappable as "rtk_status"; default points to /novatel_a/bestgnsspos
-  // in launch.
-  if (this->gt_odom_enabled_ && this->rtk_gate_enabled_) {
-    this->rtk_status_cb_group_ = this->create_callback_group(
-        rclcpp::CallbackGroupType::Reentrant);
-    auto rtk_sub_opt = rclcpp::SubscriptionOptions();
-    rtk_sub_opt.callback_group = this->rtk_status_cb_group_;
-    auto rtk_qos = rclcpp::QoS(rclcpp::KeepLast(10));
-    rtk_qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
-    rtk_qos.durability(rclcpp::DurabilityPolicy::Volatile);
-    this->rtk_status_sub_ = this->create_subscription<
-        novatel_oem7_msgs::msg::BESTGNSSPOS>(
-        "rtk_status", rtk_qos,
-        std::bind(&gicp_localization::LocalizationNode::callbackRtkStatus,
-                  this, std::placeholders::_1),
-        rtk_sub_opt);
-    RCLCPP_INFO(this->get_logger(),
-                "RTK fix-status gate ENABLED (topic remap 'rtk_status', "
-                "allow_float=%s, max_status_age=%.1fs). Samples with "
-                "non-RTK-fixed status will be DROPPED from the gt_odom "
-                "buffer (no init / no snap / no cross-check from those).",
-                this->rtk_gate_allow_float_ ? "true" : "false",
-                this->rtk_gate_max_status_age_sec_);
-  } else if (this->gt_odom_enabled_) {
-    RCLCPP_WARN(this->get_logger(),
-                "RTK fix-status gate DISABLED. gt_odom samples will be "
-                "accepted regardless of NovAtel pos_type -- snap and "
-                "init may seed state from non-RTK-fixed (cm-level) or "
-                "worse positions. Enable localization/rtk_gate/enable to "
-                "reject degraded GNSS.");
+  // RTK quality gate is now self-contained in callbackGtOdom: it inspects
+  // msg->pose.covariance on each gt_odom sample (no separate subscription).
+  // Log the current configuration so the operator can see what's active.
+  if (this->gt_odom_enabled_) {
+    if (this->rtk_gate_enabled_) {
+      RCLCPP_INFO(this->get_logger(),
+                  "RTK quality gate ENABLED (P1-native): drop gt_odom when "
+                  "pose covariance exceeds max_pose_var_xy=%.3f m^2 or "
+                  "max_pose_var_z=%.3f m^2.",
+                  this->rtk_gate_max_pose_var_xy_,
+                  this->rtk_gate_max_pose_var_z_);
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "RTK quality gate DISABLED. gt_odom samples will be "
+                  "accepted regardless of Atlas-reported pose covariance "
+                  "-- snap and init may seed state from degraded GNSS. "
+                  "Enable localization/rtk_gate/enable to reject samples "
+                  "with poor covariance.");
+    }
   }
 
   // Setup publishers
@@ -1076,23 +1061,20 @@ void gicp_localization::LocalizationNode::getParams() {
   this->gt_odom_buffer_size_ = static_cast<size_t>(std::max(gt_buf, 1));
   this->gt_odom_max_dt_ = gt_max_dt;
 
-  // RTK fix-status gate for the gt_odom buffer. When enabled, samples are
-  // only pushed when NovAtel BESTGNSSPOS reports an RTK-fixed solution
-  // (NARROW_INT or INS_RTKFIXED -- or one of the float variants when
-  // allow_float=true). Conservative defaults: gate ON, float NOT allowed,
-  // max_status_age 2 s (BESTGNSSPOS is published at 20 Hz typical; 2 s
-  // means up to 40 missed messages still treats the cache as fresh).
+  // RTK quality gate (P1-native): drop gt_odom samples whose Atlas-reported
+  // position covariance exceeds the configured thresholds. Conservative
+  // defaults: gate ON; xy threshold 0.25 m^2 (~0.5 m std, comfortably above
+  // RTK-fixed and float-mode covariances measured on AV-24 ~ 5e-5 m^2);
+  // z threshold 1.0 m^2 (~1 m std, since GPS Z is naturally worse).
   this->declare_parameter<bool>("localization/rtk_gate/enable", true);
-  this->declare_parameter<bool>("localization/rtk_gate/allow_float", false);
-  this->declare_parameter<double>("localization/rtk_gate/max_status_age", 2.0);
+  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_xy", 0.25);
+  this->declare_parameter<double>("localization/rtk_gate/max_pose_var_z", 1.0);
   this->get_parameter("localization/rtk_gate/enable",
                       this->rtk_gate_enabled_);
-  this->get_parameter("localization/rtk_gate/allow_float",
-                      this->rtk_gate_allow_float_);
-  this->get_parameter("localization/rtk_gate/max_status_age",
-                      this->rtk_gate_max_status_age_sec_);
-  this->rtk_latest_pos_type_ = 0;  // NONE
-  this->rtk_latest_status_stamp_ = -1.0;
+  this->get_parameter("localization/rtk_gate/max_pose_var_xy",
+                      this->rtk_gate_max_pose_var_xy_);
+  this->get_parameter("localization/rtk_gate/max_pose_var_z",
+                      this->rtk_gate_max_pose_var_z_);
 
   // GT-driven pose recovery (optional). Independent of gt_odom/enable; recovery
   // requires the same subscriber to be active, so it implies gt_odom/enable.
@@ -1230,27 +1212,28 @@ void gicp_localization::LocalizationNode::getParams() {
   // IMU calibration time (seconds of stationary data to average for bias/gravity)
   this->declare_parameter<double>("dlio/imu/calibTime", 3.0);
   this->get_parameter("dlio/imu/calibTime", this->imu_calib_time_);
-  // Hard guard for single-source NA deployments: by default the localizer only
-  // accepts an IMU subscription resolved to /gps_na/imu.
+  // Hard guard for single-source P1 deployments: by default the localizer only
+  // accepts an IMU subscription resolved to /gps_p1/imu.
   this->declare_parameter<bool>("localization/imu/require_topic_allowlist", true);
   this->declare_parameter<std::vector<std::string>>(
-      "localization/imu/topic_allowlist", std::vector<std::string>{"/gps_na/imu"});
+      "localization/imu/topic_allowlist", std::vector<std::string>{"/gps_p1/imu"});
   this->get_parameter("localization/imu/require_topic_allowlist", this->imu_require_topic_allowlist_);
   this->get_parameter("localization/imu/topic_allowlist", this->imu_topic_allowlist_);
   if (this->imu_topic_allowlist_.empty()) {
-    this->imu_topic_allowlist_.push_back("/gps_na/imu");
+    this->imu_topic_allowlist_.push_back("/gps_p1/imu");
   }
   // Safety guard: reject IMU samples whose header.frame_id does not match
-  // localization/imu_frame. Keep enabled by default for NovAtel-only operation.
+  // localization/imu_frame. Keep enabled by default for P1-only operation.
   this->declare_parameter<bool>("localization/imu/require_frame_match", true);
   this->get_parameter("localization/imu/require_frame_match", this->imu_require_frame_match_);
 
   // RTK-driven IMU calibration. When enabled, the first accepted GT odom
   // sample triggers a calibration window in which IMU residuals are computed
   // against the GT pose/twist (no stationary assumption). With the RTK gate
-  // enabled, "accepted" means BESTGNSSPOS reported a fresh RTK-fixed status;
-  // disabling the gate for bag replay removes that guarantee. Falls back to
-  // stationary calibration if no accepted GT arrives within fallback_timeout.
+  // enabled, "accepted" means /gps_p1/filtered_odom reported pose covariance
+  // within the configured thresholds; disabling the gate for bag replay
+  // removes that guarantee. Falls back to stationary calibration if no
+  // accepted GT arrives within fallback_timeout.
   this->declare_parameter<bool>("localization/rtk_init/enable", true);
   this->declare_parameter<double>("localization/rtk_init/calib_window", 2.0);
   this->declare_parameter<double>("localization/rtk_init/fallback_timeout", 5.0);
@@ -2411,8 +2394,8 @@ void gicp_localization::LocalizationNode::performLocalization() {
       const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
       // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
       // using the same TF composition the snap helper uses. For the AV-24
-      // single-source NA config this is a no-op (identity TF, gt_body ==
-      // base_frame == novatel_a), but applying the composition explicitly
+      // single-source P1 config this is a no-op (identity TF, gt_body ==
+      // base_frame == gps_antenna_top), but applying the composition explicitly
       // keeps the cross-check correct under any future gt_odom source change
       // (e.g. re-pointing the remap back at /localization/global/odom at cg).
       // Without this composition, the cross-check carries a constant baseline
@@ -2848,67 +2831,35 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
 
-  // RTK fix-status gate (in-code enforcement of "NovAtel must be RTK-fixed
-  // before GICP adopts any GPS-derived pose"). Drops the entire sample --
-  // no buffer push, no initial-pose seed, no snap, no cross-check. The gate
-  // runs BEFORE TF caching so a degraded GNSS sample can't even seed the
-  // cache state. Disabled gate is a pass-through.
+  // RTK quality gate (P1-native): inspect Atlas-reported pose covariance on
+  // the gt_odom message itself. Drops the entire sample -- no buffer push,
+  // no initial-pose seed, no snap, no cross-check. Runs BEFORE TF caching so
+  // a degraded GNSS sample can't even seed the cache state. Disabled gate is
+  // a pass-through.
+  //
+  // pose.covariance is laid out as a row-major 6x6 (x,y,z,roll,pitch,yaw):
+  //   [0]=cov_xx  [7]=cov_yy  [14]=cov_zz  (position variances in m^2)
+  // Reject if any horizontal variance exceeds max_pose_var_xy OR vertical
+  // variance exceeds max_pose_var_z. Atlas keeps these in the ~5e-5 m^2 band
+  // when RTK-fixed and orders of magnitude higher when degraded.
   if (this->rtk_gate_enabled_) {
-    uint32_t pos_type = 0;
-    double status_stamp = -1.0;
-    {
-      std::lock_guard<std::mutex> lock(this->rtk_status_mtx_);
-      pos_type = this->rtk_latest_pos_type_;
-      status_stamp = this->rtk_latest_status_stamp_;
-    }
-
-    // (a) No status received yet -> reject. We cannot prove RTK is fixed
-    // until at least one BESTGNSSPOS message lands.
-    if (!this->rtk_status_received_.load()) {
-      this->rtk_rejected_no_status_++;
+    const double cov_xx = msg->pose.covariance[0];
+    const double cov_yy = msg->pose.covariance[7];
+    const double cov_zz = msg->pose.covariance[14];
+    const bool xy_bad = (cov_xx > this->rtk_gate_max_pose_var_xy_) ||
+                        (cov_yy > this->rtk_gate_max_pose_var_xy_);
+    const bool z_bad  = (cov_zz > this->rtk_gate_max_pose_var_z_);
+    if (xy_bad || z_bad) {
+      this->rtk_rejected_covariance_++;
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "RTK gate: dropping gt_odom -- no BESTGNSSPOS "
-                           "received yet (rejected total=%lu). Check the "
-                           "rtk_status topic remap.",
-                           this->rtk_rejected_no_status_.load());
-      return;
-    }
-
-    // (b) Status too stale -> reject. NovAtel publishes BESTGNSSPOS at
-    // ~20 Hz; if the last status is older than max_status_age we have no
-    // current evidence of an RTK lock.
-    const double age = s.stamp - status_stamp;
-    if (age > this->rtk_gate_max_status_age_sec_) {
-      this->rtk_rejected_stale_status_++;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "RTK gate: dropping gt_odom -- BESTGNSSPOS is "
-                           "%.2f s stale (max %.2f s). Last pos_type=%u. "
-                           "Rejected total=%lu.",
-                           age, this->rtk_gate_max_status_age_sec_,
-                           pos_type,
-                           this->rtk_rejected_stale_status_.load());
-      return;
-    }
-
-    // (c) Status fresh but not RTK-fixed -> reject. NovAtel pos_type
-    // semantics: NARROW_INT=50 and INS_RTKFIXED=56 are the cm-level
-    // fixed-integer solutions; NARROW_FLOAT=34 and INS_RTKFLOAT=55 are
-    // the carrier-phase float pre-fix states (decimeter-level). Only
-    // accept FLOAT when allow_float is on.
-    const bool is_fixed = (pos_type == 50u || pos_type == 56u);
-    const bool is_float = (pos_type == 34u || pos_type == 55u);
-    const bool pass = is_fixed || (this->rtk_gate_allow_float_ && is_float);
-    if (!pass) {
-      this->rtk_rejected_not_fixed_++;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "RTK gate: dropping gt_odom -- pos_type=%u not "
-                           "RTK-fixed (need NARROW_INT=50 or "
-                           "INS_RTKFIXED=56%s). Rejected total=%lu.",
-                           pos_type,
-                           this->rtk_gate_allow_float_
-                               ? ", or NARROW_FLOAT=34 / INS_RTKFLOAT=55"
-                               : "",
-                           this->rtk_rejected_not_fixed_.load());
+                           "RTK gate: dropping gt_odom -- pose covariance "
+                           "exceeds threshold "
+                           "(cov_xx=%.4g cov_yy=%.4g cov_zz=%.4g; "
+                           "max_xy=%.4g max_z=%.4g). Rejected total=%lu.",
+                           cov_xx, cov_yy, cov_zz,
+                           this->rtk_gate_max_pose_var_xy_,
+                           this->rtk_gate_max_pose_var_z_,
+                           this->rtk_rejected_covariance_.load());
       return;
     }
   }
@@ -2967,8 +2918,8 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   // seeded state.p lands at base_frame, not at gt_body_frame -- otherwise an
   // off-base gt_odom source would seed the state with a constant lever-arm
   // offset (the same defect that previously biased the cross-check). For the
-  // AV-24 single-source NA config the composition is identity since gt_body
-  // == base_frame == novatel_a. If the extrinsic hasn't cached yet (TF lookup
+  // AV-24 single-source P1 config the composition is identity since gt_body
+  // == base_frame == gps_antenna_top. If the extrinsic hasn't cached yet (TF lookup
   // deferred), skip this message and try again on the next one rather than
   // seeding from a frame we can't compose.
   // Overrides any param-based initial pose. Sets first_opt_done so odom starts
@@ -3010,47 +2961,6 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
                 "First ground-truth odom received at stamp=%.3f frame=%s child_frame=%s",
                 s.stamp, msg->header.frame_id.c_str(),
                 msg->child_frame_id.empty() ? "(empty)" : msg->child_frame_id.c_str());
-  }
-}
-
-void gicp_localization::LocalizationNode::callbackRtkStatus(
-    const novatel_oem7_msgs::msg::BESTGNSSPOS::ConstSharedPtr msg) {
-  // Latch the latest pos_type + stamp under the cache mutex. We deliberately
-  // do not validate the position fields here -- the gate cares only about
-  // the fix status, not the lat/lon/height. pos_type semantics per NovAtel
-  // OEM7: 50=NARROW_INT (cm-level RTK fixed), 56=INS_RTKFIXED (INS-aided
-  // fixed), 34=NARROW_FLOAT (dm-level pre-fix), 55=INS_RTKFLOAT,
-  // 16=SINGLE (m-level standalone), 0=NONE.
-  const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-  const uint32_t pos_type = static_cast<uint32_t>(msg->pos_type.type);
-  {
-    std::lock_guard<std::mutex> lock(this->rtk_status_mtx_);
-    this->rtk_latest_pos_type_ = pos_type;
-    this->rtk_latest_status_stamp_ = stamp;
-  }
-  // Log the first message and any subsequent transitions between
-  // not-fixed and fixed so an operator can see RTK lock/unlock events
-  // in the log without polling.
-  const bool is_fixed = (pos_type == 50u || pos_type == 56u);
-  if (!this->rtk_status_received_.exchange(true)) {
-    RCLCPP_INFO(this->get_logger(),
-                "First BESTGNSSPOS received at stamp=%.3f pos_type=%u "
-                "is_fixed=%s. RTK gate is now active.",
-                stamp, pos_type, is_fixed ? "true" : "false");
-  } else {
-    // Edge-triggered status log (one INFO when the fix state flips).
-    // Static guards work because this callback is serialized within its
-    // own callback group, but use atomic just to be safe under future
-    // multi-threading changes.
-    static std::atomic<bool> prev_fixed{false};
-    bool was_fixed = prev_fixed.exchange(is_fixed);
-    if (was_fixed != is_fixed) {
-      RCLCPP_INFO(this->get_logger(),
-                  "RTK fix transition: %s -> %s (pos_type=%u)",
-                  was_fixed ? "FIXED" : "NOT-FIXED",
-                  is_fixed ? "FIXED" : "NOT-FIXED",
-                  pos_type);
-    }
   }
 }
 
@@ -3424,15 +3334,16 @@ void gicp_localization::LocalizationNode::callbackImu(const sensor_msgs::msg::Im
   Eigen::Vector3f lin_accel(imu->linear_acceleration.x, imu->linear_acceleration.y, imu->linear_acceleration.z);
 
   // One-shot defensive check: warn if the incoming IMU header.frame_id does
-  // not match the configured imu_frame. The single-source NA design assumes
-  // both are "novatel_a"; any other combination usually indicates the
-  // imu_topic launch arg was re-pointed at a different IMU (e.g. vectornav)
-  // without also updating localization/imu_frame. The code would otherwise
-  // silently treat the foreign IMU's axes / lever-arm as if they were at
-  // novatel_a, because the TF lookup base_frame -> imu_frame still returns
-  // identity in our yaml. Atomic exchange ensures the warning fires exactly
-  // once even under the Reentrant callback group. Empty frame_id is tolerated
-  // (some drivers leave it unset); only an explicit mismatch trips the warn.
+  // not match the configured imu_frame. The single-source P1 design assumes
+  // both are "gps_antenna_top"; any other combination usually indicates the
+  // imu_topic launch arg was re-pointed at a different IMU (e.g. a NovAtel
+  // or VectorNav source) without also updating localization/imu_frame. The
+  // code would otherwise silently treat the foreign IMU's axes / lever-arm
+  // as if they were at gps_antenna_top, because the TF lookup base_frame ->
+  // imu_frame still returns identity in our yaml. Atomic exchange ensures the
+  // warning fires exactly once even under the Reentrant callback group.
+  // Empty frame_id is tolerated (some drivers leave it unset); only an
+  // explicit mismatch trips the warn.
   const bool imu_frame_mismatch =
       !imu->header.frame_id.empty() &&
       imu->header.frame_id != this->imu_frame;

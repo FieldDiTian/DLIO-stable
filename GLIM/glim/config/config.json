@@ -7,8 +7,23 @@
     "config_viewer": "config_viewer.json",
     "config_sensors": "config_sensors.json",
     "config_preprocess": "config_preprocess.json",
-    // "config_odometry": "config_odometry_gpu.json",
-    "config_odometry": "config_odometry_ins.json",
+    // RTK-tolerant mapping design:
+    //   * Primary odometry = LiDAR + IMU fused (gpu/cpu/ct estimator). Runs
+    //     continuously, no external pose required, no holes during RTK loss.
+    //   * Global anchoring = libgnss_global.so extension (enabled in
+    //     config_ros.json), which adds GNSS-position factors to the iSAM2
+    //     graph whenever a usable RTK-FIXED sample arrives. During GNSS-denied
+    //     passages the GNSS factor stream goes silent and LiDAR+IMU odometry
+    //     alone drives the trajectory until RTK reacquires.
+    //   * Pre-filter (gicp_localization/scripts/rtk_fixed_odom_filter.py)
+    //     gates the GNSS topic to RTK-FIXED quality only, so degraded fixes
+    //     never poison the global graph.
+    // The old config_odometry_ins.json path (INS-driven, GLIM PAUSES on RTK
+    // loss) is left in tree for reference but should not be selected for
+    // production mapping that traverses GNSS-denied terrain.
+    "config_odometry": "config_odometry_gpu.json",
+    // "config_odometry": "config_odometry_ins.json",
+    // "config_odometry": "config_odometry_cpu.json",
     "config_sub_mapping": "config_sub_mapping_passthrough.json",
     "config_global_mapping": "config_global_mapping_gpu.json",
     "config_gnss": "config_gnss_global.json",

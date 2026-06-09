@@ -102,12 +102,12 @@ The block matches its comment exactly. Don't refactor unless asked.
 **What it looks like**: `t_imu_gnss = T_imu_gnss.translation()` throws away
 the rotation part of an SE(3) transform. Looks like a missed correction.
 
-**Why it's actually fine on AV-24**: in `av24.urdf`, both `novatel_a_joint`
-(the IMU per `urdf_imu_frame: "novatel_a"`) and `gps_antenna_right_joint`
-(the antenna) are origin-only — no `rpy` attributes — and share the same
+**Why it's actually fine on AV-24**: in `av24.urdf`, both the chassis `pointonenav_joint`
+and `gps_antenna_top_joint` are origin-only — no `rpy` attributes — and share the same
 parent link `rear_axle_middle`. So `R_imu→antenna = identity`, and the
 translation is the same vector regardless of which of those two frames you
-express it in.
+express it in. With Atlas firmware projecting both IMU and pose to
+`gps_antenna_top` directly, the offset never enters our math at all.
 
 **Watch condition**: if a future URDF adds an `rpy` to either joint, or the
 `urdf_imu_frame` is switched to a non-axis-aligned IMU, the lever-arm
@@ -124,10 +124,9 @@ correction will become biased. A startup warning was added in commit
 - `GLIM/glim_ext/modules/mapping/gnss_global/include/glim_ext/gnss_global_module.hpp:361-368`
 
 **What it looks like**: the GNSS extension subtracts `R_world_imu * t_imu_gnss`
-from the reported GNSS position. If the Novatel receiver is also configured
-with `LEVERARMCONFIG`, both firmware and software would compensate, biasing
-the GNSS prior by ~0.6 m horizontal on AV-24 (the `novatel_a` →
-`gps_antenna_right` offset).
+from the reported GNSS position. If Atlas firmware also applies its IMU-to-antenna
+projection internally, both firmware and software would compensate, biasing
+the GNSS prior.
 
 **Why it's actually fine on AV-24 today**:
 - `libgnss_global.so` is **commented out** in `config_ros.json`'s
@@ -135,20 +134,20 @@ the GNSS prior by ~0.6 m horizontal on AV-24 (the `novatel_a` →
   never loaded, so mapping does not double-compensate.
 - The INS-driven odometry frontend (`libodometry_estimation_ins.so`) computes
   its own `T_imu_ins` from URDF but resolves to identity in the current
-  config: `urdf_imu_frame: "novatel_a"` and `urdf_ins_frame: "novatel_a"`.
+  config: `urdf_imu_frame: "gps_antenna_top"` and `urdf_ins_frame: "gps_antenna_top"`.
 - The localization node (`gicp_localization`) does not apply a GNSS
-  lever-arm correction at all. As of the single-source NA design, it
-  consumes `/gps_na/filtered_odom` (NA INS pre-VKS, naturally at
-  NA_IMU_Frame) as-is. The lever arm is handled inside the NovAtel
-  firmware. `base_frame`, `imu_frame`, and the gt_odom source are all
-  at `novatel_a`, so the in-code TF lookups (`baselink2imu_T`,
+  lever-arm correction at all. As of the all-P1 single-source design, it
+  consumes `/gps_p1/filtered_odom` (Atlas INS, `child_frame_id="gps_antenna_top"`)
+  as-is. The lever arm is handled inside Atlas firmware (chassis IMU → antenna
+  phase centre). `base_frame`, `imu_frame`, and the gt_odom source are all
+  at `gps_antenna_top`, so the in-code TF lookups (`baselink2imu_T`,
   `T_base_gtbody_`) resolve to identity. See
-  `gicp_localization/docs/GICP_GNSS_IMU_bug_report.pdf` for the
+  `gicp_localization/docs/GICP_GNSS_IMU_bug_report.pdf` for the historical
   architectural alternatives that were considered.
 
 **Watch condition**: if `libgnss_global.so` is uncommented, or
 `urdf_ins_frame` is changed to a different link than `urdf_imu_frame`,
-verify the Novatel `LEVERARMCONFIG` state before merging — software
+verify Atlas's firmware projection contract before merging — software
 compensation must only be on when the firmware is off, and vice versa.
 Setting `urdf_gnss_frame: ""` in `config_gnss_global.json` hard-disables
 the software side even if the extension is re-enabled.
@@ -164,36 +163,33 @@ receives and pushes it into the buffer with no RTK / fix-status check.
 A reviewer might flag this as a missing guard — snap-back could fire from
 a degraded GNSS fix.
 
-**Why it's mostly fine on AV-24** (under the single-source NA design):
-`/gps_na/filtered_odom` is published by race_common's `novatel_interface`
-node, which applies its own quality gates (`sensors.position_rms`,
-`sensors.heading_stdev_max`, `sensors.activation_speed`, and the
-`bypass_checks` flag in `novatel_interface.param.yaml`). Combined with
-the 0.1 s `gt_odom/max_dt` window, a stalled or rejected upstream
-publisher cleanly defers snap-back (logged as
+**Why it's mostly fine on AV-24** (under the all-P1 single-source design):
+`/gps_p1/filtered_odom` is published by race_common's
+`pointonenav_interface` node, which forwards Atlas FusionEngine's INS
+solution along with its native pose covariance. Combined with the 0.1 s
+`gt_odom/max_dt` window, a stalled or rejected upstream publisher
+cleanly defers snap-back (logged as
 `deferring snap — no GT sample within max_dt…`) rather than firing on
 stale data.
 
-**RTK-contract gate now enforced in code**: the previous design relied
-on `/localization/global/odom` (voted INS output) stopping publication
-entirely when RTK is not fixed. The new single-source NA design
-subscribes to `/gps_na/filtered_odom` directly, which can keep publishing
-through RTK degradations. The localization node now subscribes to the
-NovAtel `BESTGNSSPOS` topic (default `/novatel_a/bestgnsspos`,
-remappable as `rtk_status`) and rejects every `gt_odom` sample whose
-cached `pos_type` is not in the RTK-fixed set (`NARROW_INT=50` or
-`INS_RTKFIXED=56`; plus `NARROW_FLOAT=34` / `INS_RTKFLOAT=55` when
-`localization/rtk_gate/allow_float=true`). Stale status (older than
-`localization/rtk_gate/max_status_age`, default 2 s) is treated as
-not-fixed. See `callbackRtkStatus` and the RTK-gate block at the top of
-`callbackGtOdom`. Reviewers should not flag the missing fix-status guard
-in the legacy code path — it now exists explicitly.
+**RTK-quality gate enforced in code (P1-native)**: the localization node
+inspects `msg->pose.covariance[0,7,14]` (xx, yy, zz position variances)
+on every `/gps_p1/filtered_odom` sample and rejects anything that exceeds
+the configured thresholds (`localization/rtk_gate/max_pose_var_xy`,
+default 0.25 m^2; `localization/rtk_gate/max_pose_var_z`, default 1.0 m^2).
+This is the all-P1 replacement for the legacy NovAtel BESTGNSSPOS enum
+gate; the entire gate is now self-contained at the top of
+`callbackGtOdom` (no separate status topic, no extra subscription).
+Reference covariances from known-RTK-fixed AV-24 bag: median cov_xx
+≈ 2.8e-5 m^2; RTK-float lives in the 1e-2…1e-1 m^2 band; GPS-only ≥ 1 m^2.
+Reviewers should not flag the missing fix-status guard in the legacy
+code path — it now exists explicitly as a covariance check.
 
-**Watch condition**: if the RTK gate is disabled (`rtk_gate/enable=false`)
-or the `rtk_status` topic is misrouted, the joint failure mode to keep
-in mind is a low-feature LiDAR stretch coinciding with an RTK
-degradation: GICP can't recover geometrically and the snap pulls toward
-a degraded GNSS fix.
+**Watch condition**: if the gate is disabled (`rtk_gate/enable=false`)
+or Atlas covariance population is broken on a particular bag, the joint
+failure mode to keep in mind is a low-feature LiDAR stretch coinciding
+with an RTK degradation: GICP can't recover geometrically and the snap
+pulls toward a degraded GNSS fix.
 
 ---
 
@@ -266,17 +262,20 @@ When reviewing this codebase:
 
 Improve the GICP localization algorithm by integrating with a race car platform and two integrated GNSS systems, one for NovAtel, one for vectorNav
 
-### Current scope clarification: single-source NovAtel is intentional
+### Current scope clarification: single-source Point One Atlas is intentional
 
 The imported objective above mentions two integrated GNSS systems
 (NovAtel + VectorNav), but the current `art-jazzy` implementation deliberately
-narrowed the localization runtime to the NovAtel (`/gps_na/*`) path. This is
-not an accidental omission: the safe race-day design keeps IMU, GT odom, RTK
-status, `base_frame`, and `imu_frame` aligned at `novatel_a`, then gates
-`/gps_na/filtered_odom` with NovAtel `BESTGNSSPOS` before using it for init,
-cross-check, calibration, or snap recovery.
+narrowed the localization runtime to the Point One Atlas (`/gps_p1/*`) path.
+This is not an accidental omission: the safe race-day design keeps IMU, GT
+odom, RTK quality, `base_frame`, and `imu_frame` aligned at `gps_antenna_top`
+(Atlas's firmware-projected output point), then gates `/gps_p1/filtered_odom`
+on Atlas's own pose covariance before using it for init, cross-check,
+calibration, or snap recovery. The NovAtel and VectorNav subscriptions, RTK
+status topic, and `novatel_oem7_msgs` dependency were removed.
 
-Do not review the absence of VectorNav fusion as a bug in the current branch.
-Treat VectorNav integration as future scope requiring an explicit design for
-source selection/voting, frame targets, RTK/fix-status semantics, and failure
-fallbacks before it is enabled in `gicp_localization`.
+Do not review the absence of NovAtel or VectorNav fusion as a bug in the
+current branch. Treat multi-vendor GNSS integration as future scope requiring
+an explicit design for source selection/voting, frame targets, fix-status
+semantics, and failure fallbacks before it is enabled in
+`gicp_localization`.

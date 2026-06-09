@@ -25,31 +25,21 @@ def generate_launch_description():
 
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
-    # Atlas-INS IMU + NovAtel-RTK GT design:
-    #   imu_topic    = /gps_p1/imu       (Atlas FusionEngine imu_calibrated:
-    #                                     sensor-level bias/scale/misalignment
-    #                                     removed by P1 firmware; gravity
-    #                                     PRESENT; no fused orientation; 99 Hz)
-    #   gt_odom_topic = /gps_na/filtered_odom  (NovAtel INS pre-VKS at novatel_a;
-    #                                           RTK-fixed positioning)
-    #   imu_frame / base_frame = "gps_antenna_top"  (Atlas projects its
-    #                                                IMU output to the primary
-    #                                                GNSS antenna phase centre
-    #                                                via firmware lever-arm,
-    #                                                same point Atlas reports
-    #                                                position at).
-    # composeGtPoseInBase resolves the static novatel_a -> gps_antenna_top
-    # offset via TF on first GT message, so the cross-check / snap / RTK init
-    # paths all operate at the IMU/pose reference frame with no double
-    # lever-arm work.
+    # All-P1 single-source design:
+    #   imu_topic     = /gps_p1/imu              (Atlas imu_calibrated)
+    #   gt_odom_topic = /gps_p1/filtered_odom    (Atlas FusionEngine INS)
+    #   imu_frame / base_frame = "gps_antenna_top"
+    #
+    # Atlas projects its IMU output AND its INS pose solution to the primary
+    # GNSS antenna phase centre via firmware lever-arm, so every comparison
+    # the node performs lives at the same body reference -- no TF lever-arm
+    # correction needed anywhere, no second GNSS vendor, no novatel_oem7_msgs
+    # dependency. The RTK quality gate inspects msg->pose.covariance on the
+    # gt_odom message itself, so there is no separate /bestgnsspos
+    # subscription -- the gate is self-contained in callbackGtOdom.
     imu_topic = LaunchConfiguration('imu_topic', default='/gps_p1/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
-    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_na/filtered_odom')
-    # NovAtel BESTGNSSPOS topic for the RTK fix-status gate. Drives the
-    # decision to accept or drop each gt_odom sample. See
-    # localization/rtk_gate/* in the yaml.
-    rtk_status_topic = LaunchConfiguration(
-        'rtk_status_topic', default='/novatel_a/bestgnsspos')
+    gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_p1/filtered_odom')
     imu_only = LaunchConfiguration('imu_only', default='false')
     urdf_path = LaunchConfiguration(
         'urdf_path',
@@ -74,18 +64,11 @@ def generate_launch_description():
     declare_gt_odom_topic_arg = DeclareLaunchArgument(
         'gt_odom_topic', default_value=gt_odom_topic,
         description='Ground-truth odometry topic for init / divergence cross-check / GT-recovery snap. '
-                    'Default /gps_na/filtered_odom -- NA pre-VKS, at NA_IMU_Frame, matches base_frame. '
+                    'Default /gps_p1/filtered_odom -- Atlas FusionEngine INS solution, '
+                    'header.frame_id="map", child_frame_id="gps_antenna_top" (matches base_frame). '
                     'Do NOT point this at /localization/global/odom (cg frame) without also changing '
                     'localization/base_frame to cg, or the cross-check baseline will be biased by '
                     '~0.39 m and applyInitialPose will seed the state offset by the same amount.')
-    declare_rtk_status_topic_arg = DeclareLaunchArgument(
-        'rtk_status_topic', default_value=rtk_status_topic,
-        description='NovAtel BESTGNSSPOS topic for the RTK fix-status gate on gt_odom. '
-                    'Default /novatel_a/bestgnsspos. When localization/rtk_gate/enable=true '
-                    'the node subscribes here and rejects gt_odom samples while NovAtel is '
-                    'not RTK-fixed (NARROW_INT=50 / INS_RTKFIXED=56). If this topic does not '
-                    'publish, ALL gt_odom samples are dropped -- the node falls back to pure '
-                    'IMU dead-reckoning. Set localization/rtk_gate/enable=false to disable.')
     declare_imu_only_arg = DeclareLaunchArgument(
         'imu_only', default_value=imu_only,
         description='If true, disable GICP and run IMU-only propagation')
@@ -157,7 +140,6 @@ def generate_launch_description():
                 ('imu', imu_topic),
                 ('odom', odom_topic),
                 ('gt_odom', gt_odom_topic),
-                ('rtk_status', rtk_status_topic),
                 ('localized_pose', 'gicp/localization/pose'),
                 ('localized_odom', 'gicp/localization/odom'),
                 ('localized_path', 'gicp/localization/path'),
@@ -202,7 +184,6 @@ def generate_launch_description():
         declare_imu_topic_arg,
         declare_odom_topic_arg,
         declare_gt_odom_topic_arg,
-        declare_rtk_status_topic_arg,
         declare_imu_only_arg,
         declare_urdf_path_arg,
         declare_parent_frame_arg,

@@ -46,8 +46,8 @@ The single supported launch file is `localization_with_tf.launch.py`. It starts 
 ros2 launch gicp_localization localization_with_tf.launch.py \
     rviz:=true \
     pointcloud_topic:=/luminar_front/points \
-    imu_topic:=/gps_na/imu \
-    gt_odom_topic:=/gps_na/filtered_odom
+    imu_topic:=/gps_p1/imu \
+    gt_odom_topic:=/gps_p1/filtered_odom
 ```
 
 ### Launch arguments
@@ -56,48 +56,43 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
 |---|---|---|
 | `rviz` | `false` | Launch RViz with the bundled config. |
 | `pointcloud_topic` | `/luminar_front/points` | Primary LiDAR topic (gets remapped to `pointcloud`). |
-| `imu_topic` | `/gps_na/imu` | NovAtel IMU topic (matches `base_frame=novatel_a`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
+| `imu_topic` | `/gps_p1/imu` | Point One Atlas `imu_calibrated` (sensor-calibrated, gravity present, 99 Hz, frame `gps_antenna_top`). **Watch for typos**: it's `imu_topic` (underscore), not `imu-topic`. |
 | `odom_topic` | `/odom` | Pose-init odom topic when `localization/use_odom_init=true` and not bootstrapping from GT. |
-| `gt_odom_topic` | `/gps_na/filtered_odom` | NovAtel pre-VKS INS odometry, at NA_IMU_Frame. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Matches `base_frame` so no TF correction is needed. |
-| `rtk_status_topic` | `/novatel_a/bestgnsspos` | NovAtel BESTGNSSPOS for the RTK fix-status gate. While not RTK-fixed, gt_odom samples are dropped. Set `localization/rtk_gate/enable=false` to disable the gate. |
+| `gt_odom_topic` | `/gps_p1/filtered_odom` | Atlas FusionEngine INS odometry, at `gps_antenna_top`. Used when `localization/gt_odom/enable=true` and/or `gt_recovery/enable=true`. Same frame as `base_frame`, so no TF correction is needed. |
 | `imu_only` | `false` | Disable GICP and propagate pose from IMU only (debug/sanity check). |
 | `urdf_path` | (auto-found) | Path to the URDF that publishes sensor TFs. |
 | `parent_frame` / `child_frame` | `base_link` / `luminar_front` | Used by the bundled static-TF helper. |
 | `map_path` | (yaml) | Override the yaml `localization/map_path` from the command line. |
 
-### Frame conventions (single-source NA design)
+### Frame conventions (all-P1 single-source design)
 
-Every comparison the node performs lives at `NA_IMU_Frame` (URDF link `novatel_a`):
+Every comparison the node performs lives at the Atlas antenna phase centre (URDF link `gps_antenna_top`):
 
-- `localization/base_frame: novatel_a` — GICP's state is reported at this frame.
-- `localization/imu_frame: novatel_a` — IMU subscription from `/gps_na/imu` is at this frame.
-- `gt_odom_topic` → `/gps_na/filtered_odom` — NA INS pre-VKS, naturally at this frame.
+- `localization/base_frame: gps_antenna_top` — GICP's state is reported at this frame.
+- `localization/imu_frame: gps_antenna_top` — IMU subscription from `/gps_p1/imu` is at this frame (Atlas firmware projects the chassis-mounted IMU to the antenna point internally via lever-arm).
+- `gt_odom_topic` → `/gps_p1/filtered_odom` — Atlas INS pose, `child_frame_id="gps_antenna_top"`.
 
 Because base_frame, imu_frame, and the gt_odom source all align, the in-code TF lookups in `callbackImu` (`baselink2imu_T`) and `callbackGtOdom` (`T_base_gtbody_`) degenerate to identity. No lever-arm work happens anywhere; the cross-check `gt_pos_err_m` is exact (no constant baseline bias); `applyInitialPose` correctly seeds the state; the snap helper composes a no-op identity TF.
 
-This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is no GNSS-source-quality fallback (NA only) and the localized pose lives at NA_IMU_Frame rather than the controller-expected `cg` (downstream consumers need an extra `novatel_a → cg` TF lookup, which `robot_state_publisher` already provides). See `docs/GICP_GNSS_IMU_bug_report.pdf` for the architectural alternatives and their trade-offs.
+This design deliberately bypasses race_common's downstream `cg`-frame intermediate (VKS / robot_localization). The trade-off is the localized pose lives at the antenna point rather than the controller-expected `cg` (downstream consumers need an extra `gps_antenna_top → cg` TF lookup, which `robot_state_publisher` already provides). See `docs/GICP_GNSS_IMU_bug_report.pdf` for the architectural alternatives and their trade-offs.
 
-### RTK fix-status gate
+### RTK quality gate (P1 covariance-based)
 
-GICP enforces in-code that every gt_odom sample is RTK-fixed before it enters the buffer. With the legacy `/localization/global/odom` topic, race_common's voted INS stopped publishing during RTK loss; with `/gps_na/filtered_odom` the upstream may keep publishing through brief RTK degradations, so the gate is now done explicitly here.
+GICP enforces in-code that every gt_odom sample carries Atlas-reported pose covariance below configured thresholds before it enters the buffer. Replaces the legacy NovAtel BESTGNSSPOS enum gate; the gate is now self-contained in `callbackGtOdom` (no separate status topic).
 
 ```yaml
-localization/rtk_gate/enable:         true   # require RTK-fixed status
-localization/rtk_gate/allow_float:    false  # require NARROW_INT / INS_RTKFIXED, not just FLOAT
-localization/rtk_gate/max_status_age: 2.0    # seconds; older status = treat as not fixed
+localization/rtk_gate/enable:           true   # inspect msg->pose.covariance
+localization/rtk_gate/max_pose_var_xy:  0.25   # m^2 (~0.5 m horizontal std)
+localization/rtk_gate/max_pose_var_z:   1.0    # m^2 (~1.0 m vertical std)
 ```
 
-Mechanism: the node subscribes to `rtk_status` (default `/novatel_a/bestgnsspos`). Each NovAtel `BESTGNSSPOS` message updates a cached `pos_type` + stamp. On every gt_odom message, the cache is checked and the sample is rejected unless `pos_type ∈ {NARROW_INT=50, INS_RTKFIXED=56}` (plus `{NARROW_FLOAT=34, INS_RTKFLOAT=55}` when `allow_float=true`) and the status is fresher than `max_status_age`.
+Mechanism: on every `/gps_p1/filtered_odom` message, the node reads `pose.covariance[0]`, `[7]`, `[14]` (xx, yy, zz position variances). The sample is rejected if any horizontal variance exceeds `max_pose_var_xy` OR the vertical variance exceeds `max_pose_var_z`. Reference covariances from a known-RTK-fixed AV-24 bag: median `cov_xx`≈2.8e-5, `cov_yy`≈4.2e-5, `cov_zz`≈1.0e-4 m². RTK-float typically lives in the 1e-2…1e-1 m² band; GPS-only at 1 m²+.
 
-When the gate rejects, GICP runs on IMU dead-reckoning until RTK recovers. Operator-facing log lines (throttled to 5 s):
+When the gate rejects, GICP runs on IMU dead-reckoning until Atlas's solution recovers. Operator-facing log line (throttled to 5 s):
 
-- `RTK gate: dropping gt_odom -- no BESTGNSSPOS received yet (rejected total=N)` — gate is on but `rtk_status` topic isn't publishing.
-- `RTK gate: dropping gt_odom -- BESTGNSSPOS is X.XX s stale (max 2.00 s). Last pos_type=N` — BESTGNSSPOS stopped or slowed.
-- `RTK gate: dropping gt_odom -- pos_type=N not RTK-fixed (need NARROW_INT=50 or INS_RTKFIXED=56)` — RTK lost or never acquired.
+- `RTK gate: dropping gt_odom -- pose covariance exceeds threshold (cov_xx=… cov_yy=… cov_zz=… ; max_xy=… max_z=…). Rejected total=N`
 
-Edge-triggered transitions are also logged: `RTK fix transition: NOT-FIXED -> FIXED (pos_type=50)` when GICP starts accepting samples again.
-
-Set `rtk_gate/enable: false` only for bag-replay diagnostics where the BESTGNSSPOS topic isn't available — disabling the gate lets snap and init seed state from non-RTK-fixed positions.
+Set `rtk_gate/enable: false` only for bag-replay diagnostics where the covariance isn't trustworthy — disabling the gate lets snap and init seed state from degraded GNSS.
 
 ### Setting an initial pose
 
@@ -115,9 +110,9 @@ All parameters live in `cfg/localization.yaml`. The yaml has inline comments exp
 
 ```yaml
 localization/map_frame:    "map"
-localization/base_frame:   "novatel_a"      # body the node tracks; URDF link
-localization/imu_frame:    "novatel_a"      # IMU URDF link
-localization/lidar_frame:  "luminar_front"  # primary LiDAR URDF link
+localization/base_frame:   "gps_antenna_top"  # body the node tracks; URDF link
+localization/imu_frame:    "gps_antenna_top"  # IMU URDF link (matches /gps_p1/imu header)
+localization/lidar_frame:  "luminar_front"    # primary LiDAR URDF link
 ```
 
 ### GICP rejection gates
@@ -260,7 +255,7 @@ For UTM output, point `localization/utm_transform_path` at GLIM's `T_world_utm.t
 
 Symptoms: `imu_buffer_span=-1.000s` in SCAN DEBUG, `guess_from_last=0`, no "First IMU message received" log.
 
-Almost always a topic-mismatch problem. The launch arg is `imu_topic` (underscore). Passing `imu-topic:=/X` silently does nothing — the launch falls back to default `/gps_na/imu` and your IMU subscription stays empty. Verify with:
+Almost always a topic-mismatch problem. The launch arg is `imu_topic` (underscore). Passing `imu-topic:=/X` silently does nothing — the launch falls back to default `/gps_p1/imu` and your IMU subscription stays empty. Verify with:
 
 ```bash
 ros2 topic list | grep -i imu
@@ -289,7 +284,7 @@ Watch for `GICP REJECTED (... — degenerate slide)` warns. Tunable knobs (in or
 
 ### Frame check
 
-`ros2 run tf2_tools view_frames` should show `map → novatel_a` (`base_frame`) and the URDF chain `base_link → luminar_front`, `base_link → novatel_a`, etc. The localization node tracks `base_frame`; everything else is just the URDF.
+`ros2 run tf2_tools view_frames` should show `map → gps_antenna_top` (`base_frame`) and the URDF chain `base_link → luminar_front`, `base_link → gps_antenna_top`, etc. The localization node tracks `base_frame`; everything else is just the URDF.
 
 ## Debug scripts
 

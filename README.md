@@ -17,21 +17,21 @@ Each subpackage has its own README (`GLIM/README.md`, `gicp_localization/README.
 The configs target an AV-24 Cybertruck instrumented with:
 
 - **3× Luminar Iris LiDAR** — `luminar_front` is the primary sensor; `luminar_left` and `luminar_right` are concatenated into the primary cloud via URDF transforms.
-- **Novatel INS** publishing IMU on `/gps_na/imu` and odometry on `/gps_na/filtered_odom`. The URDF link `novatel_a` is used as both `base_frame` and `imu_frame` in the localization config. The localization node gates this odometry with NovAtel `BESTGNSSPOS` status before using it for initialization, diagnostics, or recovery.
-- **RTK GPS** publishing `nav_msgs/msg/Odometry` on `/gps_na/odom`, consumed by GLIM's GNSS extension to recover the world-to-UTM transform.
+- **Point One Atlas (LG69T) INS** publishing IMU on `/gps_p1/imu` (`imu_calibrated`: sensor-level bias/scale/misalignment removed by FusionEngine firmware, gravity present, no fused orientation) and odometry on `/gps_p1/filtered_odom`. Atlas firmware projects both the IMU and the INS pose to the primary antenna phase centre, so the URDF link `gps_antenna_top` is used as both `base_frame` and `imu_frame` in the localization config. RTK quality is gated on the Atlas-reported pose covariance.
+- **RTK GPS** — the FusionEngine INS itself; no separate raw RTK topic is needed for localization.
 - Optional camera (used only by extension modules).
 
 All sensor extrinsics are resolved at runtime from [`av24.urdf`](av24.urdf); the `*_frame` strings in the configs are URDF link names, not free-form labels.
 
-Current localization scope is intentionally single-source NovAtel. Earlier
-project notes mention both NovAtel and VectorNav GNSS integration, but
-`gicp_localization` does not currently fuse or vote across VectorNav. Adding
-VectorNav back is future work and needs a fresh source-selection and
-fix-status design rather than a topic remap.
+Current localization scope is intentionally single-source Point One Atlas. Earlier
+project notes mention NovAtel and VectorNav GNSS integration, but
+`gicp_localization` no longer subscribes to either; adding them back is future
+work and needs a fresh source-selection and fix-status design rather than a
+topic remap.
 
 ### GNSS lever-arm policy
 
-The Novatel firmware compensates the antenna-to-IMU lever arm internally (when `LEVERARMCONFIG` is set on the receiver), so the software side stays **off** to avoid double-compensation. The disable is explicit in three independent places — any one is sufficient:
+Atlas firmware compensates the IMU-to-antenna lever arm internally, so the software side stays **off** to avoid double-compensation. The disable is explicit in three independent places — any one is sufficient:
 
 1. **Config flag** — `GLIM/glim_ext/config/config_gnss_global.json` sets `"enable_lever_arm": false`. This is the grep-able single source of truth.
 2. **Empty antenna frame** — same file sets `"urdf_gnss_frame": ""`. With this empty, the URDF lookup is skipped and `t_imu_gnss` stays zero even if the flag check were bypassed.
@@ -48,11 +48,11 @@ If the module ever loads with this config, it logs `lever-arm compensation expli
 
 ### Recovery during GICP failures
 
-In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting, the node snaps pose and velocity to the latest NovAtel INS sample that passed the RTK fix-status gate. If RTK status is missing, stale, or not fixed, GT samples are rejected and the node stays on IMU dead-reckoning until either LiDAR geometry or RTK quality recovers.
+In low-feature stretches the localizer first falls back to IMU dead-reckoning. If GICP keeps rejecting, the node snaps pose and velocity to the latest Atlas INS sample that passed the pose-covariance quality gate. If the gate rejects (Atlas covariance above the configured thresholds), GT samples are dropped and the node stays on IMU dead-reckoning until either LiDAR geometry or RTK quality recovers.
 
 ### Initialization: RTK-driven IMU calibration
 
-By default the localizer uses the post-gate NovAtel GT odom stream to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first RTK-fixed sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no gated GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the localizer enforces RTK-fixed status itself using `BESTGNSSPOS`; disabling the gate for bag replay removes that guarantee. Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
+By default the localizer uses the post-gate Atlas GT odom stream to calibrate gyro/accel biases while the vehicle is moving, and seeds pose+velocity from the first high-quality sample rather than assuming the vehicle is stationary. Falls back to the legacy stationary calibration if no gated GT odom is received within a configurable timeout. With `localization/rtk_gate/enable=true`, the localizer inspects `pose.covariance` on every `/gps_p1/filtered_odom` sample and drops anything that exceeds `max_pose_var_xy` / `max_pose_var_z`. Knobs live under `localization/rtk_init/*` and `localization/rtk_gate/*` in the localization yaml.
 
 ### Remaining tuning work
 
@@ -115,11 +115,11 @@ ros2 run glim_ros glim_pcap_rosbag <pcap_dir> <mcap_bag> --ros-args -p dump_path
 ros2 run glim_ros offline_viewer
 
 # GICP localization against a pre-built PCD map
-# (single-source NA design: IMU and GT odom both from NovAtel pre-VKS, at NA_IMU_Frame)
+# (single-source P1 design: IMU + GT odom both from Atlas, at gps_antenna_top)
 ros2 launch gicp_localization localization_with_tf.launch.py rviz:=true \
     pointcloud_topic:=/luminar_front/points \
-    imu_topic:=/gps_na/imu \
-    gt_odom_topic:=/gps_na/filtered_odom
+    imu_topic:=/gps_p1/imu \
+    gt_odom_topic:=/gps_p1/filtered_odom
 ```
 
 ---
