@@ -13,18 +13,29 @@
     localization/utm_frame: "utm"
 
     # Frame IDs
-    # Single-source NA design: every comparison the node performs lives at
-    # NA_IMU_Frame (URDF link novatel_a). base_frame, imu_frame, and the
-    # gt_odom source (/gps_na/filtered_odom, set in the launch file) are all
-    # at novatel_a, so the in-code TF lookups (callbackImu's
-    # baselink2imu_T, the snap helper's T_base_gtbody_) degenerate to
-    # identity -- no lever-arm work happens anywhere. This bypasses the
-    # cg-frame intermediate the rest of the race_common stack uses and
-    # avoids the cross-check baseline / phantom-snap bugs documented in
-    # docs/GICP_GNSS_IMU_bug_report.pdf.
+    # Atlas-INS IMU design: GICP consumes IMU from /gps_p1/imu (Atlas
+    # imu_calibrated -- sensor-level bias/scale/misalignment removed by
+    # FusionEngine firmware, gravity still PRESENT, no fused orientation).
+    #
+    # IMU frame note: the Atlas LG69T physically sits at the chassis link
+    # "pointonenav" (URDF xyz=1.898, 0.027, 0.450) but the firmware applies
+    # a lever-arm projection internally so that the published IMU and pose
+    # outputs both refer to the primary GNSS antenna phase centre, the
+    # URDF link "gps_antenna_top" (xyz=1.27135, 0.0, 0.91994). The
+    # pointonenav_interface therefore correctly tags /gps_p1/imu with
+    # frame_id="gps_antenna_top" -- it is NOT a mislabel.
+    # imu_frame and base_frame are both set to gps_antenna_top so that
+    # callbackImu's baselink2imu_T degenerates to identity and no
+    # second lever-arm work happens here (avoids double-compensating
+    # what Atlas already did internally).
+    #
+    # gt_odom is still /gps_na/filtered_odom at novatel_a (NovAtel RTK is
+    # the production truth source for cross-check / snap / RTK-driven init).
+    # composeGtPoseInBase resolves the static novatel_a -> gps_antenna_top
+    # offset via TF (both linked under rear_axle_middle in the URDF).
     localization/map_frame: "map"
-    localization/base_frame: "novatel_a"
-    localization/imu_frame: "novatel_a"
+    localization/base_frame: "gps_antenna_top"
+    localization/imu_frame: "gps_antenna_top"
     localization/lidar_frame: "luminar_front"  # Must match launch child_frame or incoming LiDAR frame
 
     # Map downsampling for GICP (smaller = more accurate but slower)
@@ -150,12 +161,15 @@
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
     # Hard guard on IMU topic remap. When true, node startup fails unless the
-    # resolved imu topic is in topic_allowlist (default: /gps_na/imu).
+    # resolved imu topic is in topic_allowlist (default: /gps_p1/imu).
     localization/imu/require_topic_allowlist: true
-    localization/imu/topic_allowlist: ["/gps_na/imu"]
+    localization/imu/topic_allowlist: ["/gps_p1/imu"]
     # Reject IMU samples whose message frame_id does not match imu_frame.
+    # Re-enabled now that imu_frame=gps_antenna_top matches the upstream
+    # pointonenav_interface output (Atlas projects IMU to antenna phase
+    # centre internally).
     localization/imu/require_frame_match: true
-    dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable)
+    dlio/imu/calibTime: 0.5  # Seconds of stationary IMU data for bias/gravity calibration (fallback when RTK init is off/unavailable). With Atlas imu_calibrated input the residual bias is already near-zero, so this estimate captures only mount-level tilt; shortening below ~0.1s is safe.
 
     # RTK-driven IMU calibration: use the post-gate GT odom buffer as the truth
     # source for bias estimation. Lets the vehicle calibrate while moving and
@@ -175,8 +189,11 @@
     odom/geo/Kp: 4.5      # Position correction gain
     odom/geo/Kv: 11.25    # Velocity correction gain
     odom/geo/Kq: 4.0      # Orientation correction gain
-    odom/geo/Kab: 2.25    # Accelerometer bias correction gain
-    odom/geo/Kgb: 1.0    # Gyroscope bias correction gain
+    # Online bias adaptation from GICP residuals is disabled for the fused
+    # NovAtel INS path. RTK/stationary init can still seed state.b once; set
+    # these >0 only to restore upstream DLIO-style adaptive IMU bias tracking.
+    odom/geo/Kab: 0.0     # Accelerometer bias adaptation gain
+    odom/geo/Kgb: 0.0     # Gyroscope bias adaptation gain
     odom/geo/Kz_damping: 0.0  
     odom/geo/abias_max: 5.0    # Max accelerometer bias (m/s^2)
     odom/geo/gbias_max: 0.5    # Max gyroscope bias (rad/s)

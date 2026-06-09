@@ -54,7 +54,7 @@
     "points_time_offset": 0.0,
     "acc_scale": 0.0, // Auto-detect if zero
     // TF config
-    "imu_frame_id": "", // Auto-detect if blank
+    "imu_frame_id": "", // Auto-detect from /gps_p1/imu header (= gps_antenna_top; Atlas firmware projects IMU to antenna phase centre)
     "lidar_frame_id": "", // Auto-detect if blank
     "base_frame_id": "", // If blank, IMU frame ID is used
     "odom_frame_id": "odom",
@@ -70,7 +70,10 @@
       // "libgnss_global.so"
     ],
     // Topics
-    "imu_topic": "/gps_na/imu",
+    // Atlas FusionEngine imu_calibrated: sensor-level bias/scale/misalignment
+    // removed by P1 firmware, gravity present, no fused orientation, 99 Hz.
+    // See gicp_localization/cfg/localization.yaml for the rationale.
+    "imu_topic": "/gps_p1/imu",
     "points_topic": "/luminar_front/points",
     "image_topic": "/image",
     // External INS / GNSS-aided odometry. Leave blank to disable.

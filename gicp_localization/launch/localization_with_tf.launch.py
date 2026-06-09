@@ -25,15 +25,24 @@ def generate_launch_description():
 
     rviz = LaunchConfiguration('rviz', default='false')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/luminar_front/points')
-    # Single-source NA design: GICP consumes IMU and GT odom directly from the
-    # NovAtel (NA) INS pre-VKS, both naturally referenced at the NA_IMU_Frame
-    # (URDF link novatel_a). This matches localization/base_frame = "novatel_a"
-    # in the yaml, so every comparison the node performs (state.p vs gt.p, IMU
-    # propagation, GT-recovery snap, initial pose from odom) lives at the same
-    # body reference -- no TF lever-arm correction needed anywhere, and no
-    # dependency on race_common's VKS / robot_localization fusion or its cg
-    # frame target.
-    imu_topic = LaunchConfiguration('imu_topic', default='/gps_na/imu')
+    # Atlas-INS IMU + NovAtel-RTK GT design:
+    #   imu_topic    = /gps_p1/imu       (Atlas FusionEngine imu_calibrated:
+    #                                     sensor-level bias/scale/misalignment
+    #                                     removed by P1 firmware; gravity
+    #                                     PRESENT; no fused orientation; 99 Hz)
+    #   gt_odom_topic = /gps_na/filtered_odom  (NovAtel INS pre-VKS at novatel_a;
+    #                                           RTK-fixed positioning)
+    #   imu_frame / base_frame = "gps_antenna_top"  (Atlas projects its
+    #                                                IMU output to the primary
+    #                                                GNSS antenna phase centre
+    #                                                via firmware lever-arm,
+    #                                                same point Atlas reports
+    #                                                position at).
+    # composeGtPoseInBase resolves the static novatel_a -> gps_antenna_top
+    # offset via TF on first GT message, so the cross-check / snap / RTK init
+    # paths all operate at the IMU/pose reference frame with no double
+    # lever-arm work.
+    imu_topic = LaunchConfiguration('imu_topic', default='/gps_p1/imu')
     odom_topic = LaunchConfiguration('odom_topic', default='/odom')
     gt_odom_topic = LaunchConfiguration('gt_odom_topic', default='/gps_na/filtered_odom')
     # NovAtel BESTGNSSPOS topic for the RTK fix-status gate. Drives the
@@ -54,8 +63,12 @@ def generate_launch_description():
         'pointcloud_topic', default_value=pointcloud_topic, description='Pointcloud topic name')
     declare_imu_topic_arg = DeclareLaunchArgument(
         'imu_topic', default_value=imu_topic,
-        description='IMU topic name. Default /gps_na/imu (NovAtel INS at NA_IMU_Frame, '
-                    'matches base_frame=novatel_a in localization.yaml).')
+        description='IMU topic name. Default /gps_p1/imu (Point One Atlas '
+                    'imu_calibrated: sensor-calibrated, gravity present, '
+                    '99 Hz, lever-arm-projected by Atlas firmware to the '
+                    'primary antenna phase centre gps_antenna_top). Stays '
+                    'in sync with base_frame=gps_antenna_top in '
+                    'localization.yaml.')
     declare_odom_topic_arg = DeclareLaunchArgument(
         'odom_topic', default_value=odom_topic, description='Odometry topic name (for initialization)')
     declare_gt_odom_topic_arg = DeclareLaunchArgument(

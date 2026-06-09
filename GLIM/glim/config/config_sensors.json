@@ -25,9 +25,9 @@
       1
     ],
     "T_lidar_imu": [
-      -0.5860000000000001,
-      -0.08,
-      -0.347,
+      -0.95065,
+      -0.005,
+      0.47194,
       0.0,
       0.0,
       0.0,
@@ -51,7 +51,11 @@
       480
     ],
     "imu_acc_noise": 0.2,
-    "imu_bias_noise": 0.0001,
+    // imu_bias_noise: Atlas firmware applies sensor-level bias/scale
+    // calibration so the residual bias is much more stable than raw MEMS.
+    // Tightened from 1e-4 to 1e-5 to reflect that. Revert if you ever
+    // re-point GLIM at a raw IMU stream (e.g. /gps_na/imu RAWIMUSX).
+    "imu_bias_noise": 1e-5,
     "imu_gyro_noise": 0.05,
     "imu_int_noise": 0.001,
     "intensity_field": "reflectance",
@@ -64,7 +68,7 @@
     "perpoint_relative_time": false,
     "perpoint_time_scale": 1.0,
     "ring_field": "line_index",
-    "urdf_imu_frame": "novatel_a",
+    "urdf_imu_frame": "gps_antenna_top",
     "urdf_lidar_frame": "luminar_front",
     "urdf_path": "av24.urdf"
   }

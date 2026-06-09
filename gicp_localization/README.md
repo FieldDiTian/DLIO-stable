@@ -165,9 +165,13 @@ dlio/imu/calibTime: 0.5            # initial stationary calibration window
 odom/geo/Kp: 4.5                   # Position correction gain
 odom/geo/Kv: 11.25                 # Velocity
 odom/geo/Kq: 4.0                   # Orientation
-odom/geo/Kab: 2.25                 # Accel bias
-odom/geo/Kgb: 1.0                  # Gyro bias
+odom/geo/Kab: 0.0                  # Online accel-bias adaptation disabled
+odom/geo/Kgb: 0.0                  # Online gyro-bias adaptation disabled
 ```
+
+`Kab`/`Kgb` are intentionally zero for the fused NovAtel INS path. Initial
+RTK/stationary calibration may still seed `state.b`, but GICP residuals do not
+continue rewriting IMU bias online unless these gains are explicitly raised.
 
 ## Topics
 

@@ -1285,12 +1285,15 @@ void gicp_localization::LocalizationNode::getParams() {
   }
   RCLCPP_INFO(this->get_logger(), "Sensor type: %s", sensor_type_str.c_str());
 
-  // Geometric Observer parameters (proportional correction gains, matching upstream DLIO)
+  // Geometric Observer parameters. Position/orientation gains stay active, but
+  // online IMU bias adaptation defaults off for the fused NovAtel INS path; the
+  // initial RTK/stationary calibration still seeds state.b once before
+  // propagation.
   this->declare_parameter<double>("odom/geo/Kp", 4.5);
   this->declare_parameter<double>("odom/geo/Kv", 11.25);
   this->declare_parameter<double>("odom/geo/Kq", 4.0);
-  this->declare_parameter<double>("odom/geo/Kab", 2.25);
-  this->declare_parameter<double>("odom/geo/Kgb", 1.0);
+  this->declare_parameter<double>("odom/geo/Kab", 0.0);
+  this->declare_parameter<double>("odom/geo/Kgb", 0.0);
   this->declare_parameter<double>("odom/geo/Kz_damping", 5.0);
   this->declare_parameter<double>("odom/geo/abias_max", 5.0);
   this->declare_parameter<double>("odom/geo/gbias_max", 0.5);
@@ -4256,18 +4259,23 @@ void gicp_localization::LocalizationNode::updateState() {
 
   err_body = qhat.conjugate()._transformVector(err);
 
-  double abias_max = this->geo_abias_max_;
-  double gbias_max = this->geo_gbias_max_;
+  // Optional online bias adaptation. Keep disabled by default for fused
+  // NovAtel INS input so GICP residuals do not chase drift by rewriting the
+  // trusted IMU bias estimate. Setting Kab/Kgb > 0 restores the upstream DLIO
+  // adaptive observer behavior.
+  if (this->geo_Kab_ > 0.0) {
+    const double abias_max = this->geo_abias_max_;
+    this->state.b.accel -= dt * this->geo_Kab_ * err_body;
+    this->state.b.accel = this->state.b.accel.array().min(abias_max).max(-abias_max);
+  }
 
-  // Update accel bias
-  this->state.b.accel -= dt * this->geo_Kab_ * err_body;
-  this->state.b.accel = this->state.b.accel.array().min(abias_max).max(-abias_max);
-
-  // Update gyro bias
-  this->state.b.gyro[0] -= dt * this->geo_Kgb_ * qe.w() * qe.x();
-  this->state.b.gyro[1] -= dt * this->geo_Kgb_ * qe.w() * qe.y();
-  this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
-  this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
+  if (this->geo_Kgb_ > 0.0) {
+    const double gbias_max = this->geo_gbias_max_;
+    this->state.b.gyro[0] -= dt * this->geo_Kgb_ * qe.w() * qe.x();
+    this->state.b.gyro[1] -= dt * this->geo_Kgb_ * qe.w() * qe.y();
+    this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
+    this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
+  }
 
   // Proportional observer correction (matching upstream DLIO design)
   // Position correction
