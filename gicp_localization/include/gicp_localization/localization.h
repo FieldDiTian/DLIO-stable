@@ -54,12 +54,19 @@ public:
 
   // Ground-truth odom sample (public so internal helper signatures can reference it).
   // p/q are header.frame_id=map; v_lin_body / v_ang_body are in child_frame_id (gt_body).
+  // cov_pos_{xx,yy,zz} are the diagonal position-variance terms from
+  // pose.covariance[0,7,14] -- carried per-sample so consumers can decide whether
+  // the sample is RTK-FIXED quality (init / calibration / cross-check) or merely
+  // Atlas's INS-dead-reckoning quality (snap-recovery accepts either).
   struct GtSample {
     double stamp;
     Eigen::Vector3f p;
     Eigen::Quaternionf q;
     Eigen::Vector3f v_lin_body;
     Eigen::Vector3f v_ang_body;
+    double cov_pos_xx;
+    double cov_pos_yy;
+    double cov_pos_zz;
   };
 
   LocalizationNode();
@@ -104,6 +111,13 @@ private:
   // biases were applied (caller should mark imu_calibrated_).
   bool tryRtkCalibrationStep(double stamp, const Eigen::Vector3f& measured_gyro,
                              const Eigen::Vector3f& measured_accel);
+
+  // Is the GT sample RTK-FIXED quality? Tests Atlas-reported pose covariance
+  // against rtk_gate_max_pose_var_xy_ / rtk_gate_max_pose_var_z_. Used by
+  // consumers (init/calibration/cross-check) that need cm-level truth.
+  // maybeSnapPoseToGT does NOT call this -- it accepts any sample because
+  // Atlas's INS dead-reckoning is the next-best fallback to GICP failure.
+  bool gtSampleIsRtkFixed(const GtSample& s) const;
 
   void preprocessPointCloud(pcl::PointCloud<PointType>::Ptr& cloud);
   void deskewPointcloud();

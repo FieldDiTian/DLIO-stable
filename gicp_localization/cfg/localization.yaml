@@ -162,7 +162,18 @@
     localization/sensor_type: "luminar"
 
     # IMU and Deskewing Parameters
-    dlio/deskew: false  # Disabled: Luminar per-point timestamps are collapsed, so deskewing has no effect
+    # Enabled now that the Luminar per-point timestamp encoding is confirmed:
+    # Iris emits UINT8[8] = uint64 PTP epoch nanoseconds per point (Iris
+    # Product Information Guide R2.0.7 sec 7.8.4: "If those timestamps are
+    # in epoch time, and not time since sensor startup, then the sensor
+    # synced at least once"). The previously observed "collapsed" symptom
+    # was a side-effect of the lidar_concat shift double-counting the
+    # inter-scan offset on absolute-epoch timestamps; that shift now passes
+    # UINT8[8] through unchanged (see shiftCloudTimestamps).
+    # If the LUMINAR_TS_DIAG one-shot dump on first cloud ever reports a
+    # different encoding (e.g. FLOAT64 seconds-since-scan-start), flip back
+    # to false until copyPointTimeFromCloud's LUMINAR branch is updated.
+    dlio/deskew: true
     dlio/gravity: 9.81  # Gravity magnitude (m/s^2)
     dlio/imu/bufferSize: 2000  # IMU buffer size
     # Hard guard on IMU topic remap. When true, node startup fails unless the

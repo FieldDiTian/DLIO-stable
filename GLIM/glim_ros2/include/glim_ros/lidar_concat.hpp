@@ -100,6 +100,20 @@ inline bool find_time_field(const sensor_msgs::msg::PointCloud2& msg, int& time_
   return false;
 }
 
+// Shift per-point timestamps by `dt` seconds to rebase an aux scan from its
+// own header.stamp onto the merged cloud's primary header.stamp.
+//
+// SCAN-RELATIVE encodings (FLOAT32/FLOAT64 seconds-since-scan-start, UINT32
+// nanoseconds-since-scan-start): add dt so the value reads as "offset since
+// primary scan start" and deskew works.
+//
+// ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns,
+// per Iris Product Information Guide R2.0.7 sec 7.8.4: "If those
+// timestamps are in epoch time ... then the sensor synced at least once"):
+// must NOT be shifted. Each point already carries its absolute capture
+// time; the deskewer computes (t_i - merged_header.stamp) and naturally
+// produces the correct (T_aux - T_primary + intra-aux-offset). Adding dt
+// here would double-count the inter-scan offset.
 inline void shift_cloud_timestamps(
   std::vector<uint8_t>& data,
   uint32_t point_step,
@@ -136,13 +150,11 @@ inline void shift_cloud_timestamps(
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        if (time_count == 8) {
-          uint64_t val;
-          std::memcpy(&val, time_ptr, sizeof(uint64_t));
-          int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
-          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
-          std::memcpy(time_ptr, &val, sizeof(uint64_t));
-        }
+        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds.
+        // Absolute timestamps -- leave untouched. See header comment.
+        // Any other count is not a recognised timestamp encoding.
+        (void)dt;
+        (void)time_count;
         break;
       }
       default:

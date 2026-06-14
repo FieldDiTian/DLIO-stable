@@ -521,26 +521,39 @@ void logLuminarTimestampStats(size_t num_points, const pcl::PointCloud<PointType
   std::fflush(stderr);
 }
 
-// Shift per-point timestamps by `dt` seconds. When `luminar_uint64` is set the
-// 8 bytes at the time field are reinterpreted as uint64 hardware nanoseconds
-// regardless of the declared field type — Luminar publishes the raw uint64 bits
-// even when the field datatype is FLOAT64, so generic FP arithmetic would
-// scramble them.
+// Shift per-point timestamps by `dt` seconds to rebase an aux scan's per-point
+// times from its own header.stamp onto the merged cloud's primary header.stamp.
+//
+// Whether to actually shift depends on the underlying encoding:
+//   * SCAN-RELATIVE encodings (FLOAT32/FLOAT64 seconds-since-scan-start,
+//     UINT32 nanoseconds-since-scan-start) -> ADD dt so the value reads as
+//     "seconds since primary scan start".
+//   * ABSOLUTE-EPOCH encodings (Luminar Iris UINT8[8] = uint64 PTP epoch ns
+//     per Iris Product Information Guide R2.0.7 sec 7.8.4: "If those
+//     timestamps are in epoch time ... then the sensor synced at least
+//     once") -> DO NOT shift. The downstream deskewer subtracts the merged
+//     cloud's header.stamp to get a scan-relative offset, which already
+//     gives the right (T_aux - T_primary + intra-aux-offset) when the
+//     value is left at its absolute capture time.
+// Shifting an absolute time by dt would double-count the inter-scan offset
+// and corrupt deskew.
+//
+// `luminar_uint64=true` forces the 8 bytes at the time field to be read as
+// uint64 regardless of declared datatype, because Luminar publishes the raw
+// uint64 bits even when the field is mislabelled FLOAT64; generic FP
+// arithmetic on those bits would scramble them.
 void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
                           int time_off, uint8_t time_datatype, int time_count,
                           double dt, bool luminar_uint64) {
   if (time_off < 0) return;
 
+  // Absolute-epoch path (Luminar Iris UINT8[8]): leave the per-point values
+  // untouched. Each point already carries its absolute capture time; the
+  // deskewer's t_i - merged_header.stamp computation in preprocessPointCloud
+  // produces the correct intra-scan offset for both primary and aux points
+  // without any rebasing here.
   if (luminar_uint64) {
-    const int64_t dt_ns = static_cast<int64_t>(dt * 1e9);
-    for (size_t i = 0; i < num_points; ++i) {
-      uint8_t* p = data + i * point_step + time_off;
-      uint64_t v;
-      std::memcpy(&v, p, sizeof(uint64_t));
-      const int64_t shifted = static_cast<int64_t>(v) + dt_ns;
-      v = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
-      std::memcpy(p, &v, sizeof(uint64_t));
-    }
+    (void)dt;
     return;
   }
 
@@ -570,13 +583,12 @@ void shiftCloudTimestamps(uint8_t* data, size_t num_points, uint32_t point_step,
         break;
       }
       case sensor_msgs::msg::PointField::UINT8: {
-        if (time_count == 8) {
-          uint64_t val;
-          std::memcpy(&val, time_ptr, sizeof(uint64_t));
-          const int64_t shifted = static_cast<int64_t>(val) + static_cast<int64_t>(dt * 1e9);
-          val = static_cast<uint64_t>(std::max<int64_t>(0, shifted));
-          std::memcpy(time_ptr, &val, sizeof(uint64_t));
-        }
+        // UINT8 count=8 == Luminar Iris uint64 PTP epoch nanoseconds (per
+        // Iris Product Information Guide R2.0.7 sec 7.8.4). Values are
+        // absolute capture times -- leave them untouched (see header
+        // comment block on this function for the deskew-correctness
+        // argument). For any other UINT8 count (e.g. raw byte runs that
+        // are not timestamps), there is nothing sensible to shift.
         break;
       }
       default:
@@ -2389,7 +2401,11 @@ void gicp_localization::LocalizationNode::performLocalization() {
   double gt_dt = 0.0;
   if (this->gt_odom_enabled_ && this->gt_odom_received_.load() && candidate_pose_valid) {
     GtSample gt;
-    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt)) {
+    // Cross-check is a CM-LEVEL DIAGNOSTIC -- only meaningful against
+    // RTK-FIXED-quality Atlas samples. Snap-recovery and IMU dead-reckoning
+    // do NOT participate in this gate; they accept Atlas dead-reckoning
+    // quality as the next-best truth.
+    if (this->getGtPoseAt(this->scan_stamp.seconds(), gt) && this->gtSampleIsRtkFixed(gt)) {
       const Eigen::Vector3f cand_p = candidate_pose.block<3, 1>(0, 3);
       const Eigen::Quaternionf cand_q(Eigen::Matrix3f(candidate_pose.block<3, 3>(0, 0)));
       // Bring the GT sample from msg.child_frame_id (gt_body) into base_frame
@@ -2830,39 +2846,20 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   s.v_ang_body = Eigen::Vector3f(msg->twist.twist.angular.x,
                                  msg->twist.twist.angular.y,
                                  msg->twist.twist.angular.z);
-
-  // RTK quality gate (P1-native): inspect Atlas-reported pose covariance on
-  // the gt_odom message itself. Drops the entire sample -- no buffer push,
-  // no initial-pose seed, no snap, no cross-check. Runs BEFORE TF caching so
-  // a degraded GNSS sample can't even seed the cache state. Disabled gate is
-  // a pass-through.
-  //
-  // pose.covariance is laid out as a row-major 6x6 (x,y,z,roll,pitch,yaw):
-  //   [0]=cov_xx  [7]=cov_yy  [14]=cov_zz  (position variances in m^2)
-  // Reject if any horizontal variance exceeds max_pose_var_xy OR vertical
-  // variance exceeds max_pose_var_z. Atlas keeps these in the ~5e-5 m^2 band
-  // when RTK-fixed and orders of magnitude higher when degraded.
-  if (this->rtk_gate_enabled_) {
-    const double cov_xx = msg->pose.covariance[0];
-    const double cov_yy = msg->pose.covariance[7];
-    const double cov_zz = msg->pose.covariance[14];
-    const bool xy_bad = (cov_xx > this->rtk_gate_max_pose_var_xy_) ||
-                        (cov_yy > this->rtk_gate_max_pose_var_xy_);
-    const bool z_bad  = (cov_zz > this->rtk_gate_max_pose_var_z_);
-    if (xy_bad || z_bad) {
-      this->rtk_rejected_covariance_++;
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                           "RTK gate: dropping gt_odom -- pose covariance "
-                           "exceeds threshold "
-                           "(cov_xx=%.4g cov_yy=%.4g cov_zz=%.4g; "
-                           "max_xy=%.4g max_z=%.4g). Rejected total=%lu.",
-                           cov_xx, cov_yy, cov_zz,
-                           this->rtk_gate_max_pose_var_xy_,
-                           this->rtk_gate_max_pose_var_z_,
-                           this->rtk_rejected_covariance_.load());
-      return;
-    }
-  }
+  // Carry Atlas-reported position covariance per-sample. The RTK quality
+  // gate is no longer applied here -- every sample is pushed into the buffer
+  // regardless of FIXED/FLOAT/dead-reckoning state. The gate now runs at
+  // the CONSUMER side:
+  //   * tryRtkCalibrationStep (init/calibration)  -> require FIXED
+  //   * scan cross-check (gt_pos_err diagnostic)  -> require FIXED
+  //   * maybeSnapPoseToGT (recovery from GICP failure) -> accept ANY sample
+  // Rationale: Atlas's onboard INS already does coupled GNSS+IMU dead-
+  // reckoning with calibrated sensors during RTK loss. When GICP fails to
+  // match the LiDAR scan, the next-best truth is Atlas's pose at whatever
+  // quality it currently has -- not our own software IMU dead-reckoning.
+  s.cov_pos_xx = msg->pose.covariance[0];
+  s.cov_pos_yy = msg->pose.covariance[7];
+  s.cov_pos_zz = msg->pose.covariance[14];
 
   // Cache base_frame ← gt_body_frame TF on the first message (mirrors the IMU
   // extrinsic caching pattern in callbackImu). Required before the snap helper
@@ -2964,6 +2961,15 @@ void gicp_localization::LocalizationNode::callbackGtOdom(const nav_msgs::msg::Od
   }
 }
 
+bool gicp_localization::LocalizationNode::gtSampleIsRtkFixed(const GtSample& s) const {
+  // When the gate is disabled, treat every sample as FIXED -- the operator
+  // has explicitly opted into "trust whatever the upstream publishes".
+  if (!this->rtk_gate_enabled_) return true;
+  return (s.cov_pos_xx <= this->rtk_gate_max_pose_var_xy_) &&
+         (s.cov_pos_yy <= this->rtk_gate_max_pose_var_xy_) &&
+         (s.cov_pos_zz <= this->rtk_gate_max_pose_var_z_);
+}
+
 bool gicp_localization::LocalizationNode::getGtPoseAt(double stamp, GtSample& out) {
   std::lock_guard<std::mutex> lock(this->gt_odom_mtx_);
   if (this->gt_odom_buffer_.size() < 2) {
@@ -3051,7 +3057,11 @@ bool gicp_localization::LocalizationNode::tryRtkCalibrationStep(
     double stamp, const Eigen::Vector3f& measured_gyro,
     const Eigen::Vector3f& measured_accel) {
   GtSample gt;
-  if (!this->getGtPoseAt(stamp, gt)) {
+  // RTK-driven IMU bias calibration needs CM-LEVEL truth -- only consume
+  // RTK-FIXED samples. If only dead-reckoned Atlas poses are available the
+  // init machine will time out (rtk_init/fallback_timeout) and drop into
+  // stationary calibration.
+  if (!this->getGtPoseAt(stamp, gt) || !this->gtSampleIsRtkFixed(gt)) {
     // GT not yet available at this IMU stamp (e.g., IMU briefly ahead of buffer).
     // Don't error — just skip this sample.
     return false;

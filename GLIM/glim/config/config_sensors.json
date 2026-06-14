@@ -33,8 +33,25 @@
       0.0,
       1.0
     ],
-    "autoconf_perpoint_times": false,
-    "autoconf_prefer_frame_time": true,
+    // Per-point timestamp auto-detection -- ENABLED.
+    //
+    // autoconf_perpoint_times=true lets TimeKeeper::replace_points_stamp
+    // inspect the first cloud's min/max times and select the right
+    // encoding automatically:
+    //   * max_time < 1.0           -> scan-relative FLOAT seconds
+    //   * max_time > 1.0           -> absolute, auto-convert to relative
+    //   * min_time > 1e16          -> Livox/Iris-style FLOAT64 / UINT8[8]
+    //                                 nanoseconds; applies 1e-9 scale
+    // For Luminar Iris (UINT8[8] = uint64 PTP epoch ns per Iris Product
+    // Information Guide R2.0.7 sec 7.8.4) min_time lands at ~1.7e18 ->
+    // hits the third branch -> scaled to seconds and rebased to
+    // scan-start; deskew then works correctly.
+    //
+    // autoconf_prefer_frame_time=false means we USE the per-point times
+    // for deskewing instead of collapsing each scan to its frame stamp
+    // (which would disable deskewing).
+    "autoconf_perpoint_times": true,
+    "autoconf_prefer_frame_time": false,
     "distortion_coeffs": [
       -0.02295507941388206,
       0.0681131726659881,
