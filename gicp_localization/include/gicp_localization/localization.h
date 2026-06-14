@@ -33,6 +33,7 @@
 // STL
 #include <atomic>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -64,9 +65,14 @@ public:
     Eigen::Quaternionf q;
     Eigen::Vector3f v_lin_body;
     Eigen::Vector3f v_ang_body;
-    double cov_pos_xx;
-    double cov_pos_yy;
-    double cov_pos_zz;
+    // Default to +inf so any sample that reaches the RTK gate without having
+    // its covariance explicitly populated is treated as NOT RTK-FIXED (the
+    // safe direction) rather than reading an uninitialized value. Real
+    // samples overwrite these in callbackGtOdom; interpolated samples in
+    // getGtPoseAt() carry the conservative max of the bracketing samples.
+    double cov_pos_xx = std::numeric_limits<double>::infinity();
+    double cov_pos_yy = std::numeric_limits<double>::infinity();
+    double cov_pos_zz = std::numeric_limits<double>::infinity();
   };
 
   LocalizationNode();
@@ -275,6 +281,7 @@ private:
   rclcpp::Time last_gicp_stamp_;
   bool last_gicp_valid_;
   double last_fitness_score_{-1.0};  // -1 = no scan yet
+  double last_accepted_scan_stamp_{-1.0};  // s — stamp of last accepted GICP scan (P3 dead-reckon cov)
 
   // Trajectory. The actual ring of poses lives in path_buffer_ (deque, O(1)
   // pop_front when capping); path_msg is filled only when the path topic has
@@ -446,6 +453,21 @@ private:
   double geo_abias_max_;
   double geo_gbias_max_;
 
+  // Observer-correction stability bounds (P2#1). The proportional observer applies
+  // dt*K corrections; this is forward-Euler and only stable for dt*K < 2. A long
+  // scan gap (dropped Luminar frames / high-speed racing) would otherwise inject a
+  // huge, unstable correction. Cap the effective timestep, and optionally clamp the
+  // per-update position/velocity correction magnitude (0 = clamp disabled).
+  double geo_observer_dt_max_;     // s   — cap on dt used in updateState corrections
+  double geo_max_pos_correction_;  // m   — clamp per-update position correction (0=off)
+  double geo_max_vel_correction_;  // m/s — clamp per-update velocity correction (0=off)
+
+  // Time/speed-based dead-reckoning covariance growth (P3). During GICP loss the
+  // reported position sigma grows with elapsed dead-reckon time and distance
+  // travelled (speed*time), not the raw missed-scan count. 0 rates disable growth.
+  double dr_cov_time_rate_;        // m of sigma per second of dead reckoning
+  double dr_cov_dist_frac_;        // m of sigma per metre travelled while dead reckoning
+
   // Debug parameters
   bool debug_pub_enabled_;
   bool debug_jump_log_enabled_;
@@ -453,6 +475,12 @@ private:
   bool debug_lm_print_;
   double debug_jump_trans_m_;
   double debug_jump_rot_deg_;
+  // Speed/scan_dt-aware jump-gate scaling (P2#2). The effective large-jump
+  // thresholds grow with how far the IMU prior could have drifted: translation
+  // with speed*scan_dt, rotation with scan_dt. 0 scales reproduce the fixed
+  // thresholds (debug_jump_trans_m_ / debug_jump_rot_deg_).
+  double jump_trans_speed_scale_;  // extra trans threshold per (speed*scan_dt) metre
+  double jump_rot_dt_scale_deg_;   // extra rot threshold (deg) per second of scan_dt
   bool verbose_;
 
   // Extrinsics

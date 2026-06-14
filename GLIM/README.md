@@ -332,7 +332,7 @@ Each directory contains:
 | IMU stationary accel σ | 3 mm/s² @ 99 Hz | — | density ~3×10⁻⁴ m/s²/√Hz |
 | IMU stationary gyro σ | 7 mrad/s @ 99 Hz | — | density ~7×10⁻⁴ rad/s/√Hz |
 
-The IMU and GNSS noise parameters below sit ~3× looser than these measured values, to leave headroom for transients (vibration spikes, multipath bursts) that the per-message covariance doesn't capture.
+The IMU and GNSS noise parameters below are deliberately conservative — set much looser than these measured stationary values to leave headroom for transients (vibration spikes, multipath bursts) that the per-message covariance doesn't capture. Concretely, `imu_acc_noise = 0.05` is ~170× the measured ~3×10⁻⁴ accel density and `imu_gyro_noise = 0.01` is ~14× the measured ~7×10⁻⁴ gyro density. (Framed against the upstream GLIM defaults of 0.2 / 0.05 instead, these same values are ~4× / ~5× *tighter* — see `config_sensors.json`; the two framings just use different baselines.)
 
 **RTK-FIXED pre-filter** (`gicp_localization/scripts/rtk_fixed_odom_filter.py` params):
 ```yaml
