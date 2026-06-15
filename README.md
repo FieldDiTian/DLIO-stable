@@ -102,13 +102,39 @@ When the `imu_topic:=` launch arg points at a non-existent topic, the subscripti
 
 Both GLIM and `gicp_localization` deskew each LiDAR scan to compensate for vehicle motion across the scan duration. Deskewing reads the scan's per-point timestamp field, interpolates the IMU-propagated pose for each point's capture instant, and projects every point into a single common time. At race speeds (30 m/s) this can be the difference between a 30 cm scan-end smear and a clean point.
 
-**Deskewing is now ON in both stacks** (`dlio/deskew: true` in `gicp_localization/cfg/localization.yaml`; `autoconf_perpoint_times: true` + `autoconf_prefer_frame_time: false` in `GLIM/glim/config/config_sensors.json`). Previously both were effectively off because the Luminar Iris per-point timestamp encoding was ambiguous; the Iris Product Information Guide R2.0.7 (sec 7.8.4) confirmed the format and both pipelines were updated.
+**Deskewing is ON in both stacks** (`dlio/deskew: true` in `gicp_localization/cfg/localization.yaml`; `autoconf_perpoint_times: true` + `autoconf_prefer_frame_time: false` in `GLIM/glim/config/config_sensors.json`).
+
+#### Luminar Iris per-point timestamps — the definitive account
+
+This is the authoritative description; if other comments disagree, this section and the validated code win.
+
+**On-the-wire format (Luminar Iris Data Output Specification v1.3.0).** The Iris does *not* emit a single 64-bit timestamp on the wire. It splits the PTP time across two places: **48-bit integer epoch seconds in the packet header** (§2.1, `UQ48.0`) and a **32-bit sub-second nanosecond count per ray** (§2.2 / §2.6.3, `UQ32.0`) that wraps every 1 s; all fields little-endian. The ROS2 driver reconstructs these into one **little-endian `uint64` of full epoch nanoseconds** per point and publishes it as PointCloud2 field `timestamp` (`datatype=UINT8`, `count=8`, `offset=0`, `point_step=56`). *(Note: the previously cited "Iris PIG R2.0.7 §7.8.4" is PTP Troubleshooting, not the data layout — the Data Output Spec above is the real source.)*
+
+**Validated (May-26 `run_5`/`run_3` bags).** All three Luminar topics expose that exact schema; the bytes decode as `uint64` epoch ns (e.g. `1779827344001041615` → 2026-05-26T20:29:04Z), intra-scan span ≈ **48.997 ms**, second rollovers safe, no collapse. See `GLIM_GICP_Luminar_Timestamp_Validation.pdf` (procedure) and the validation report for evidence.
+
+**GICP deskew — robust by construction.** `copyPointTimeFromCloud` (LUMINAR case in `localization.cc`) stores the raw `uint64` ns; `deskewPointcloud` then computes each point's capture time as
+
+```
+t_point = scan_stamp.seconds()  +  (ts - min_ts) * 1e-9
+          └── header anchor ──┘     └── intra-scan relative offset ──┘
+```
+
+It uses **only the relative offset within the scan, anchored at the header stamp** — it never trusts the absolute epoch of `ts`. That makes GICP deskew **correct regardless of whether the per-point clock is on the Unix/INS epoch or a sensor-local/PTP axis**. The only way it could break is a driver emitting a bare 32-bit sub-second field that wraps mid-scan; the one-second-boundary check (Procedure C) confirms that does not happen. This is why GICP needs no timestamp repair and is the more trustworthy pipeline for deskew.
+
+**GLIM deskew — correct, but requires epoch alignment.** `ros_cloud_converter.hpp` reads `UINT8[8]` as little-endian `uint64` and divides by `1e9` → epoch *seconds* (~1.78e9). `TimeKeeper::replace_points_stamp` then sees `max_time ≥ 1.0`, takes the *absolute → relative* branch, and (with `prefer_frame_time=false`) **overwrites the frame stamp with the first point time** while making per-point times relative; `point_time_scale` stays `1.0`. Because GLIM *trusts the absolute point-time epoch*, that epoch must match the IMU/header epoch. Raw bags were observed with point times on the sensor/PTP axis (~2e13 ns) while the header/IMU were on the ROS/INS epoch — GLIM then overwrote the frame stamp with a sensor-clock value and dropped every scan as unsynchronized. Two complementary repairs close this:
+
+- **Offline:** `scripts/prep_bag.py` rebases each Luminar cloud by `header.stamp − min(point_time)` (span preserved) when building a prepped bag.
+- **Live:** `ros_cloud_converter.hpp` applies the same rebase in-pipeline — only when the times are absolute *and* `|header − min| > 1 s` (a no-op on already-aligned/prepped data and on scan-relative sensors).
+
+GICP requires neither because of the header-anchored relative-offset design above.
+
+**Status.** Deskew is validated correct for all bagged/offline data in both stacks. The only open item is a **live-hardware PTP-lock repeat** (no live publishers were available during the final check). That item concerns absolute-epoch / GT time association, **not** GICP deskew geometry, which depends only on the (validated) intra-scan span. Previously both stacks ran with deskew effectively off because this encoding was ambiguous; it no longer is.
 
 **`gicp_localization` supports five sensor-type-driven decoders** (`copyPointTimeFromCloud` in `localization.cc`), selected by `localization/sensor_type` in the yaml:
 
 | `localization/sensor_type` | Field encodings handled | Notes |
 |---|---|---|
-| `luminar` | `UINT8[8]` (uint64 PTP epoch ns), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper), `UINT32` (32-bit ns) | Iris PTP-synced output. The PIG-confirmed default is UINT8[8]; the others cover driver-version variants. |
+| `luminar` | `UINT8[8]` (uint64 epoch ns; validated default — field `timestamp`, offset 0, point_step 56), `FLOAT64` (raw uint64 bits in a mislabelled FLOAT64 wrapper), `UINT32` (32-bit ns) | Iris PTP-synced output, reconstructed to full epoch ns by the driver (see the definitive account above). The validated default is `UINT8[8]`; the others cover driver-version variants. |
 | `ouster` | `UINT32`, `FLOAT32`, `FLOAT64` (all scan-relative ns or s) | Standard Ouster ROS driver layouts. |
 | `velodyne` | `FLOAT32`, `UINT32` (scan-relative s or ns) | VLP-16/32 and similar. |
 | `hesai` | `FLOAT64`, `FLOAT32` (absolute or relative seconds) | Pandar / XT line. |
@@ -121,8 +147,10 @@ That's **5 sensor types × multiple PointField datatypes** per family. Adding a 
 | Bucket detected from `min/max` per-point time | Source encodings that fall here | What GLIM does |
 |---|---|---|
 | `max_time < 1.0` | Scan-relative FLOAT seconds (Ouster, Velodyne, Hesai, Livox in their FLOAT modes) | Use as-is. |
-| `1.0 ≤ max_time < 1e16` | Absolute wall-clock seconds (Hesai FLOAT64 absolute; rebagged scan-start-relative streams with large stamps) | Rebase to first-point time, treat as relative seconds. |
-| `min_time ≥ 1e16` | Absolute nanoseconds in a 64-bit field — Luminar Iris UINT8[8] PTP ns, Livox FLOAT64 ns | Apply `1e-9` scale; rebase to first-point time. |
+| `1.0 ≤ max_time < 1e16` | Absolute epoch **seconds** — Hesai FLOAT64 absolute, **and Luminar Iris** (its `UINT8[8]` ns are divided by `1e9` in `ros_cloud_converter.hpp` *before* TimeKeeper, landing here at ~1.78e9) | Overwrite frame stamp with first point time; treat per-point times as relative seconds (`point_time_scale = 1.0`). |
+| `min_time ≥ 1e16` | Raw, *unconverted* 64-bit nanoseconds (e.g. Livox FLOAT64 ns forwarded without scaling) | Apply `1e-9` scale; rebase to first-point time. |
+
+Note: Luminar lands in the **middle** bucket, not the `≥1e16` one, precisely because `ros_cloud_converter.hpp` already applies the `1e-9` divide. The `≥1e16` branch only fires for pipelines that forward raw nanoseconds — which this one never does for Iris.
 
 The combination of `autoconf_perpoint_times: true` and `autoconf_prefer_frame_time: false` makes GLIM use the *per-point* times for deskew. The earlier "Luminar timestamps look collapsed" symptom was the `autoconf_prefer_frame_time: true` default collapsing each scan to its single header stamp — that has been turned off.
 

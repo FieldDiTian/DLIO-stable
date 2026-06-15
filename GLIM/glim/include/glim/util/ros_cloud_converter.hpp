@@ -4,6 +4,8 @@
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <boost/format.hpp>
 
@@ -170,8 +172,10 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
             // header (§2.1) and a 32-bit sub-second nanosecond count per ray
             // (§2.2/§2.6.3); the single uint64 epoch-ns read here is the
             // upstream driver's reconstruction (seconds*1e9 + ns). Divide by
-            // 1e9 to get epoch seconds; deskew uses only relative offsets so
-            // the absolute epoch reference cancels.
+            // 1e9 to get epoch seconds. NOTE: GLIM's TimeKeeper treats these as
+            // ABSOLUTE and overwrites the frame stamp with the first point time,
+            // so the epoch must match the IMU/header epoch -- see the epoch-axis
+            // safeguard after this loop.
             std::uint64_t time_ns = 0;
             std::memcpy(&time_ns, time_ptr, sizeof(std::uint64_t));
             raw_points->times[i] = static_cast<double>(time_ns) / 1e9;
@@ -183,6 +187,42 @@ static RawPoints::Ptr extract_raw_points(const PointCloud2& points_msg, const st
         default:
           spdlog::warn("unsupported time type {} count {}", time_type, time_count);
           return nullptr;
+      }
+    }
+
+    // Epoch-axis safeguard (Luminar / absolute per-point times on the live path).
+    // Absolute per-point timestamps (e.g. Luminar UINT8[8] epoch ns) can sit on
+    // the sensor's own clock rather than the ROS/header epoch when the sensor is
+    // not PTP-locked to an epoch grandmaster (observed in raw bags: point times
+    // ~2e13 ns while header.stamp / IMU were on the Unix epoch). GLIM's TimeKeeper
+    // OVERWRITES the frame stamp with the first absolute point time, so a
+    // mismatched epoch desyncs the scan against the IMU and the frame is dropped
+    // as unsynchronized. Here we rebase the absolute times onto the header epoch
+    // (preserving the intra-scan span) when they are clearly on a different axis.
+    // This generalizes scripts/prep_bag.py's offline repair to the live pipeline.
+    // It is a no-op for already-aligned / prepped data (|diff| < 1 s) and for
+    // scan-relative encodings (max_time < 1.0, e.g. Ouster/Velodyne ns- or
+    // s-since-scan-start). GICP needs no equivalent: it anchors deskew at
+    // header.stamp and uses only relative (ts - min_ts) offsets.
+    if (!raw_points->times.empty()) {
+      const auto mm = std::minmax_element(raw_points->times.begin(), raw_points->times.end());
+      const double min_time = *mm.first;
+      const double max_time = *mm.second;
+      const double header_sec = to_sec(points_msg.header.stamp);
+      if (max_time >= 1.0 && std::abs(header_sec - min_time) > 1.0) {
+        const double offset = header_sec - min_time;
+        for (auto& t : raw_points->times) {
+          t += offset;
+        }
+        static bool warned = false;
+        if (!warned) {
+          spdlog::warn(
+            "ros_cloud_converter: per-point timestamps are on a different epoch than header.stamp "
+            "(min_point={:.6f}s header={:.6f}s diff={:.3f}s); rebasing onto the header epoch "
+            "(intra-scan span preserved). Likely an unsynced sensor clock -- confirm PTP lock.",
+            min_time, header_sec, offset);
+          warned = true;
+        }
       }
     }
   }
