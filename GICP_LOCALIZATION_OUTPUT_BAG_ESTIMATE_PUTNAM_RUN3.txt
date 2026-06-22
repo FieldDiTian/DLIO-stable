@@ -1,0 +1,118 @@
+GICP LOCALIZATION OUTPUT BAG ESTIMATE - PUTNAM RUN 3
+Generated: 2026-06-21
+Repository: /home/roar/Documents/DLIO_plusplus-stable
+
+Request
+-------
+Run full online GLIM mapping on Putnam Park run_3 using the current repository
+configuration and the /atlas/* -> /gps_p1/* adapter/PCAP IMU path, then use the
+resulting GLIM map for GICP localization and report the estimated GICP output
+ROS 2 bag.
+
+Input data
+----------
+Raw ROS 2 bag:
+/media/roar/data/rosbags/putnam/may_26/run_3/filtered/all
+
+Point One IMU PCAP:
+/media/roar/data/rosbags/putnam/may_26/run_3/ins_20260526_102229.pcap
+
+Full online GLIM run output directory:
+/media/roar/data/rosbags/putnam/may_26/run_3/glim_full_latest_online_rate0p2_20260620_222212
+
+Online run setup
+----------------
+- ros2 bag play rate: 0.2x
+- ros2 bag play topics:
+  - /atlas/pose_filtered
+  - /luminar_front/points -> /dlio_raw/luminar_front/points
+  - /luminar_left/points  -> /dlio_raw/luminar_left/points
+  - /luminar_right/points -> /dlio_raw/luminar_right/points
+- PCAP IMU replay topic:
+  - /atlas/imu_calibrated
+- Adapter output topics:
+  - /gps_p1/imu
+  - /gps_p1/filtered_odom
+  - /gps_p1/rtk_odom
+  - /luminar_front/points, /luminar_left/points, /luminar_right/points
+- FastDDS large-data profile:
+  /home/roar/Documents/DLIO_plusplus/gicp_localization/config/fastdds_largedata.xml
+
+Timeline
+--------
+- run started:        2026-06-20T22:22:13-07:00
+- bag play started:   2026-06-20T22:22:27-07:00
+- bag play finished:  2026-06-21T01:38:39-07:00
+- GLIM SIGINT sent:   2026-06-21T01:43:39-07:00
+- GLIM process ended: 2026-06-21T03:07:09-07:00
+
+Result
+------
+The online bag playback completed, but GLIM did not produce a usable dump.
+After SIGINT, GLIM kept draining its odometry backlog for about 83 minutes and
+then aborted before save:
+
+- dump saved: no
+- GLIM dump files: 0
+- GLIM submap directories: 0
+- T_world_utm.txt from GLIM dump: no
+- merged PCD map: not produced
+- GICP localization run: not run
+- GICP output ROS 2 bag: not produced
+
+Therefore the estimated GICP localization output bag cannot be generated from
+this run. GICP needs a PCD map path for localization, and this GLIM run failed
+before the dump -> PCD step could be executed.
+
+Adapter throughput
+------------------
+The adapter/PCAP input side did run and passed the expected online data:
+
+- pose_in=234820
+- odom_out=234820
+- rtk_out=234820
+- imu_in=232038
+- imu_out=232038
+- /luminar_front/points in=43382 out=43382
+- /luminar_left/points  in=43383 out=43383
+- /luminar_right/points in=43382 out=43382
+
+GLIM warning/error summary
+--------------------------
+- large_time_diff: 18044
+- large_lidar_gap: 0
+- submap_zero overlap warnings: 985
+- IMU prediction warning blocks: 301
+- last num_validations before abort: 19264
+- smoother fallback count: 1
+- cudaErrorMemoryAllocation: 1
+- cudaErrorIllegalAddress: 9
+- cudaErrorInvalidResourceHandle: 3
+- thrust::system::system_error: 1
+- max logged GPU memory: 16082 / 16116 MB (99.79%)
+- max logged CPU memory: 52983.97 / 63995.50 MB (82.79%)
+
+Failure evidence
+----------------
+The final GLIM log shows CUDA memory exhaustion followed by illegal-address
+errors and process abort:
+
+- cudaErrorMemoryAllocation: out of memory
+- parallel_for failed to synchronize: cudaErrorIllegalAddress
+- cudaErrorInvalidResourceHandle
+- terminate called after throwing thrust::system::system_error
+
+The run did not fail during ros2 bag playback. It failed after playback, during
+GLIM's soft-stop drain of the accumulated odometry queue, before local/global
+mapping save.
+
+Conclusion
+----------
+The current online full-run GLIM path successfully consumes the replayed bag,
+PCAP IMU, and adapter topics, but the full Putnam run_3 map does not complete
+on this GPU/memory envelope. No GLIM dump, no PCD map, and no downstream GICP
+localization output bag are available from this attempt.
+
+The next technically meaningful retry should reduce GLIM memory pressure before
+full-run mapping. The main pressure point observed here was GPU memory saturation
+during GLIM odometry backlog processing, not ROS topic ingestion.

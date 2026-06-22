@@ -102,6 +102,7 @@ OdometryEstimationIMU::OdometryEstimationIMU(std::unique_ptr<OdometryEstimationI
   isam2_params.relinearizeSkip = params->isam2_relinearize_skip;
   isam2_params.setRelinearizeThreshold(params->isam2_relinearize_thresh);
   smoother.reset(new FixedLagSmootherExt(params->smoother_lag, isam2_params));
+  smoother->set_fix_variable_types({{'x', 0}, {'v', 1}});
 
 #ifdef GTSAM_USE_TBB
   tbb_task_arena = std::make_shared<tbb::task_arena>(params->num_smoother_update_threads);

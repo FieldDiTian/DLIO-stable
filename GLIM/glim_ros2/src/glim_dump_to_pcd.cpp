@@ -6,10 +6,12 @@
 // localization/map_path.
 //
 // Usage:
-//   ros2 run glim_ros glim_dump_to_pcd <dump_dir> <output.pcd> [config_path]
+//   ros2 run glim_ros glim_dump_to_pcd <dump_dir> <output.pcd> [config_path] [--export-only]
 //
 // config_path defaults to "<dump_dir>/config" and falls back to the glim
 // package config when absent.
+// --export-only loads saved submap poses and values.bin only, then exports
+// points without rebuilding whole-map matching factors or running optimize().
 
 #include <filesystem>
 #include <fstream>
@@ -25,7 +27,7 @@
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::cerr << "usage: glim_dump_to_pcd <dump_dir> <output.pcd> [config_path]" << std::endl;
+    std::cerr << "usage: glim_dump_to_pcd <dump_dir> <output.pcd> [config_path] [--export-only]" << std::endl;
     return 1;
   }
 
@@ -35,21 +37,35 @@ int main(int argc, char** argv) {
   auto logger = spdlog::stdout_color_mt("glim");
   spdlog::set_default_logger(logger);
 
+  bool export_only = false;
   std::string config_path;
-  if (argc >= 4) {
-    config_path = argv[3];
-  } else if (std::filesystem::exists(dump_path + "/config/config.json")) {
+  for (int i = 3; i < argc; i++) {
+    const std::string arg = argv[i];
+    if (arg == "--export-only") {
+      export_only = true;
+    } else if (config_path.empty()) {
+      config_path = arg;
+    } else {
+      std::cerr << "unknown extra argument: " << arg << std::endl;
+      std::cerr << "usage: glim_dump_to_pcd <dump_dir> <output.pcd> [config_path] [--export-only]" << std::endl;
+      return 1;
+    }
+  }
+
+  if (config_path.empty() && std::filesystem::exists(dump_path + "/config/config.json")) {
     config_path = dump_path + "/config";
-  } else {
+  } else if (config_path.empty()) {
     config_path = ament_index_cpp::get_package_share_directory("glim") + "/config";
   }
 
   spdlog::info("config_path: {}", config_path);
+  spdlog::info("export_only: {}", export_only ? "true" : "false");
   glim::GlobalConfig::instance(config_path);
 
   glim::GlobalMapping global_mapping;
   spdlog::info("loading dump: {}", dump_path);
-  if (!global_mapping.load(dump_path)) {
+  const auto load_mode = export_only ? glim::GlobalMapping::LoadMode::LOAD_ONLY : glim::GlobalMapping::LoadMode::OPTIMIZE;
+  if (!global_mapping.load(dump_path, load_mode)) {
     spdlog::error("failed to load dump from {}", dump_path);
     return 1;
   }

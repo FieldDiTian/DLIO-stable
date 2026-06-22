@@ -1,5 +1,6 @@
 #include <glim/mapping/global_mapping.hpp>
 
+#include <cmath>
 #include <map>
 #include <unordered_set>
 #include <spdlog/spdlog.h>
@@ -67,6 +68,8 @@ GlobalMappingParams::GlobalMappingParams() {
   randomsampling_rate = config.param<double>("global_mapping", "randomsampling_rate", 1.0);
   max_implicit_loop_distance = config.param<double>("global_mapping", "max_implicit_loop_distance", 100.0);
   min_implicit_loop_overlap = config.param<double>("global_mapping", "min_implicit_loop_overlap", 0.1);
+  max_between_refinement_trans = config.param<double>("global_mapping", "max_between_refinement_trans", 5.0);
+  max_between_refinement_rot = config.param<double>("global_mapping", "max_between_refinement_rot", 0.5);
 
   enable_gpu = registration_error_factor_type.find("GPU") != std::string::npos;
 
@@ -384,9 +387,12 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_between_facto
 
   const int last = current - 1;
   const gtsam::Pose3 init_delta = gtsam::Pose3((submaps[last]->T_world_origin.inverse() * submaps[current]->T_world_origin).matrix());
+  const auto add_odom_between_factor = [&] {
+    factors->add(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), init_delta, gtsam::noiseModel::Isotropic::Precision(6, 1e6)));
+  };
 
   if (params.between_registration_type == "NONE") {
-    factors->add(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), init_delta, gtsam::noiseModel::Isotropic::Precision(6, 1e6)));
+    add_odom_between_factor();
     return factors;
   }
 
@@ -420,6 +426,24 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_between_facto
 #endif
 
   const gtsam::Pose3 estimated_delta = values.at<gtsam::Pose3>(X(1));
+  const gtsam::Pose3 refinement = init_delta.inverse() * estimated_delta;
+  const double refinement_trans = refinement.translation().norm();
+  const double refinement_rot = Eigen::AngleAxisd(refinement.rotation().matrix()).angle();
+  const bool reject_refinement =
+    (params.max_between_refinement_trans > 0.0 && refinement_trans > params.max_between_refinement_trans) ||
+    (params.max_between_refinement_rot > 0.0 && refinement_rot > params.max_between_refinement_rot);
+
+  if (reject_refinement) {
+    logger->warn(
+      "reject global between GICP refinement X{}->X{} (trans={:.3f}m rot={:.3f}deg); using odom delta",
+      last,
+      current,
+      refinement_trans,
+      refinement_rot * 180.0 / M_PI);
+    add_odom_between_factor();
+    return factors;
+  }
+
   const auto linearized = factor->linearize(values);
   const gtsam::Matrix6 H = linearized->hessianBlockDiagonal()[X(1)] + 1e6 * gtsam::Matrix6::Identity();
 
@@ -435,19 +459,28 @@ std::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_cost
 
   const auto& current_submap = submaps.back();
 
-  double previous_overlap = 0.0;
-  double squared_max_implicit_loop_distance = params.max_implicit_loop_distance * params.max_implicit_loop_distance;
+  const int previous = current - 1;
+  const Eigen::Isometry3d previous_delta = submaps[previous]->T_world_origin.inverse() * current_submap->T_world_origin;
+  const double previous_overlap = gtsam_points::overlap_auto(submaps[previous]->voxelmaps.back(), current_submap->frame, previous_delta);
+  logger->info("global previous overlap X{}->X{} = {:.3f}", previous, current, previous_overlap);
+  const double squared_max_implicit_loop_distance = params.max_implicit_loop_distance * params.max_implicit_loop_distance;
 
   for (int i = 0; i < current; i++) {
-    const double squared_dist = (submaps[i]->T_world_origin.translation() - current_submap->T_world_origin.translation()).squaredNorm();
-    if (squared_dist > squared_max_implicit_loop_distance) {
-      continue;
+    const bool is_previous = i == previous;
+    if (!is_previous) {
+      if (params.max_implicit_loop_distance <= 0.0) {
+        continue;
+      }
+
+      const double squared_dist = (submaps[i]->T_world_origin.translation() - current_submap->T_world_origin.translation()).squaredNorm();
+      if (squared_dist > squared_max_implicit_loop_distance) {
+        continue;
+      }
     }
 
-    const Eigen::Isometry3d delta = submaps[i]->T_world_origin.inverse() * current_submap->T_world_origin;
-    const double overlap = gtsam_points::overlap_auto(submaps[i]->voxelmaps.back(), current_submap->frame, delta);
+    const Eigen::Isometry3d delta = is_previous ? previous_delta : submaps[i]->T_world_origin.inverse() * current_submap->T_world_origin;
+    const double overlap = is_previous ? previous_overlap : gtsam_points::overlap_auto(submaps[i]->voxelmaps.back(), current_submap->frame, delta);
 
-    previous_overlap = i == current - 1 ? overlap : previous_overlap;
     if (overlap < params.min_implicit_loop_overlap) {
       continue;
     }
@@ -687,13 +720,14 @@ gtsam_points::PointCloud::Ptr GlobalMapping::export_points() {
   return merged;
 }
 
-bool GlobalMapping::load(const std::string& path) {
+bool GlobalMapping::load(const std::string& path, LoadMode mode) {
   std::ifstream ifs(path + "/graph.txt");
   if (!ifs) {
     logger->error("failed to open {}/graph.txt", path);
     return false;
   }
 
+  const bool load_only = mode == LoadMode::LOAD_ONLY;
   const int start_from_frame_id = submaps.size();
 
   std::string token;
@@ -736,7 +770,12 @@ bool GlobalMapping::load(const std::string& path) {
 
     submaps.push_back(submap);
     submaps.back()->voxelmaps.clear();
-    subsampled_submaps.push_back(subsampled_submap);
+    subsampled_submaps.push_back(load_only ? submap->frame : subsampled_submap);
+
+    if (load_only) {
+      Callbacks::on_insert_submap(submap);
+      continue;
+    }
 
     if (params.enable_gpu) {
 #ifdef GTSAM_POINTS_USE_CUDA
@@ -761,6 +800,41 @@ bool GlobalMapping::load(const std::string& path) {
     }
 
     Callbacks::on_insert_submap(submap);
+  }
+
+  if (load_only) {
+    logger->info("load-only mode: deserializing values and skipping matching-factor rebuild / optimization");
+
+    gtsam::Values loaded_values;
+    try {
+      gtsam::deserializeFromBinaryFile(path + "/values.bin", loaded_values);
+    } catch (boost::archive::archive_exception e) {
+      logger->error("failed to deserialize values!!");
+      logger->error(e.what());
+      return false;
+    } catch (std::exception& e) {
+      logger->error("failed to deserialize values!!");
+      logger->error(e.what());
+      return false;
+    }
+
+    for (int i = 0; i < num_submaps; i++) {
+      const int target = start_from_frame_id + i;
+      const gtsam::Key source_key = X(i);
+      const gtsam::Key target_key = X(target);
+
+      if (loaded_values.exists(source_key)) {
+        submaps[target]->T_world_origin = Eigen::Isometry3d(loaded_values.at<gtsam::Pose3>(source_key).matrix());
+      } else if (loaded_values.exists(target_key)) {
+        submaps[target]->T_world_origin = Eigen::Isometry3d(loaded_values.at<gtsam::Pose3>(target_key).matrix());
+      } else {
+        logger->warn("load-only values are missing X{}; keeping dumped submap pose", i);
+      }
+    }
+
+    Callbacks::on_update_submaps(submaps);
+    session_id++;
+    return true;
   }
 
   gtsam::Values values, loaded_values;

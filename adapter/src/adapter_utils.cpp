@@ -1,4 +1,4 @@
-#include "dlio_input_adapter/adapter_utils.hpp"
+#include "adapter/adapter_utils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,7 +9,7 @@
 #include <limits>
 #include <sstream>
 
-namespace dlio_input_adapter {
+namespace adapter {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -319,4 +319,4 @@ double P1ClockMapper::offsetDrift(const std::vector<std::pair<double, double>>& 
   return max_it->second - min_it->second;
 }
 
-}  // namespace dlio_input_adapter
+}  // namespace adapter

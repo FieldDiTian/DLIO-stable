@@ -33,6 +33,10 @@
     rtk_max_var_xy: 0.001
     rtk_max_var_z: 0.005
 
+    # Leave this off when the source bag/live stack already publishes
+    # /luminar_* topics. Enable it only for inputs that still use the
+    # /dlio_raw/luminar_* namespace and need to be normalized for GLIM/GICP.
+    enable_lidar_bridge: false
     luminar_front_input_topic: "/dlio_raw/luminar_front/points"
     luminar_left_input_topic: "/dlio_raw/luminar_left/points"
     luminar_right_input_topic: "/dlio_raw/luminar_right/points"

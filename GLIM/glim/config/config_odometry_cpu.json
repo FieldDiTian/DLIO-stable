@@ -29,6 +29,12 @@
     "vgicp_resolution": 0.5,
     "vgicp_voxelmap_levels": 1,
     "vgicp_voxelmap_scaling_factor": 2.0,
+    // Bad-registration guard. Accepted registration must stay close to IMU prediction
+    // and, for VGICP, keep enough frame-to-model overlap before it enters target map.
+    "enable_registration_guard": true,
+    "max_registration_correction_trans": 2.0,
+    "max_registration_correction_rot": 0.35,
+    "min_registration_overlap": 0.05,
     // Optimizer params
     "validate_imu": true,
     "save_imu_rate_trajectory": true,

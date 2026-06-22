@@ -46,6 +46,8 @@ public:
   double randomsampling_rate;
   double max_implicit_loop_distance;
   double min_implicit_loop_overlap;
+  double max_between_refinement_trans;
+  double max_between_refinement_rot;
 
   bool use_isam2_dogleg;
   double isam2_relinearize_skip;
@@ -59,6 +61,8 @@ public:
  */
 class GlobalMapping : public GlobalMappingBase {
 public:
+  enum class LoadMode { OPTIMIZE, LOAD_ONLY };
+
   GlobalMapping(const GlobalMappingParams& params = GlobalMappingParams());
   virtual ~GlobalMapping();
 
@@ -75,7 +79,7 @@ public:
    * @brief Load a mapping result from a dumped directory
    * @param path Input dump path
    */
-  bool load(const std::string& path);
+  bool load(const std::string& path, LoadMode mode = LoadMode::OPTIMIZE);
 
 private:
   void insert_submap(int current, const SubMap::Ptr& submap);

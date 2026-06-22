@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(dlio_input_adapter)
+project(adapter)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -23,23 +23,23 @@ if(NOT GeographicLib_FOUND)
   find_package(GeographicLib REQUIRED)
 endif()
 
-add_library(dlio_input_adapter_utils STATIC src/adapter_utils.cpp)
-target_include_directories(dlio_input_adapter_utils PUBLIC
+add_library(adapter_utils STATIC src/adapter_utils.cpp)
+target_include_directories(adapter_utils PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(dlio_input_adapter_utils Eigen3::Eigen)
-ament_target_dependencies(dlio_input_adapter_utils
+target_link_libraries(adapter_utils Eigen3::Eigen)
+ament_target_dependencies(adapter_utils
   builtin_interfaces
   sensor_msgs
   nav_msgs
   fusion_engine_msgs
 )
 
-add_executable(dlio_input_adapter_node src/dlio_input_adapter_node.cpp)
-target_include_directories(dlio_input_adapter_node PRIVATE ${GeographicLib_INCLUDE_DIRS})
-target_link_libraries(dlio_input_adapter_node dlio_input_adapter_utils ${GeographicLib_LIBRARIES})
-ament_target_dependencies(dlio_input_adapter_node
+add_executable(adapter src/adapter_node.cpp)
+target_include_directories(adapter PRIVATE ${GeographicLib_INCLUDE_DIRS})
+target_link_libraries(adapter adapter_utils ${GeographicLib_LIBRARIES})
+ament_target_dependencies(adapter
   rclcpp
   sensor_msgs
   nav_msgs
@@ -47,7 +47,7 @@ ament_target_dependencies(dlio_input_adapter_node
   fusion_engine_msgs
 )
 
-install(TARGETS dlio_input_adapter_utils dlio_input_adapter_node
+install(TARGETS adapter_utils adapter
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -61,6 +61,10 @@ install(DIRECTORY include/
 )
 
 install(DIRECTORY config launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(FILES README.md
   DESTINATION share/${PROJECT_NAME}
 )
 

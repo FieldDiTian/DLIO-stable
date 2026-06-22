@@ -2,11 +2,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cmath>
+
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/nonlinear/LinearContainerFactor.h>
 
 #include <gtsam_points/ann/ivox.hpp>
+#include <gtsam_points/types/gaussian_voxelmap.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <gtsam_points/factors/linear_damping_factor.hpp>
 #include <gtsam_points/factors/integrated_gicp_factor.hpp>
@@ -48,28 +51,20 @@ OdometryEstimationCPUParams::OdometryEstimationCPUParams() : OdometryEstimationI
   vgicp_resolution = config.param<double>("odometry_estimation", "vgicp_resolution", 0.2);
   vgicp_voxelmap_levels = config.param<int>("odometry_estimation", "vgicp_voxelmap_levels", 2);
   vgicp_voxelmap_scaling_factor = config.param<double>("odometry_estimation", "vgicp_voxelmap_scaling_factor", 2.0);
+
+  enable_registration_guard = config.param<bool>("odometry_estimation", "enable_registration_guard", true);
+  max_registration_correction_trans = config.param<double>("odometry_estimation", "max_registration_correction_trans", 2.0);
+  max_registration_correction_rot = config.param<double>("odometry_estimation", "max_registration_correction_rot", 0.35);
+  min_registration_overlap = config.param<double>("odometry_estimation", "min_registration_overlap", 0.05);
 }
 
 OdometryEstimationCPUParams::~OdometryEstimationCPUParams() {}
 
 OdometryEstimationCPU::OdometryEstimationCPU(const OdometryEstimationCPUParams& params) : OdometryEstimationIMU(std::make_unique<OdometryEstimationCPUParams>(params)) {
   last_T_target_imu.setIdentity();
-  if (params.registration_type == "GICP") {
-    target_ivox.reset(new gtsam_points::iVox(params.ivox_resolution));
-    target_ivox->voxel_insertion_setting().set_min_dist_in_cell(params.ivox_min_dist);
-    target_ivox->set_lru_horizon(params.lru_thresh);
-    target_ivox->set_neighbor_voxel_mode(1);
-  } else if (params.registration_type == "VGICP") {
-    target_voxelmaps.resize(params.vgicp_voxelmap_levels);
-    for (int i = 0; i < params.vgicp_voxelmap_levels; i++) {
-      const double resolution = params.vgicp_resolution * std::pow(params.vgicp_voxelmap_scaling_factor, i);
-      target_voxelmaps[i] = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(resolution);
-      target_voxelmaps[i]->set_lru_horizon(params.lru_thresh);
-    }
-  } else {
-    spdlog::error("unknown registration type for odometry_estimation_cpu ({})", params.registration_type);
-    abort();
-  }
+  pending_target_update = false;
+  pending_target_frame = -1;
+  reset_target();
 }
 
 OdometryEstimationCPU::~OdometryEstimationCPU() {}
@@ -151,6 +146,31 @@ gtsam::NonlinearFactorGraph OdometryEstimationCPU::create_factors(const int curr
   const Eigen::Isometry3d T_target_imu = Eigen::Isometry3d(values.at<gtsam::Pose3>(X(current)).matrix());
   Eigen::Isometry3d T_last_current = last_T_target_imu.inverse() * T_target_imu;
   T_last_current.linear() = Eigen::Quaterniond(T_last_current.linear()).normalized().toRotationMatrix();
+
+  const Eigen::Isometry3d registration_correction = pred_T_target_imu.inverse() * T_target_imu;
+  const double correction_trans = registration_correction.translation().norm();
+  const double correction_rot = Eigen::AngleAxisd(registration_correction.linear()).angle();
+  double registration_overlap = 1.0;
+  if (params->registration_type == "VGICP" && !target_voxelmaps.empty()) {
+    registration_overlap = gtsam_points::overlap_auto(target_voxelmaps.back(), frames[current]->frame, T_target_imu);
+  }
+
+  const bool reject_by_trans = params->max_registration_correction_trans > 0.0 && correction_trans > params->max_registration_correction_trans;
+  const bool reject_by_rot = params->max_registration_correction_rot > 0.0 && correction_rot > params->max_registration_correction_rot;
+  const bool reject_by_overlap =
+    params->registration_type == "VGICP" && params->min_registration_overlap > 0.0 && registration_overlap < params->min_registration_overlap;
+  if (params->enable_registration_guard && (reject_by_trans || reject_by_rot || reject_by_overlap)) {
+    logger->warn(
+      "reject CPU registration at frame {} (correction_trans={:.3f}m correction_rot={:.3f}deg overlap={:.3f}); keeping IMU prediction out of target map",
+      current,
+      correction_trans,
+      correction_rot * 180.0 / M_PI,
+      registration_overlap);
+    pending_target_update = false;
+    pending_target_frame = -1;
+    return gtsam::NonlinearFactorGraph();
+  }
+
   frames[current]->T_world_imu = frames[last]->T_world_imu * T_last_current;
   new_values.insert_or_assign(X(current), gtsam::Pose3(frames[current]->T_world_imu.matrix()));
 
@@ -166,13 +186,40 @@ gtsam::NonlinearFactorGraph OdometryEstimationCPU::create_factors(const int curr
   factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), gtsam::Pose3(T_last_current.matrix()), gtsam::noiseModel::Isotropic::Precision(6, 1e3));
   factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(X(current), gtsam::Pose3(T_target_imu.matrix()), gtsam::noiseModel::Isotropic::Precision(6, 1e3));
 
-  update_target(current, T_target_imu);
-  last_T_target_imu = T_target_imu;
+  pending_target_update = true;
+  pending_target_frame = current;
 
   return factors;
 }
 
-void OdometryEstimationCPU::fallback_smoother() {}
+void OdometryEstimationCPU::fallback_smoother() {
+  pending_target_update = false;
+  pending_target_frame = -1;
+  rebuild_target_from_active_frames();
+}
+
+void OdometryEstimationCPU::update_frames(const int current, const gtsam::NonlinearFactorGraph& new_factors) {
+  OdometryEstimationIMU::update_frames(current, new_factors);
+
+  if (smoother->fallbackHappened()) {
+    pending_target_update = false;
+    pending_target_frame = -1;
+    rebuild_target_from_active_frames();
+    return;
+  }
+
+  if (!pending_target_update || pending_target_frame != current || !frames[current]) {
+    if (frames[current]) {
+      last_T_target_imu = frames[current]->T_world_imu;
+    }
+    return;
+  }
+
+  update_target(current, frames[current]->T_world_imu);
+  last_T_target_imu = frames[current]->T_world_imu;
+  pending_target_update = false;
+  pending_target_frame = -1;
+}
 
 void OdometryEstimationCPU::update_target(const int current, const Eigen::Isometry3d& T_target_imu) {
   const auto params = static_cast<const OdometryEstimationCPUParams*>(this->params.get());
@@ -221,6 +268,45 @@ void OdometryEstimationCPU::update_target(const int current, const Eigen::Isomet
     }
 
     target_ivox_frame = frame;
+  }
+}
+
+void OdometryEstimationCPU::reset_target() {
+  const auto params = static_cast<const OdometryEstimationCPUParams*>(this->params.get());
+
+  target_ivox.reset();
+  target_voxelmaps.clear();
+
+  if (params->registration_type == "GICP") {
+    target_ivox.reset(new gtsam_points::iVox(params->ivox_resolution));
+    target_ivox->voxel_insertion_setting().set_min_dist_in_cell(params->ivox_min_dist);
+    target_ivox->set_lru_horizon(params->lru_thresh);
+    target_ivox->set_neighbor_voxel_mode(1);
+  } else if (params->registration_type == "VGICP") {
+    target_voxelmaps.resize(params->vgicp_voxelmap_levels);
+    for (int i = 0; i < params->vgicp_voxelmap_levels; i++) {
+      const double resolution = params->vgicp_resolution * std::pow(params->vgicp_voxelmap_scaling_factor, i);
+      target_voxelmaps[i] = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(resolution);
+      target_voxelmaps[i]->set_lru_horizon(params->lru_thresh);
+    }
+  } else {
+    spdlog::error("unknown registration type for odometry_estimation_cpu ({})", params->registration_type);
+    abort();
+  }
+}
+
+void OdometryEstimationCPU::rebuild_target_from_active_frames() {
+  reset_target();
+  last_T_target_imu.setIdentity();
+
+  for (auto itr = frames.inner_begin(); itr != frames.inner_end(); ++itr) {
+    if (!*itr) {
+      continue;
+    }
+
+    const auto& frame = *itr;
+    update_target(frame->id, frame->T_world_imu);
+    last_T_target_imu = frame->T_world_imu;
   }
 }
 

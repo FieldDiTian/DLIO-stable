@@ -15,7 +15,7 @@
 
 #include <GeographicLib/UTMUPS.hpp>
 
-#include "dlio_input_adapter/adapter_utils.hpp"
+#include "adapter/adapter_utils.hpp"
 #include "fusion_engine_msgs/msg/pose.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -29,12 +29,12 @@ constexpr double kDegToRadSq = kDegToRad * kDegToRad;
 
 }  // namespace
 
-using namespace dlio_input_adapter;
+using namespace adapter;
 
-class DlioInputAdapter : public rclcpp::Node {
+class Adapter : public rclcpp::Node {
 public:
-  DlioInputAdapter()
-  : Node("dlio_input_adapter"),
+  Adapter()
+  : Node("adapter"),
     clock_mapper_(declare_parameter("p1_clock_bin_seconds", 60.0))
   {
     pose_input_topic_ = declare_parameter("pose_input_topic", "/atlas/pose_filtered");
@@ -57,6 +57,7 @@ public:
     rtk_max_var_xy_ = declare_parameter("rtk_max_var_xy", 1e-3);
     rtk_max_var_z_ = declare_parameter("rtk_max_var_z", 5e-3);
     lidar_time_offset_sec_ = declare_parameter("lidar_time_offset", 0.0);
+    enable_lidar_bridge_ = declare_parameter("enable_lidar_bridge", false);
     repair_luminar_point_time_ = declare_parameter("repair_luminar_point_time", true);
     strict_luminar_schema_ = declare_parameter("strict_luminar_schema", true);
     lidar_input_reliability_ = declare_parameter("lidar_input_reliability", "best_effort");
@@ -107,42 +108,46 @@ public:
     imu_options.callback_group = imu_group_;
     pose_sub_ = create_subscription<fusion_engine_msgs::msg::Pose>(
       pose_input_topic_, inputQos(pose_input_reliability_, pose_input_qos_depth_),
-      std::bind(&DlioInputAdapter::poseCallback, this, std::placeholders::_1), pose_options);
+      std::bind(&Adapter::poseCallback, this, std::placeholders::_1), pose_options);
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       imu_input_topic_, inputQos(imu_input_reliability_, imu_input_qos_depth_),
-      std::bind(&DlioInputAdapter::imuCallback, this, std::placeholders::_1), imu_options);
+      std::bind(&Adapter::imuCallback, this, std::placeholders::_1), imu_options);
 
-    addLidarBridge(
-      declare_parameter("luminar_front_input_topic", "/dlio_raw/luminar_front/points"),
-      declare_parameter("luminar_front_output_topic", "/luminar_front/points"));
-    addLidarBridge(
-      declare_parameter("luminar_left_input_topic", "/dlio_raw/luminar_left/points"),
-      declare_parameter("luminar_left_output_topic", "/luminar_left/points"));
-    addLidarBridge(
-      declare_parameter("luminar_right_input_topic", "/dlio_raw/luminar_right/points"),
-      declare_parameter("luminar_right_output_topic", "/luminar_right/points"));
+    if (enable_lidar_bridge_) {
+      addLidarBridge(
+        declare_parameter("luminar_front_input_topic", "/dlio_raw/luminar_front/points"),
+        declare_parameter("luminar_front_output_topic", "/luminar_front/points"));
+      addLidarBridge(
+        declare_parameter("luminar_left_input_topic", "/dlio_raw/luminar_left/points"),
+        declare_parameter("luminar_left_output_topic", "/luminar_left/points"));
+      addLidarBridge(
+        declare_parameter("luminar_right_input_topic", "/dlio_raw/luminar_right/points"),
+        declare_parameter("luminar_right_output_topic", "/luminar_right/points"));
+    } else {
+      RCLCPP_INFO(get_logger(), "LiDAR bridge disabled; expecting normalized /luminar_* topics upstream.");
+    }
 
     flush_timer_ = create_wall_timer(
       std::chrono::milliseconds(100),
-      std::bind(&DlioInputAdapter::flushTimerCallback, this), timer_group_);
+      std::bind(&Adapter::flushTimerCallback, this), timer_group_);
     if (!summary_output_path_.empty()) {
       summary_timer_ = create_wall_timer(
         std::chrono::seconds(1),
-        std::bind(&DlioInputAdapter::writeSummaryFile, this), timer_group_);
+        std::bind(&Adapter::writeSummaryFile, this), timer_group_);
     }
 
     RCLCPP_INFO(
       get_logger(),
-      "DLIO input adapter ready: pose=%s imu=%s imu_stamp_mode=%s map_odom=%s",
+      "Adapter ready: pose=%s imu=%s imu_stamp_mode=%s map_odom=%s",
       pose_input_topic_.c_str(), imu_input_topic_.c_str(), imu_stamp_mode_.c_str(),
       publish_map_odom_ ? "true" : "false");
   }
 
-  ~DlioInputAdapter() override
+  ~Adapter() override
   {
     writeSummaryFile();
     const std::string summary = summaryText();
-    RCLCPP_INFO(get_logger(), "DLIO input adapter summary:\n%s", summary.c_str());
+    RCLCPP_INFO(get_logger(), "Adapter summary:\n%s", summary.c_str());
   }
 
   std::string summaryText() const
@@ -419,12 +424,12 @@ private:
 
   bool isRtkFixed(const fusion_engine_msgs::msg::Pose& msg) const
   {
-    return dlio_input_adapter::posePassesRtkGate(msg, rtk_max_var_xy_, rtk_max_var_z_);
+    return adapter::posePassesRtkGate(msg, rtk_max_var_xy_, rtk_max_var_z_);
   }
 
   void publishMapOdom(const nav_msgs::msg::Odometry& odom)
   {
-    nav_msgs::msg::Odometry out = dlio_input_adapter::transformOdomToMap(odom, t_world_utm_);
+    nav_msgs::msg::Odometry out = adapter::transformOdomToMap(odom, t_world_utm_);
     out.header.stamp = monotonicStamp("/gps_p1/filtered_odom_map", stampToSec(odom.header.stamp));
     odom_map_pub_->publish(out);
     ++map_odom_out_count_;
@@ -504,7 +509,7 @@ private:
     for (const auto& q : arrival_imu_queue_) {
       stamps.push_back(q.arrival);
     }
-    return dlio_input_adapter::retimeArrivalStamps(stamps, imu_period_sec_);
+    return adapter::retimeArrivalStamps(stamps, imu_period_sec_);
   }
 
   void publishFrontArrivalRetimedImu()
@@ -596,7 +601,7 @@ private:
   bool repairLuminarPointTime(sensor_msgs::msg::PointCloud2& msg, const std::string& topic)
   {
     std::string reason;
-    if (!dlio_input_adapter::repairLuminarPointTimestamps(msg, &reason)) {
+    if (!adapter::repairLuminarPointTimestamps(msg, &reason)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 5000, "%s %s.", topic.c_str(), reason.c_str());
       return false;
@@ -632,6 +637,7 @@ private:
   int pose_input_qos_depth_ = 100;
   int imu_input_qos_depth_ = 100;
   int lidar_input_qos_depth_ = 5;
+  bool enable_lidar_bridge_ = false;
   bool repair_luminar_point_time_ = true;
   bool strict_luminar_schema_ = true;
   bool utm_ready_ = false;
@@ -687,7 +693,7 @@ private:
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<DlioInputAdapter>();
+  auto node = std::make_shared<Adapter>();
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
   executor.add_node(node);
   executor.spin();

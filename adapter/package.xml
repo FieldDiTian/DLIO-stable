@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>dlio_input_adapter</name>
+  <name>adapter</name>
   <version>0.0.1</version>
-  <description>Live input adapter from AV-24 raw Atlas/Luminar topics to DLIO++ normalized topics.</description>
+  <description>Online adapter from Atlas, optional P1 IMU PCAP, and optional raw Luminar topics to the normalized GLIM/GICP input contract.</description>
   <maintainer email="bryan.chang@berkeley.edu">Bryan Chang</maintainer>
   <license>MIT</license>
 

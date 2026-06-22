@@ -202,6 +202,19 @@ gtsam::NonlinearFactorGraph OdometryEstimationGPU::create_factors(const int curr
     }
   }
 
+  double previous_overlap = -1.0;
+  if (current > 0 && frames[current - 1] && !frames[current - 1]->voxelmaps.empty()) {
+    const Eigen::Isometry3d delta = frames[current - 1]->T_world_imu.inverse() * frames[current]->T_world_imu;
+    previous_overlap = gtsam_points::overlap_gpu(frames[current - 1]->voxelmaps.back(), frames[current]->frame, delta, *stream);
+  }
+  logger->debug(
+    "GPU odometry diagnostics frame={} vgicp_factors={} keyframes={} active_frames={} previous_overlap={:.3f}",
+    current,
+    factors.size(),
+    keyframes.size(),
+    frames.inner_size(),
+    previous_overlap);
+
   return factors;
 }
 

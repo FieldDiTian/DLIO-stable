@@ -16,7 +16,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/msg/point_field.hpp"
 
-namespace dlio_input_adapter {
+namespace adapter {
 
 double stampToSec(const builtin_interfaces::msg::Time& stamp);
 int64_t stampToNs(const builtin_interfaces::msg::Time& stamp);
@@ -62,4 +62,4 @@ private:
   std::vector<Bin> bins_;
 };
 
-}  // namespace dlio_input_adapter
+}  // namespace adapter
