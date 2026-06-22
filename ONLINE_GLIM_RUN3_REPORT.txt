@@ -1,0 +1,166 @@
+Putnam Run 3 Online GLIM Mapping Report
+Date: 2026-06-22
+
+Summary
+-------
+The accepted online path is:
+
+  raw Run3 rosbag + INS PCAP
+    -> adapter_clean-style adapter for Point One IMU / odom normalization
+    -> GLIM online replay with reliable LiDAR QoS
+    -> live GLIM viewer
+    -> dump save
+    -> export-only PCD
+
+This does not use a prepped bag, offline full-bag preprocessing, or future
+information. It consumes the raw rosbag and PCAP online.
+
+Final accepted run
+------------------
+Run directory:
+  /media/roar/data/rosbags/putnam/may_26/run_3/glim_online_reliable_viewer_run3_20260622_150848
+
+Inputs:
+  bag:
+    /media/roar/data/rosbags/putnam/may_26/run_3/filtered/all
+  PCAP IMU:
+    /media/roar/data/rosbags/putnam/may_26/run_3/ins_20260526_102229.pcap
+  GLIM config:
+    /tmp/dlio_online_run3_viewer_config
+  QoS override:
+    /media/roar/data/rosbags/putnam/may_26/run_3/glim_online_reliable_viewer_run3_20260622_150848/qos.yaml
+  replay rate:
+    0.2x
+
+Outputs:
+  dump:
+    /media/roar/data/rosbags/putnam/may_26/run_3/glim_online_reliable_viewer_run3_20260622_150848/dump
+  PCD:
+    /media/roar/data/rosbags/putnam/may_26/run_3/glim_online_reliable_viewer_run3_20260622_150848/map.pcd
+
+The run was stopped manually after the user confirmed the visible result was
+good. The saved segment covers about 287.45 seconds of trajectory, not the
+entire 2355 second bag.
+
+Result metrics
+--------------
+Trajectory file:
+  dump/traj_lidar.txt
+
+Frames:
+  5750
+
+Time span:
+  1779816149.9639447 -> 1779816437.4139426
+  duration = 287.4499979 sec
+
+U-turn / jump checks:
+  max_abs_yaw_step_deg = 5.1258397923247925
+  large_yaw_gt30 = 0
+  max_xy_step_m = 1.7649859893074538
+  large_xy_gt5 = 0
+
+Online odom monitor:
+  status remained "ok"
+  no >30 deg yaw jump
+  no >5 m XY jump
+
+GLIM log counts:
+  large time difference between points and imu = 0
+  large time gap between consecutive LiDAR = 0
+  large time gap between consecutive IMU = 0
+  IndeterminantLinearSystemException = 0
+  Segmentation fault = 0
+  terminate called = 0
+  [error] = 0
+  [fatal] = 0
+
+Startup-only warning:
+  OdometryEstimationINS: INS data does not cover frame = 124
+
+This warning appeared at startup while INS/odom buffers were warming up. It did
+not continue growing during normal operation and did not produce a trajectory
+jump in this accepted run.
+
+PCD export:
+  command used export-only mode
+  exported points = 8524442
+  output size = 131M
+
+Methods tried
+-------------
+1. Raw online best-effort LiDAR replay
+
+   Result:
+     Failed / unstable.
+
+   Evidence:
+     Earlier raw online tests produced LiDAR gap and points-vs-IMU time
+     difference warnings even though direct metadata/header inspection showed
+     the raw bag LiDAR header timestamps were continuous.
+
+   Cause:
+     The problem was not the MCAP timestamps themselves. The online ROS2
+     best-effort replay/subscription path was dropping or delaying LiDAR frames
+     enough for GLIM to see discontinuities.
+
+2. Over-integrated adapter-owned sync
+
+   Result:
+     Rejected as the main direction.
+
+   Cause:
+     It made the adapter responsible for too much sensor scheduling policy and
+     drifted away from the adapter_clean contract. It also created confusing
+     behavior around deadlines and degraded/drop decisions.
+
+3. Prepped-bag / D3 control
+
+   Result:
+     Useful as a control only.
+
+   Evidence:
+     The prepped/control path did not show the u-turn, proving the core GLIM
+     mapping path can produce a sane trajectory when inputs are deterministic.
+
+   Limitation:
+     It is not the accepted final approach because it relies on a preprocessed
+     bag and is not the requested online path.
+
+4. Online adapter_clean-style path with reliable LiDAR QoS
+
+   Result:
+     Accepted.
+
+   Key changes:
+     - Keep adapter focused on Point One / GPS-P1 normalization.
+     - Keep raw rosbag as the source of LiDAR and Atlas pose.
+     - Use PCAP IMU replay through adapter for /gps_p1/imu.
+     - Subscribe/play /luminar_front/points with reliable QoS and deep queue.
+     - Keep GLIM concat disabled for this validation.
+     - Use INS-driven GLIM odometry + CPU sub/global mapping config.
+     - Use process-group shutdown so GLIM reliably receives SIGINT and saves.
+
+   Why it succeeded:
+     Reliable LiDAR QoS removed the hidden replay/subscription frame drops that
+     previously caused GLIM LiDAR gaps and points/IMU time mismatch. Once the
+     input stream was continuous, the online trajectory no longer showed the
+     u-turn failure.
+
+Remaining notes
+---------------
+The accepted visible run was intentionally stopped after the user confirmed the
+front-end result was good. Therefore the saved PCD is a partial Run3 map from
+the accepted online segment, not a complete full-bag map.
+
+For a full overnight run, use the same online path and runner:
+
+  raw Run3 bag
+  PCAP IMU
+  adapter_clean-style normalization
+  reliable /luminar_front/points QoS
+  process-group shutdown
+  GLIM export-only PCD conversion
+
+Do not return to best-effort LiDAR replay for this workload; that is the path
+that reproduced the time-discontinuity symptoms.

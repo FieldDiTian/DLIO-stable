@@ -2,6 +2,7 @@
 
 #define GLIM_ROS2
 
+#include <algorithm>
 #include <deque>
 #include <thread>
 #include <iostream>
@@ -85,6 +86,26 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   imu_time_offset = config_ros.param<double>("glim_ros", "imu_time_offset", 0.0);
   points_time_offset = config_ros.param<double>("glim_ros", "points_time_offset", 0.0);
   acc_scale = config_ros.param<double>("glim_ros", "acc_scale", 0.0);
+  const bool deterministic_live_input_default = config_ros.param<bool>("glim_ros", "deterministic_live_input", true);
+  const double live_input_reorder_window_sec_default = config_ros.param<double>("glim_ros", "live_input_reorder_window_sec", 0.25);
+  const int live_input_max_queue_size_default = config_ros.param<int>("glim_ros", "live_input_max_queue_size", 10000);
+  this->declare_parameter<bool>("deterministic_live_input", deterministic_live_input_default);
+  this->declare_parameter<double>("live_input_reorder_window_sec", live_input_reorder_window_sec_default);
+  this->declare_parameter<int>("live_input_max_queue_size", live_input_max_queue_size_default);
+  this->get_parameter<bool>("deterministic_live_input", deterministic_live_input);
+  this->get_parameter<double>("live_input_reorder_window_sec", live_input_reorder_window_sec);
+  int live_input_max_queue_size_param = live_input_max_queue_size_default;
+  this->get_parameter<int>("live_input_max_queue_size", live_input_max_queue_size_param);
+  live_input_max_queue_size = static_cast<size_t>(std::max(1, live_input_max_queue_size_param));
+  live_input_stop.store(false);
+  live_input_latest_stamp = -std::numeric_limits<double>::infinity();
+  live_input_next_seq = 0;
+  if (deterministic_live_input) {
+    spdlog::info(
+      "deterministic live input enabled (reorder_window={:.3f}s max_queue={})",
+      live_input_reorder_window_sec,
+      live_input_max_queue_size);
+  }
 
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
@@ -96,6 +117,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   // offline glim_rosbag / glim_pcap_rosbag tools do; otherwise live mapping
   // would silently use only the front LiDAR.
   aux_concat = glim_ros::load_aux_sensors_from_config(config_sensors);
+  aux_latest_stamps.assign(aux_concat.aux_sensors.size(), -std::numeric_limits<double>::infinity());
 
   // Override T_lidar_imu from URDF if configured
   const std::string urdf_path = config_sensors.param<std::string>("sensors", "urdf_path", "");
@@ -213,7 +235,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   rclcpp::SensorDataQoS default_imu_qos;
   default_imu_qos.get_rmw_qos_profile().depth = 1000;
   auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
-  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback_live, this, _1));
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
   // Route the primary cloud through points_callback_live() so buffered aux
@@ -244,7 +266,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     rclcpp::QoS default_external_odom_qos(100);
     auto external_odom_qos = get_qos_settings(config_ros, "glim_ros", "external_odom_qos", default_external_odom_qos);
     external_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
-      external_odom_topic, external_odom_qos, std::bind(&GlimROS::external_odom_callback, this, _1));
+      external_odom_topic, external_odom_qos, std::bind(&GlimROS::external_odom_callback_live, this, _1));
     spdlog::info("subscribed to external odometry topic: {}", external_odom_topic);
   }
 
@@ -253,14 +275,18 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     sub->create_subscriber(*this);
   }
 
-  // Start timer
-  timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+  if (deterministic_live_input) {
+    live_input_thread = std::thread([this]() { live_input_loop(); });
+  } else {
+    timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+  }
 
   spdlog::debug("initialized");
 }
 
 GlimROS::~GlimROS() {
   spdlog::debug("quit");
+  stop_live_input(false);
   extension_modules.clear();
 
   if (dump_on_unload) {
@@ -272,6 +298,114 @@ GlimROS::~GlimROS() {
 
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
   return extension_subs;
+}
+
+void GlimROS::enqueue_live_input(LiveInputEvent&& event) {
+  {
+    std::lock_guard<std::mutex> lock(live_input_mutex);
+    event.seq = live_input_next_seq++;
+    live_input_latest_stamp = std::max(live_input_latest_stamp, event.stamp);
+    live_input_queue.push_back(std::move(event));
+  }
+  live_input_cv.notify_one();
+}
+
+bool GlimROS::pop_live_input(LiveInputEvent& event, bool drain_all) {
+  std::unique_lock<std::mutex> lock(live_input_mutex);
+  live_input_cv.wait_for(lock, std::chrono::milliseconds(1), [this, drain_all] {
+    return live_input_stop.load() || drain_all || !live_input_queue.empty();
+  });
+
+  if (live_input_queue.empty()) {
+    return false;
+  }
+
+  std::sort(live_input_queue.begin(), live_input_queue.end(), [](const LiveInputEvent& lhs, const LiveInputEvent& rhs) {
+    if (lhs.stamp != rhs.stamp) {
+      return lhs.stamp < rhs.stamp;
+    }
+    return lhs.seq < rhs.seq;
+  });
+
+  const auto& oldest = live_input_queue.front();
+  const bool queue_pressure = live_input_queue.size() > live_input_max_queue_size;
+  const bool ready_by_watermark = oldest.stamp <= live_input_latest_stamp - live_input_reorder_window_sec;
+  if (!drain_all && !live_input_stop.load() && !queue_pressure && !ready_by_watermark) {
+    return false;
+  }
+
+  if (queue_pressure) {
+    spdlog::warn("deterministic live input queue exceeded max_queue={} - forcing oldest message through", live_input_max_queue_size);
+  }
+
+  event = std::move(live_input_queue.front());
+  live_input_queue.erase(live_input_queue.begin());
+  return true;
+}
+
+void GlimROS::dispatch_live_input(const LiveInputEvent& event) {
+  switch (event.type) {
+    case LiveInputType::IMU:
+      imu_callback(event.imu);
+      break;
+    case LiveInputType::POINTS:
+      process_points_callback_live(event.points);
+      break;
+    case LiveInputType::AUX_POINTS:
+      process_aux_points_callback(std::const_pointer_cast<sensor_msgs::msg::PointCloud2>(event.points), event.aux_index);
+      break;
+    case LiveInputType::EXTERNAL_ODOM:
+      external_odom_callback(event.odom);
+      break;
+  }
+}
+
+void GlimROS::live_input_loop() {
+  while (true) {
+    LiveInputEvent event;
+    if (pop_live_input(event, live_input_stop.load())) {
+      dispatch_live_input(event);
+    }
+    timer_callback();
+
+    if (live_input_stop.load()) {
+      std::lock_guard<std::mutex> lock(live_input_mutex);
+      if (live_input_queue.empty()) {
+        break;
+      }
+    }
+  }
+}
+
+void GlimROS::stop_live_input(bool drain_all) {
+  if (!deterministic_live_input) {
+    return;
+  }
+
+  const bool was_stopped = live_input_stop.exchange(true);
+  if (!was_stopped) {
+    live_input_cv.notify_all();
+  }
+
+  if (drain_all && live_input_thread.joinable() && live_input_thread.get_id() != std::this_thread::get_id()) {
+    live_input_thread.join();
+  } else if (!drain_all && live_input_thread.joinable() && live_input_thread.get_id() != std::this_thread::get_id()) {
+    live_input_cv.notify_all();
+    live_input_thread.join();
+  }
+}
+
+void GlimROS::imu_callback_live(const sensor_msgs::msg::Imu::SharedPtr msg) {
+  if (!deterministic_live_input) {
+    imu_callback(msg);
+    return;
+  }
+
+  LiveInputEvent event;
+  event.type = LiveInputType::IMU;
+  event.stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + imu_time_offset;
+  event.imu = msg;
+  enqueue_live_input(std::move(event));
 }
 
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
@@ -335,31 +469,110 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 #endif
 
 void GlimROS::aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
-  std::lock_guard<std::mutex> lock(aux_buffers_mutex);
-  if (aux_index >= aux_concat.aux_sensors.size()) {
+  if (deterministic_live_input) {
+    LiveInputEvent event;
+    event.type = LiveInputType::AUX_POINTS;
+    event.stamp = glim_ros::stamp_to_sec(msg->header.stamp);
+    event.aux_index = aux_index;
+    event.points = msg;
+    enqueue_live_input(std::move(event));
     return;
   }
-  auto& aux = aux_concat.aux_sensors[aux_index];
-  aux.buffer.push_back(msg);
-  while (aux.buffer.size() > aux.buffer_size) {
-    aux.buffer.pop_front();
+
+  process_aux_points_callback(msg, aux_index);
+}
+
+void GlimROS::process_aux_points_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg, size_t aux_index) {
+  std::vector<sensor_msgs::msg::PointCloud2::ConstSharedPtr> ready;
+  {
+    std::lock_guard<std::mutex> lock(aux_buffers_mutex);
+    if (aux_index >= aux_concat.aux_sensors.size()) {
+      return;
+    }
+    auto& aux = aux_concat.aux_sensors[aux_index];
+    aux.buffer.push_back(msg);
+    while (aux.buffer.size() > aux.buffer_size) {
+      aux.buffer.pop_front();
+    }
+    if (aux_index < aux_latest_stamps.size()) {
+      aux_latest_stamps[aux_index] = std::max(aux_latest_stamps[aux_index], glim_ros::stamp_to_sec(msg->header.stamp));
+    }
+    ready = flush_ready_live_points_locked();
+  }
+
+  for (const auto& points : ready) {
+    points_callback(points);
   }
 }
 
 void GlimROS::points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  // Merge buffered auxiliary clouds into the primary scan (front + left + right
-  // -> luminar_front frame), then hand the result to the estimator. The mutex
-  // guards the aux buffers, which merge_clouds() reads via find_nearest().
+  if (deterministic_live_input) {
+    LiveInputEvent event;
+    event.type = LiveInputType::POINTS;
+    event.stamp = glim_ros::stamp_to_sec(msg->header.stamp);
+    event.points = msg;
+    enqueue_live_input(std::move(event));
+    return;
+  }
+
+  process_points_callback_live(msg);
+}
+
+void GlimROS::process_points_callback_live(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   if (aux_concat.enabled && !aux_concat.aux_sensors.empty()) {
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr merged;
+    std::vector<sensor_msgs::msg::PointCloud2::ConstSharedPtr> ready;
     {
       std::lock_guard<std::mutex> lock(aux_buffers_mutex);
-      merged = glim_ros::merge_clouds(msg, aux_concat.aux_sensors, aux_concat.time_threshold);
+      primary_points_buffer.push_back(msg);
+      while (primary_points_buffer.size() > static_cast<size_t>(std::max(1, aux_concat.buffer_size))) {
+        const double stamp = glim_ros::stamp_to_sec(primary_points_buffer.front()->header.stamp);
+        spdlog::warn("lidar_concat: dropping queued primary scan at {:.6f}; auxiliary watermarks did not catch up within buffer_size={}", stamp, aux_concat.buffer_size);
+        primary_points_buffer.pop_front();
+      }
+      ready = flush_ready_live_points_locked();
     }
-    points_callback(merged);
+
+    for (const auto& points : ready) {
+      points_callback(points);
+    }
   } else {
     points_callback(msg);
   }
+}
+
+std::vector<sensor_msgs::msg::PointCloud2::ConstSharedPtr> GlimROS::flush_ready_live_points_locked() {
+  std::vector<sensor_msgs::msg::PointCloud2::ConstSharedPtr> ready;
+
+  while (!primary_points_buffer.empty()) {
+    const auto& primary = primary_points_buffer.front();
+    const double primary_stamp = glim_ros::stamp_to_sec(primary->header.stamp);
+    if (!aux_watermarks_cover_primary_locked(primary_stamp)) {
+      break;
+    }
+
+    ready.push_back(glim_ros::merge_clouds(primary, aux_concat.aux_sensors, aux_concat.time_threshold));
+    primary_points_buffer.pop_front();
+  }
+
+  return ready;
+}
+
+bool GlimROS::aux_watermarks_cover_primary_locked(double primary_stamp) const {
+  if (!aux_concat.enabled || aux_concat.aux_sensors.empty()) {
+    return true;
+  }
+  if (aux_latest_stamps.size() != aux_concat.aux_sensors.size()) {
+    return false;
+  }
+
+  const double required_stamp = primary_stamp + aux_concat.time_threshold;
+  for (double latest : aux_latest_stamps) {
+    if (latest < required_stamp) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
@@ -417,6 +630,19 @@ void GlimROS::external_odom_callback(const nav_msgs::msg::Odometry::ConstSharedP
   odometry_estimation->insert_external_pose(stamp, T_world_ins);
 }
 
+void GlimROS::external_odom_callback_live(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+  if (!deterministic_live_input) {
+    external_odom_callback(msg);
+    return;
+  }
+
+  LiveInputEvent event;
+  event.type = LiveInputType::EXTERNAL_ODOM;
+  event.stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+  event.odom = msg;
+  enqueue_live_input(std::move(event));
+}
+
 bool GlimROS::needs_wait() {
   for (const auto& ext_module : extension_modules) {
     if (ext_module->needs_wait()) {
@@ -453,6 +679,8 @@ void GlimROS::timer_callback() {
 }
 
 void GlimROS::wait(bool auto_quit) {
+  stop_live_input(true);
+
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
 

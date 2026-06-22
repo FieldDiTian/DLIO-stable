@@ -407,7 +407,10 @@ def main() -> None:
     except (ExternalShutdownException, KeyboardInterrupt):
         pass
     finally:
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
