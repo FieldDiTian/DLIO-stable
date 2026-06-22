@@ -7,3 +7,22 @@ CLAUDE.md
 .codex
 *.png
 .claude/
+
+# Local run artifacts
+profiling_logs/
+run_configs/
+
+# Local editor and UI state
+.vscode/
+.idea/
+imgui.ini
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local ROS / CMake generated state
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
