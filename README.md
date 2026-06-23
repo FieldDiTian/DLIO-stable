@@ -179,6 +179,147 @@ A reviewer reasonably asks: why not auto-merge the per-submap directories into a
 
 A blind `merge_glim_submaps.py` would skip all three and bake any unresolved drift into the PCD. Adding such a script as a dev-only "quick-look" mode is reasonable, but it must not become the default mapping→localization handoff.
 
+### Putnam online GLIM/GICP runbook
+
+This is the current command path for Putnam bag and INS PCAP replay in this
+checkout:
+
+```text
+rosbag /atlas/pose_filtered + /luminar_front/points
+  + INS PCAP
+  -> adapter publishes /gps_p1/*
+  -> GLIM consumes /gps_p1/* and /luminar_front/points
+  -> GLIM dump
+  -> glim_dump_to_pcd --export-only
+  -> GICP consumes map.pcd, /gps_p1/*, and /luminar_front/points
+```
+
+Build and source:
+
+```bash
+cd /home/roar/Documents/DLIO_plusplus-stable
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  --packages-select adapter glim glim_ros glim_ext gicp_localization
+
+set +u
+source /opt/ros/jazzy/setup.bash
+source /home/roar/Documents/race_common/install/setup.bash
+source install/setup.bash
+set -u
+```
+
+Run GLIM mapping:
+
+```bash
+RUN_ROOT=/media/roar/data1/rosbags/putnam/may_26/run_3
+BAG="$RUN_ROOT/filtered/all"
+PCAP="$RUN_ROOT/ins_20260526_102229.pcap"
+OUT="$RUN_ROOT/glim_online_reliable_run3_$(date +%Y%m%d_%H%M%S)"
+
+scripts/run_glim_online_reliable.sh \
+  --bag "$BAG" \
+  --pcap "$PCAP" \
+  --output "$OUT" \
+  --rate 0.2 \
+  --domain 86 \
+  --viewer true
+```
+
+Expected mapping outputs:
+
+```text
+$OUT/state.txt
+$OUT/adapter.log
+$OUT/glim.log
+$OUT/bag_play.log
+$OUT/adapter_summary.txt
+$OUT/config/
+$OUT/dump/
+```
+
+`dump/` is written when GLIM exits cleanly after bag playback. Stop the runner
+with `INT` so GLIM can save the dump.
+
+Export the PCD used by GICP:
+
+```bash
+ros2 run glim_ros glim_dump_to_pcd \
+  "$OUT/dump" \
+  "$OUT/map.pcd" \
+  "$OUT/dump/config" \
+  --export-only
+```
+
+GICP needs both files from the same GLIM run:
+
+```text
+$OUT/map.pcd
+$OUT/dump/T_world_utm.txt
+```
+
+Launch GICP localization against that map:
+
+```bash
+MAP_RUN=/media/roar/data1/rosbags/putnam/may_26/run_3/glim_online_reliable_run3_YYYYMMDD_HHMMSS
+LOC_RUN=/media/roar/data1/rosbags/putnam/may_26/run_5
+MAP="$MAP_RUN/map.pcd"
+T_WORLD_UTM="$MAP_RUN/dump/T_world_utm.txt"
+BAG="$LOC_RUN/filtered/all"
+PCAP="$LOC_RUN/ins_20260526_132516.pcap"
+export ROS_DOMAIN_ID=90
+
+ros2 launch adapter adapter.launch.py \
+  p1_imu_pcap_path:="$PCAP" \
+  use_sim_time:=true \
+  T_world_utm_path:="$T_WORLD_UTM"
+```
+
+In a second terminal:
+
+```bash
+cd /home/roar/Documents/DLIO_plusplus-stable
+set +u
+source /opt/ros/jazzy/setup.bash
+source /home/roar/Documents/race_common/install/setup.bash
+source install/setup.bash
+set -u
+
+MAP_RUN=/media/roar/data1/rosbags/putnam/may_26/run_3/glim_online_reliable_run3_YYYYMMDD_HHMMSS
+MAP="$MAP_RUN/map.pcd"
+export ROS_DOMAIN_ID=90
+
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  rviz:=true \
+  map_path:="$MAP" \
+  urdf_path:="$PWD/av24.urdf" \
+  pointcloud_topic:=/luminar_front/points \
+  imu_topic:=/gps_p1/imu \
+  gt_odom_topic:=/gps_p1/filtered_odom_map
+```
+
+In a third terminal:
+
+```bash
+LOC_RUN=/media/roar/data1/rosbags/putnam/may_26/run_5
+BAG="$LOC_RUN/filtered/all"
+export ROS_DOMAIN_ID=90
+
+ros2 bag play "$BAG" \
+  --clock 100 \
+  --rate 1.0 \
+  --disable-keyboard-controls \
+  --topics /atlas/pose_filtered /luminar_front/points
+```
+
+Health checks:
+
+```bash
+ros2 topic hz /gps_p1/imu
+ros2 topic hz /luminar_front/points
+ros2 topic hz /gicp/localization/odom
+ros2 topic echo --once /gicp/localization/map --field header
+```
+
 ## Build
 
 ROS 2 Humble + colcon. Built and tested inside an Ubuntu 22.04 distrobox (`distrobox enter ros2-humble`).

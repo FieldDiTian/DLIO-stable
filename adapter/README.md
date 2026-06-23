@@ -127,6 +127,21 @@ GLIM can then consume `/gps_p1/imu`,
 `/gps_p1/filtered_odom_rtk_fixed`, and `/luminar_front/points` through its
 normal configuration.
 
+For Putnam-style raw replay, prefer the repository runner instead of launching
+the pieces manually:
+
+```bash
+scripts/run_glim_online_reliable.sh \
+  --bag /path/to/run/filtered/all \
+  --pcap /path/to/run/ins_*.pcap \
+  --output /path/to/output_run \
+  --rate 0.2 \
+  --viewer true
+```
+
+That runner starts this adapter, replays the INS PCAP online, plays only the raw
+topics GLIM needs, and saves a GLIM dump in the output directory.
+
 ## Common GICP Replay
 
 ```bash
@@ -139,3 +154,15 @@ ros2 bag play /path/to/bag --clock --rate 1.0
 
 GICP can then consume `/gps_p1/imu`, `/gps_p1/filtered_odom_map`, and the
 `/luminar_*` clouds through its normal configuration.
+
+The matching GICP launch should use the PCD exported from the same GLIM dump:
+
+```bash
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  rviz:=true \
+  map_path:=/path/to/glim_run/map.pcd \
+  urdf_path:=/home/roar/Documents/DLIO_plusplus-stable/av24.urdf \
+  pointcloud_topic:=/luminar_front/points \
+  imu_topic:=/gps_p1/imu \
+  gt_odom_topic:=/gps_p1/filtered_odom_map
+```

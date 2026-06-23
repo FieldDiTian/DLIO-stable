@@ -50,6 +50,102 @@ ros2 launch gicp_localization localization_with_tf.launch.py \
     gt_odom_topic:=/gps_p1/filtered_odom
 ```
 
+### Using a GLIM map from online replay
+
+The current Putnam raw-data handoff is:
+
+```text
+GLIM online run
+  -> <map_run>/dump
+  -> glim_dump_to_pcd --export-only
+  -> <map_run>/map.pcd
+  -> adapter uses <map_run>/dump/T_world_utm.txt
+  -> GICP localizes against <map_run>/map.pcd
+```
+
+Build the map first from the repository root:
+
+```bash
+RUN_ROOT=/media/roar/data1/rosbags/putnam/may_26/run_3
+BAG="$RUN_ROOT/filtered/all"
+PCAP="$RUN_ROOT/ins_20260526_102229.pcap"
+MAP_RUN="$RUN_ROOT/glim_online_reliable_run3_$(date +%Y%m%d_%H%M%S)"
+
+scripts/run_glim_online_reliable.sh \
+  --bag "$BAG" \
+  --pcap "$PCAP" \
+  --output "$MAP_RUN" \
+  --rate 0.2 \
+  --domain 86 \
+  --viewer true
+
+ros2 run glim_ros glim_dump_to_pcd \
+  "$MAP_RUN/dump" \
+  "$MAP_RUN/map.pcd" \
+  "$MAP_RUN/dump/config" \
+  --export-only
+```
+
+Then localize another run against that map. Start the adapter first so it can
+convert Atlas pose into the GLIM map frame as `/gps_p1/filtered_odom_map`:
+
+```bash
+LOC_RUN=/media/roar/data1/rosbags/putnam/may_26/run_5
+LOC_BAG="$LOC_RUN/filtered/all"
+LOC_PCAP="$LOC_RUN/ins_20260526_132516.pcap"
+MAP_RUN=/media/roar/data1/rosbags/putnam/may_26/run_3/glim_online_reliable_run3_YYYYMMDD_HHMMSS
+export ROS_DOMAIN_ID=90
+
+ros2 launch adapter adapter.launch.py \
+  p1_imu_pcap_path:="$LOC_PCAP" \
+  use_sim_time:=true \
+  T_world_utm_path:="$MAP_RUN/dump/T_world_utm.txt"
+```
+
+Start GICP in a second terminal:
+
+```bash
+cd /home/roar/Documents/DLIO_plusplus-stable
+export ROS_DOMAIN_ID=90
+MAP_RUN=/media/roar/data1/rosbags/putnam/may_26/run_3/glim_online_reliable_run3_YYYYMMDD_HHMMSS
+
+ros2 launch gicp_localization localization_with_tf.launch.py \
+  rviz:=true \
+  map_path:="$MAP_RUN/map.pcd" \
+  urdf_path:="$PWD/av24.urdf" \
+  pointcloud_topic:=/luminar_front/points \
+  imu_topic:=/gps_p1/imu \
+  gt_odom_topic:=/gps_p1/filtered_odom_map
+```
+
+Play the raw bag in a third terminal:
+
+```bash
+export ROS_DOMAIN_ID=90
+LOC_RUN=/media/roar/data1/rosbags/putnam/may_26/run_5
+LOC_BAG="$LOC_RUN/filtered/all"
+
+ros2 bag play "$LOC_BAG" \
+  --clock 100 \
+  --rate 1.0 \
+  --disable-keyboard-controls \
+  --topics /atlas/pose_filtered /luminar_front/points
+```
+
+Minimum checks:
+
+```bash
+ros2 topic hz /gicp/localization/odom
+ros2 topic info -v /gicp/localization/map
+ros2 topic echo --once /gicp/localization/map --field header
+```
+
+If the map does not appear in RViz, first verify `map_path` points to an
+existing PCD and `/gicp/localization/map` has one publisher. If scan
+preprocessing logs `Point cloud empty after preprocessing`, use a run-local
+parameter overlay to disable or enlarge the crop box; with `dlio/deskew=true`
+the crop runs after deskewing in world/map coordinates.
+
 ### Launch arguments
 
 | Arg | Default | Purpose |
