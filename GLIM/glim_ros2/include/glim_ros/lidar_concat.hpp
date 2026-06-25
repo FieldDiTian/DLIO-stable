@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -240,6 +241,8 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 
   auto merged = std::make_shared<sensor_msgs::msg::PointCloud2>(*primary);
   size_t total_points = primary->width * primary->height;
+  size_t merged_aux_count = 0;
+  std::ostringstream dt_summary;
 
   for (auto& aux : aux_sensors) {
     auto match = find_nearest(aux.buffer, t_primary, time_threshold);
@@ -277,14 +280,33 @@ inline sensor_msgs::msg::PointCloud2::ConstSharedPtr merge_clouds(
 
     merged->data.insert(merged->data.end(), data.begin(), data.end());
     total_points += match->width * match->height;
+    ++merged_aux_count;
 
     double dt = std::abs(stamp_to_sec(match->header.stamp) - t_primary);
+    if (merged_aux_count > 1) {
+      dt_summary << ", ";
+    }
+    dt_summary << aux.topic << "=" << dt;
     spdlog::debug("lidar_concat: merged {} (dt={:.4f}s, {} pts)", aux.topic, dt, match->width * match->height);
   }
 
   merged->width = total_points;
   merged->height = 1;
   merged->row_step = point_step * total_points;
+
+  static std::atomic<size_t> concat_frame_seq{0};
+  const size_t frame_seq = ++concat_frame_seq;
+  if (frame_seq <= 5 || frame_seq % 100 == 0 || merged_aux_count != aux_sensors.size()) {
+    spdlog::info(
+      "lidar_concat: frame={} primary_t={:.6f} merged_aux={}/{} input_points={} output_points={} dt_abs=[{}]",
+      frame_seq,
+      t_primary,
+      merged_aux_count,
+      aux_sensors.size(),
+      primary->width * primary->height,
+      total_points,
+      dt_summary.str());
+  }
   return merged;
 }
 
